@@ -18,41 +18,19 @@
 #ifndef __LVCS_EQUALISER_H__
 #define __LVCS_EQUALISER_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
-
 /************************************************************************************/
 /*                                                                                  */
 /*    Structures                                                                    */
 /*                                                                                  */
 /************************************************************************************/
-
-/* Equaliser structure */
-typedef struct
-{
-    void (*pBiquadCallBack) (Biquad_Instance_t*, LVM_INT16*, LVM_INT16*, LVM_INT16);
-
-} LVCS_Equaliser_t;
-
-
 /************************************************************************************/
 /*                                                                                  */
 /*    Function prototypes                                                           */
 /*                                                                                  */
 /************************************************************************************/
 
-LVCS_ReturnStatus_en LVCS_EqualiserInit(LVCS_Handle_t       hInstance,
-                                        LVCS_Params_t       *pParams);
+LVCS_ReturnStatus_en LVCS_EqualiserInit(LVCS_Handle_t hInstance, LVCS_Params_t* pParams);
+LVCS_ReturnStatus_en LVCS_Equaliser(LVCS_Handle_t hInstance, LVM_FLOAT* pInputOutput,
+                                    LVM_UINT16 NumSamples);
 
-LVCS_ReturnStatus_en LVCS_Equaliser(LVCS_Handle_t            hInstance,
-                                    LVM_INT16                *pInputOutput,
-                                    LVM_UINT16                NumSamples);
-
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-
-#endif  /* EQUALISER_H */
+#endif /* EQUALISER_H */

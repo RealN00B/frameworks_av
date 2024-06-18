@@ -17,9 +17,9 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "AMPEG4AudioAssembler"
 
-#include "AMPEG4AudioAssembler.h"
+#include <media/stagefright/rtsp/AMPEG4AudioAssembler.h>
 
-#include "ARTPSource.h"
+#include <media/stagefright/rtsp/ARTPSource.h>
 
 #include <media/stagefright/foundation/hexdump.h>
 #include <media/stagefright/foundation/ABitReader.h>
@@ -108,7 +108,7 @@ static status_t parseAudioObjectType(
 static status_t parseGASpecificConfig(
         ABitReader *bits,
         unsigned audioObjectType, unsigned channelConfiguration) {
-    unsigned frameLengthFlag = bits->getBits(1);
+    unsigned frameLengthFlag __unused = bits->getBits(1);
     unsigned dependsOnCoreCoder = bits->getBits(1);
     if (dependsOnCoreCoder) {
         /* unsigned coreCoderDelay = */bits->getBits(1);
@@ -217,7 +217,7 @@ static status_t parseAudioSpecificConfig(ABitReader *bits, sp<ABuffer> *asc) {
                 // Apparently an extension is always considered an even
                 // multiple of 8 bits long.
 
-                ALOGI("Skipping %d bits after sync extension",
+                ALOGI("Skipping %zu bits after sync extension",
                      8 - (numBitsInExtension & 7));
 
                 bits->skipBits(8 - (numBitsInExtension & 7));
@@ -311,9 +311,7 @@ static status_t parseStreamMuxConfig(
 
         case 2:
         {
-            // reserved
-            TRESPASS();
-            break;
+            return ERROR_UNSUPPORTED;
         }
 
         case 3:
@@ -381,7 +379,10 @@ sp<ABuffer> AMPEG4AudioAssembler::removeLATMFraming(const sp<ABuffer> &buffer) {
                 unsigned muxSlotLengthBytes = 0;
                 unsigned tmp;
                 do {
-                    CHECK_LT(offset, buffer->size());
+                    if (offset >= buffer->size()) {
+                        ALOGW("Malformed buffer received");
+                        return out;
+                    }
                     tmp = ptr[offset++];
                     muxSlotLengthBytes += tmp;
                 } while (tmp == 0xff);
@@ -406,8 +407,9 @@ sp<ABuffer> AMPEG4AudioAssembler::removeLATMFraming(const sp<ABuffer> &buffer) {
                 break;
             }
         }
-
-        CHECK_LE(offset + payloadLength, buffer->size());
+        
+        CHECK_LT(offset, buffer->size());
+        CHECK_LE(payloadLength, buffer->size() - offset);
 
         memcpy(out->data() + out->size(), &ptr[offset], payloadLength);
         out->setRange(0, out->size() + payloadLength);
@@ -421,10 +423,15 @@ sp<ABuffer> AMPEG4AudioAssembler::removeLATMFraming(const sp<ABuffer> &buffer) {
             CHECK_LE(offset + (mOtherDataLenBits / 8), buffer->size());
             offset += mOtherDataLenBits / 8;
         }
+
+        if (i < mNumSubFrames && offset >= buffer->size()) {
+            ALOGW("Skip subframes after %d, total %d", (int)i, (int)mNumSubFrames);
+            break;
+        }
     }
 
     if (offset < buffer->size()) {
-        ALOGI("ignoring %d bytes of trailing data", buffer->size() - offset);
+        ALOGI("ignoring %zu bytes of trailing data", buffer->size() - offset);
     }
     CHECK_LE(offset, buffer->size());
 
@@ -460,6 +467,15 @@ AMPEG4AudioAssembler::AMPEG4AudioAssembler(
             &mFixedFrameLength,
             &mOtherDataPresent, &mOtherDataLenBits);
 
+    if (err == ERROR_UNSUPPORTED) {
+        ALOGW("Failed to parse stream mux config, using default values for playback.");
+        mMuxConfigPresent = false;
+        mNumSubFrames = 0;
+        mFrameLengthType = 0;
+        mOtherDataPresent = false;
+        mOtherDataLenBits = 0;
+        return;
+    }
     CHECK_EQ(err, (status_t)NO_ERROR);
 }
 
@@ -534,27 +550,7 @@ void AMPEG4AudioAssembler::submitAccessUnit() {
     LOG(VERBOSE) << "Access unit complete (" << mPackets.size() << " packets)";
 #endif
 
-    size_t totalSize = 0;
-    List<sp<ABuffer> >::iterator it = mPackets.begin();
-    while (it != mPackets.end()) {
-        const sp<ABuffer> &unit = *it;
-
-        totalSize += unit->size();
-        ++it;
-    }
-
-    sp<ABuffer> accessUnit = new ABuffer(totalSize);
-    size_t offset = 0;
-    it = mPackets.begin();
-    while (it != mPackets.end()) {
-        const sp<ABuffer> &unit = *it;
-
-        memcpy((uint8_t *)accessUnit->data() + offset,
-               unit->data(), unit->size());
-
-        ++it;
-    }
-
+    sp<ABuffer> accessUnit = MakeCompoundFromPackets(mPackets);
     accessUnit = removeLATMFraming(accessUnit);
     CopyTimes(accessUnit, *mPackets.begin());
 

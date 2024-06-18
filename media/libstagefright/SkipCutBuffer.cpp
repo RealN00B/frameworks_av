@@ -24,14 +24,32 @@
 
 namespace android {
 
-SkipCutBuffer::SkipCutBuffer(int32_t skip, int32_t cut, int32_t output_size) {
-    mFrontPadding = skip;
-    mBackPadding = cut;
+SkipCutBuffer::SkipCutBuffer(size_t skip, size_t cut, size_t num16BitChannels) {
+
     mWriteHead = 0;
     mReadHead = 0;
-    mCapacity = cut + output_size;
-    mCutBuffer = new char[mCapacity];
-    ALOGV("skipcutbuffer %d %d %d", skip, cut, mCapacity);
+    mCapacity = 0;
+    mCutBuffer = NULL;
+
+    if (num16BitChannels == 0 || num16BitChannels > INT32_MAX / 2) {
+        ALOGW("# channels out of range: %zu, using passthrough instead", num16BitChannels);
+        return;
+    }
+    size_t frameSize = num16BitChannels * 2;
+    if (skip > INT32_MAX / frameSize || cut > INT32_MAX / frameSize
+            || cut * frameSize > INT32_MAX - 4096) {
+        ALOGW("out of range skip/cut: %zu/%zu, using passthrough instead",
+                skip, cut);
+        return;
+    }
+    skip *= frameSize;
+    cut *= frameSize;
+
+    mFrontPadding = mSkip = skip;
+    mBackPadding = cut;
+    mCapacity = cut + 4096;
+    mCutBuffer = new (std::nothrow) char[mCapacity];
+    ALOGV("skipcutbuffer %zu %zu %d", skip, cut, mCapacity);
 }
 
 SkipCutBuffer::~SkipCutBuffer() {
@@ -39,6 +57,11 @@ SkipCutBuffer::~SkipCutBuffer() {
 }
 
 void SkipCutBuffer::submit(MediaBuffer *buffer) {
+    if (mCutBuffer == NULL) {
+        // passthrough mode
+        return;
+    }
+
     int32_t offset = buffer->range_offset();
     int32_t buflen = buffer->range_length();
 
@@ -65,16 +88,81 @@ void SkipCutBuffer::submit(MediaBuffer *buffer) {
     buffer->set_range(0, copied);
 }
 
+template <typename T>
+void SkipCutBuffer::submitInternal(const sp<T>& buffer) {
+    if (mCutBuffer == NULL) {
+        // passthrough mode
+        return;
+    }
+
+    int32_t offset = buffer->offset();
+    int32_t buflen = buffer->size();
+
+    // drop the initial data from the buffer if needed
+    if (mFrontPadding > 0) {
+        // still data left to drop
+        int32_t to_drop = (buflen < mFrontPadding) ? buflen : mFrontPadding;
+        offset += to_drop;
+        buflen -= to_drop;
+        buffer->setRange(offset, buflen);
+        mFrontPadding -= to_drop;
+    }
+
+
+    // append data to cutbuffer
+    char *src = (char*) buffer->data();
+    write(src, buflen);
+
+
+    // the mediabuffer is now empty. Fill it from cutbuffer, always leaving
+    // at least mBackPadding bytes in the cutbuffer
+    char *dst = (char*) buffer->base();
+    size_t copied = read(dst, buffer->capacity());
+    buffer->setRange(0, copied);
+}
+
+void SkipCutBuffer::submit(const sp<ABuffer>& buffer) {
+    submitInternal(buffer);
+}
+
+void SkipCutBuffer::submit(const sp<MediaCodecBuffer>& buffer) {
+    submitInternal(buffer);
+}
+
 void SkipCutBuffer::clear() {
     mWriteHead = mReadHead = 0;
+    mFrontPadding = mSkip;
 }
 
 void SkipCutBuffer::write(const char *src, size_t num) {
     int32_t sizeused = (mWriteHead - mReadHead);
     if (sizeused < 0) sizeused += mCapacity;
 
-    // everything must fit
-    CHECK_GE((mCapacity - size_t(sizeused)), num);
+    // Everything must fit. Make sure the buffer is a little larger than needed,
+    // so there is no ambiguity as to whether mWriteHead == mReadHead means buffer
+    // full or empty
+    size_t available = mCapacity - sizeused - 32;
+    if (available < num) {
+        int32_t newcapacity = mCapacity + (num - available);
+        char * newbuffer = new char[newcapacity];
+        if (mWriteHead < mReadHead) {
+            // data isn't continuous, need to memcpy twice
+            // to move previous data to new buffer.
+            size_t copyLeft = mCapacity - mReadHead;
+            memcpy(newbuffer, mCutBuffer + mReadHead, copyLeft);
+            memcpy(newbuffer + copyLeft, mCutBuffer, mWriteHead);
+            mReadHead = 0;
+            mWriteHead += copyLeft;
+        } else {
+            memcpy(newbuffer, mCutBuffer + mReadHead, mWriteHead - mReadHead);
+            mWriteHead -= mReadHead;
+            mReadHead = 0;
+        }
+        delete [] mCutBuffer;
+        mCapacity = newcapacity;
+        mCutBuffer = newbuffer;
+        ALOGV("reallocated buffer at size %d", newcapacity);
+    }
 
     size_t copyfirst = (mCapacity - mWriteHead);
     if (copyfirst > num) copyfirst = num;
@@ -100,7 +188,7 @@ size_t SkipCutBuffer::read(char *dst, size_t num) {
     if (available <=0) {
         return 0;
     }
-    if (available < num) {
+    if (available < int32_t(num)) {
         num = available;
     }
 

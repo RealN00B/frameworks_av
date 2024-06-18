@@ -16,6 +16,12 @@
 
 #define LOG_TAG "MtpProperty"
 
+#include <inttypes.h>
+#include <cutils/compiler.h>
+#include <iomanip>
+#include <sstream>
+#include <string>
+
 #include "MtpDataPacket.h"
 #include "MtpDebug.h"
 #include "MtpProperty.h"
@@ -104,15 +110,15 @@ MtpProperty::~MtpProperty() {
         free(mMinimumValue.str);
         free(mMaximumValue.str);
         if (mDefaultArrayValues) {
-            for (int i = 0; i < mDefaultArrayLength; i++)
+            for (uint32_t i = 0; i < mDefaultArrayLength; i++)
                 free(mDefaultArrayValues[i].str);
         }
         if (mCurrentArrayValues) {
-            for (int i = 0; i < mCurrentArrayLength; i++)
+            for (uint32_t i = 0; i < mCurrentArrayLength; i++)
                 free(mCurrentArrayValues[i].str);
         }
         if (mEnumValues) {
-            for (int i = 0; i < mEnumLength; i++)
+            for (uint16_t i = 0; i < mEnumLength; i++)
                 free(mEnumValues[i].str);
         }
     }
@@ -121,11 +127,14 @@ MtpProperty::~MtpProperty() {
     delete[] mEnumValues;
 }
 
-void MtpProperty::read(MtpDataPacket& packet) {
-    mCode = packet.getUInt16();
+bool MtpProperty::read(MtpDataPacket& packet) {
+    uint8_t temp8;
+
+    if (!packet.getUInt16(mCode)) return false;
     bool deviceProp = isDeviceProperty();
-    mType = packet.getUInt16();
-    mWriteable = (packet.getUInt8() == 1);
+    if (!packet.getUInt16(mType)) return false;
+    if (!packet.getUInt8(temp8)) return false;
+    mWriteable = (temp8 == 1);
     switch (mType) {
         case MTP_TYPE_AINT8:
         case MTP_TYPE_AUINT8:
@@ -138,28 +147,36 @@ void MtpProperty::read(MtpDataPacket& packet) {
         case MTP_TYPE_AINT128:
         case MTP_TYPE_AUINT128:
             mDefaultArrayValues = readArrayValues(packet, mDefaultArrayLength);
-            if (deviceProp)
+            if (!mDefaultArrayValues) return false;
+            if (deviceProp) {
                 mCurrentArrayValues = readArrayValues(packet, mCurrentArrayLength);
+                if (!mCurrentArrayValues) return false;
+            }
             break;
         default:
-            readValue(packet, mDefaultValue);
-            if (deviceProp)
-                readValue(packet, mCurrentValue);
+            if (!readValue(packet, mDefaultValue)) return false;
+            if (deviceProp) {
+                if (!readValue(packet, mCurrentValue)) return false;
+            }
     }
-    if (!deviceProp)
-        mGroupCode = packet.getUInt32();
-    mFormFlag = packet.getUInt8();
+    if (!deviceProp) {
+        if (!packet.getUInt32(mGroupCode)) return false;
+    }
+    if (!packet.getUInt8(mFormFlag)) return false;
 
     if (mFormFlag == kFormRange) {
-            readValue(packet, mMinimumValue);
-            readValue(packet, mMaximumValue);
-            readValue(packet, mStepSize);
+            if (!readValue(packet, mMinimumValue)) return false;
+            if (!readValue(packet, mMaximumValue)) return false;
+            if (!readValue(packet, mStepSize)) return false;
     } else if (mFormFlag == kFormEnum) {
-        mEnumLength = packet.getUInt16();
+        if (!packet.getUInt16(mEnumLength)) return false;
         mEnumValues = new MtpPropertyValue[mEnumLength];
-        for (int i = 0; i < mEnumLength; i++)
-            readValue(packet, mEnumValues[i]);
+        for (int i = 0; i < mEnumLength; i++) {
+            if (!readValue(packet, mEnumValues[i])) return false;
+        }
     }
+
+    return true;
 }
 
 void MtpProperty::write(MtpDataPacket& packet) {
@@ -189,9 +206,9 @@ void MtpProperty::write(MtpDataPacket& packet) {
             if (deviceProp)
                 writeValue(packet, mCurrentValue);
     }
-    packet.putUInt32(mGroupCode);
     if (!deviceProp)
-        packet.putUInt8(mFormFlag);
+        packet.putUInt32(mGroupCode);
+    packet.putUInt8(mFormFlag);
     if (mFormFlag == kFormRange) {
             writeValue(packet, mMinimumValue);
             writeValue(packet, mMaximumValue);
@@ -221,6 +238,22 @@ void MtpProperty::setCurrentValue(const uint16_t* string) {
     }
     else
         mCurrentValue.str = NULL;
+}
+
+void MtpProperty::setCurrentValue(const char* string) {
+    free(mCurrentValue.str);
+    if (string) {
+        MtpStringBuffer buffer(string);
+        mCurrentValue.str = strdup(buffer);
+    }
+    else
+        mCurrentValue.str = NULL;
+}
+
+void MtpProperty::setCurrentValue(MtpDataPacket& packet) {
+    free(mCurrentValue.str);
+    mCurrentValue.str = NULL;
+    readValue(packet, mCurrentValue);
 }
 
 void MtpProperty::setFormRange(int min, int max, int step) {
@@ -317,7 +350,7 @@ void MtpProperty::setFormDateTime() {
 }
 
 void MtpProperty::print() {
-    MtpString buffer;
+    std::string buffer;
     bool deviceProp = isDeviceProperty();
     if (deviceProp)
         ALOGI("    %s (%04X)", MtpDebug::getDevicePropCodeName(mCode), mCode);
@@ -327,11 +360,11 @@ void MtpProperty::print() {
     ALOGI("    writeable %s", (mWriteable ? "true" : "false"));
     buffer = "    default value: ";
     print(mDefaultValue, buffer);
-    ALOGI("%s", (const char *)buffer);
+    ALOGI("%s", buffer.c_str());
     if (deviceProp) {
         buffer = "    current value: ";
         print(mCurrentValue, buffer);
-        ALOGI("%s", (const char *)buffer);
+        ALOGI("%s", buffer.c_str());
     }
     switch (mFormFlag) {
         case kFormNone:
@@ -344,7 +377,7 @@ void MtpProperty::print() {
             buffer += ", ";
             print(mStepSize, buffer);
             buffer += ")";
-            ALOGI("%s", (const char *)buffer);
+            ALOGI("%s", buffer.c_str());
             break;
         case kFormEnum:
             buffer = "    Enum { ";
@@ -353,7 +386,7 @@ void MtpProperty::print() {
                 buffer += " ";
             }
             buffer += "}";
-            ALOGI("%s", (const char *)buffer);
+            ALOGI("%s", buffer.c_str());
             break;
         case kFormDateTime:
             ALOGI("    DateTime\n");
@@ -364,42 +397,47 @@ void MtpProperty::print() {
     }
 }
 
-void MtpProperty::print(MtpPropertyValue& value, MtpString& buffer) {
+void MtpProperty::print(MtpPropertyValue& value, std::string& buffer) {
+    std::ostringstream s;
     switch (mType) {
         case MTP_TYPE_INT8:
-            buffer.appendFormat("%d", value.u.i8);
+            buffer += std::to_string(value.u.i8);
             break;
         case MTP_TYPE_UINT8:
-            buffer.appendFormat("%d", value.u.u8);
+            buffer += std::to_string(value.u.u8);
             break;
         case MTP_TYPE_INT16:
-            buffer.appendFormat("%d", value.u.i16);
+            buffer += std::to_string(value.u.i16);
             break;
         case MTP_TYPE_UINT16:
-            buffer.appendFormat("%d", value.u.u16);
+            buffer += std::to_string(value.u.u16);
             break;
         case MTP_TYPE_INT32:
-            buffer.appendFormat("%d", value.u.i32);
+            buffer += std::to_string(value.u.i32);
             break;
         case MTP_TYPE_UINT32:
-            buffer.appendFormat("%d", value.u.u32);
+            buffer += std::to_string(value.u.u32);
             break;
         case MTP_TYPE_INT64:
-            buffer.appendFormat("%lld", value.u.i64);
+            buffer += std::to_string(value.u.i64);
             break;
         case MTP_TYPE_UINT64:
-            buffer.appendFormat("%lld", value.u.u64);
+            buffer += std::to_string(value.u.u64);
             break;
         case MTP_TYPE_INT128:
-            buffer.appendFormat("%08X%08X%08X%08X", value.u.i128[0], value.u.i128[1],
-                    value.u.i128[2], value.u.i128[3]);
+            for (auto i : value.u.i128) {
+                s << std::hex << std::setfill('0') << std::uppercase << i;
+            }
+            buffer += s.str();
             break;
         case MTP_TYPE_UINT128:
-            buffer.appendFormat("%08X%08X%08X%08X", value.u.u128[0], value.u.u128[1],
-                    value.u.u128[2], value.u.u128[3]);
+            for (auto i : value.u.u128) {
+                s << std::hex << std::setfill('0') << std::uppercase << i;
+            }
+            buffer += s.str();
             break;
         case MTP_TYPE_STR:
-            buffer.appendFormat("%s", value.str);
+            buffer += value.str;
             break;
         default:
             ALOGE("unsupported type for MtpProperty::print\n");
@@ -407,57 +445,59 @@ void MtpProperty::print(MtpPropertyValue& value, MtpString& buffer) {
     }
 }
 
-void MtpProperty::readValue(MtpDataPacket& packet, MtpPropertyValue& value) {
+bool MtpProperty::readValue(MtpDataPacket& packet, MtpPropertyValue& value) {
     MtpStringBuffer stringBuffer;
 
     switch (mType) {
         case MTP_TYPE_INT8:
         case MTP_TYPE_AINT8:
-            value.u.i8 = packet.getInt8();
+            if (!packet.getInt8(value.u.i8)) return false;
             break;
         case MTP_TYPE_UINT8:
         case MTP_TYPE_AUINT8:
-            value.u.u8 = packet.getUInt8();
+            if (!packet.getUInt8(value.u.u8)) return false;
             break;
         case MTP_TYPE_INT16:
         case MTP_TYPE_AINT16:
-            value.u.i16 = packet.getInt16();
+            if (!packet.getInt16(value.u.i16)) return false;
             break;
         case MTP_TYPE_UINT16:
         case MTP_TYPE_AUINT16:
-            value.u.u16 = packet.getUInt16();
+            if (!packet.getUInt16(value.u.u16)) return false;
             break;
         case MTP_TYPE_INT32:
         case MTP_TYPE_AINT32:
-            value.u.i32 = packet.getInt32();
+            if (!packet.getInt32(value.u.i32)) return false;
             break;
         case MTP_TYPE_UINT32:
         case MTP_TYPE_AUINT32:
-            value.u.u32 = packet.getUInt32();
+            if (!packet.getUInt32(value.u.u32)) return false;
             break;
         case MTP_TYPE_INT64:
         case MTP_TYPE_AINT64:
-            value.u.i64 = packet.getInt64();
+            if (!packet.getInt64(value.u.i64)) return false;
             break;
         case MTP_TYPE_UINT64:
         case MTP_TYPE_AUINT64:
-            value.u.u64 = packet.getUInt64();
+            if (!packet.getUInt64(value.u.u64)) return false;
             break;
         case MTP_TYPE_INT128:
         case MTP_TYPE_AINT128:
-            packet.getInt128(value.u.i128);
+            if (!packet.getInt128(value.u.i128)) return false;
             break;
         case MTP_TYPE_UINT128:
         case MTP_TYPE_AUINT128:
-            packet.getUInt128(value.u.u128);
+            if (!packet.getUInt128(value.u.u128)) return false;
             break;
         case MTP_TYPE_STR:
-            packet.getString(stringBuffer);
+            if (!packet.getString(stringBuffer)) return false;
             value.str = strdup(stringBuffer);
             break;
         default:
             ALOGE("unknown type %04X in MtpProperty::readValue", mType);
+            return false;
     }
+    return true;
 }
 
 void MtpProperty::writeValue(MtpDataPacket& packet, MtpPropertyValue& value) {
@@ -515,19 +555,29 @@ void MtpProperty::writeValue(MtpDataPacket& packet, MtpPropertyValue& value) {
     }
 }
 
-MtpPropertyValue* MtpProperty::readArrayValues(MtpDataPacket& packet, int& length) {
-    length = packet.getUInt32();
-    if (length == 0)
+MtpPropertyValue* MtpProperty::readArrayValues(MtpDataPacket& packet, uint32_t& length) {
+    if (!packet.getUInt32(length)) return NULL;
+
+    // Fail if resulting array is over 2GB.  This is because the maximum array
+    // size may be less than SIZE_MAX on some platforms.
+    if ( CC_UNLIKELY(
+            length == 0 ||
+            length >= INT32_MAX / sizeof(MtpPropertyValue)) ) {
+        length = 0;
         return NULL;
+    }
     MtpPropertyValue* result = new MtpPropertyValue[length];
-    for (int i = 0; i < length; i++)
-        readValue(packet, result[i]);
+    for (uint32_t i = 0; i < length; i++)
+        if (!readValue(packet, result[i])) {
+            delete [] result;
+            return NULL;
+        }
     return result;
 }
 
-void MtpProperty::writeArrayValues(MtpDataPacket& packet, MtpPropertyValue* values, int length) {
+void MtpProperty::writeArrayValues(MtpDataPacket& packet, MtpPropertyValue* values, uint32_t length) {
     packet.putUInt32(length);
-    for (int i = 0; i < length; i++)
+    for (uint32_t i = 0; i < length; i++)
         writeValue(packet, values[i]);
 }
 

@@ -18,9 +18,8 @@
 #define LOG_TAG "AAMRAssembler"
 #include <utils/Log.h>
 
-#include "AAMRAssembler.h"
-
-#include "ARTPSource.h"
+#include <media/stagefright/rtsp/AAMRAssembler.h>
+#include <media/stagefright/rtsp/ARTPSource.h>
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -143,9 +142,8 @@ ARTPAssembler::AssemblyStatus AAMRAssembler::addPacket(
         return MALFORMED_PACKET;
     }
 
-    unsigned payloadHeader = buffer->data()[0];
-    unsigned CMR = payloadHeader >> 4;
-    CHECK_EQ(payloadHeader & 0x0f, 0u);  // RR
+    unsigned payloadHeader __unused = buffer->data()[0];
+    unsigned CMR __unused = payloadHeader >> 4;
 
     Vector<uint8_t> tableOfContents;
 

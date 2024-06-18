@@ -18,7 +18,10 @@
 #define LOG_TAG "ARTPSession"
 #include <utils/Log.h>
 
-#include "ARTPSession.h"
+#include <media/stagefright/rtsp/APacketSource.h>
+#include <media/stagefright/rtsp/ARTPConnection.h>
+#include <media/stagefright/rtsp/ARTPSession.h>
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -29,9 +32,6 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-#include "APacketSource.h"
-#include "ARTPConnection.h"
-#include "ASessionDescription.h"
 
 namespace android {
 
@@ -82,7 +82,7 @@ status_t ARTPSession::setup(const sp<ASessionDescription> &desc) {
         info->mRTPSocket = rtpSocket;
         info->mRTCPSocket = rtcpSocket;
 
-        sp<AMessage> notify = new AMessage(kWhatAccessUnitComplete, id());
+        sp<AMessage> notify = new AMessage(kWhatAccessUnitComplete, this);
         notify->setSize("track-index", mTracks.size() - 1);
 
         mRTPConn->addStream(

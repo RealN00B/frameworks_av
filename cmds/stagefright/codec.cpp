@@ -16,31 +16,39 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "codec"
+#include <inttypes.h>
 #include <utils/Log.h>
 
 #include "SimplePlayer.h"
 
+#include <binder/IServiceManager.h>
 #include <binder/ProcessState.h>
-
+#include <mediadrm/ICrypto.h>
+#include <media/IMediaHTTPService.h>
+#include <media/IMediaPlayerService.h>
+#include <media/MediaCodecBuffer.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/DataSource.h>
+#include <media/stagefright/foundation/AString.h>
 #include <media/stagefright/MediaCodec.h>
 #include <media/stagefright/MediaCodecList.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/NuMediaExtractor.h>
+#include <gui/ISurfaceComposer.h>
 #include <gui/SurfaceComposerClient.h>
+#include <gui/Surface.h>
+#include <ui/DisplayMode.h>
 
 static void usage(const char *me) {
     fprintf(stderr, "usage: %s [-a] use audio\n"
                     "\t\t[-v] use video\n"
                     "\t\t[-p] playback\n"
                     "\t\t[-S] allocate buffers from a surface\n"
-                    "\t\t[-D] decrypt input buffers\n",
+                    "\t\t[-R] render output to surface (enables -S)\n"
+                    "\t\t[-T] use render timestamps (enables -R)\n",
                     me);
-
     exit(1);
 }
 
@@ -48,10 +56,8 @@ namespace android {
 
 struct CodecState {
     sp<MediaCodec> mCodec;
-    Vector<sp<ABuffer> > mCSD;
-    size_t mCSDIndex;
-    Vector<sp<ABuffer> > mInBuffers;
-    Vector<sp<ABuffer> > mOutBuffers;
+    Vector<sp<MediaCodecBuffer> > mInBuffers;
+    Vector<sp<MediaCodecBuffer> > mOutBuffers;
     bool mSignalledInputEOS;
     bool mSawOutputEOS;
     int64_t mNumBuffersDecoded;
@@ -67,13 +73,14 @@ static int decode(
         bool useAudio,
         bool useVideo,
         const android::sp<android::Surface> &surface,
-        bool decryptInputBuffers) {
+        bool renderSurface,
+        bool useTimestamp) {
     using namespace android;
 
     static int64_t kTimeout = 500ll;
 
-    sp<NuMediaExtractor> extractor = new NuMediaExtractor;
-    if (extractor->setDataSource(path) != OK) {
+    sp<NuMediaExtractor> extractor = new NuMediaExtractor(NuMediaExtractor::EntryPoint::OTHER);
+    if (extractor->setDataSource(NULL /* httpService */, path) != OK) {
         fprintf(stderr, "unable to instantiate extractor.\n");
         return 1;
     }
@@ -101,7 +108,7 @@ static int decode(
             continue;
         }
 
-        ALOGV("selecting track %d", i);
+        ALOGV("selecting track %zu", i);
 
         err = extractor->selectTrack(i);
         CHECK_EQ(err, (status_t)OK);
@@ -113,52 +120,26 @@ static int decode(
         state->mNumBuffersDecoded = 0;
         state->mIsAudio = isAudio;
 
-        if (decryptInputBuffers && !isAudio) {
-            static const MediaCodecList *list = MediaCodecList::getInstance();
-
-            ssize_t index =
-                list->findCodecByType(mime.c_str(), false /* encoder */);
-
-            CHECK_GE(index, 0);
-
-            const char *componentName = list->getCodecName(index);
-
-            AString fullName = componentName;
-            fullName.append(".secure");
-
-            state->mCodec = MediaCodec::CreateByComponentName(
-                    looper, fullName.c_str());
-        } else {
-            state->mCodec = MediaCodec::CreateByType(
-                    looper, mime.c_str(), false /* encoder */);
-        }
+        state->mCodec = MediaCodec::CreateByType(
+                looper, mime.c_str(), false /* encoder */);
 
         CHECK(state->mCodec != NULL);
 
         err = state->mCodec->configure(
                 format, isVideo ? surface : NULL,
-                decryptInputBuffers ? MediaCodec::CONFIGURE_FLAG_SECURE : 0);
+                NULL /* crypto */,
+                0 /* flags */);
 
         CHECK_EQ(err, (status_t)OK);
 
-        size_t j = 0;
-        sp<ABuffer> buffer;
-        while (format->findBuffer(StringPrintf("csd-%d", j).c_str(), &buffer)) {
-            state->mCSD.push_back(buffer);
-
-            ++j;
-        }
-
-        state->mCSDIndex = 0;
         state->mSignalledInputEOS = false;
         state->mSawOutputEOS = false;
-
-        ALOGV("got %d pieces of codec specific data.", state->mCSD.size());
     }
 
     CHECK(!stateByTrack.isEmpty());
 
-    int64_t startTimeUs = ALooper::GetNowUs();
+    int64_t startTimeUs = android::ALooper::GetNowUs();
+    int64_t startTimeRender = -1;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
         CodecState *state = &stateByTrack.editValueAt(i);
@@ -170,30 +151,8 @@ static int decode(
         CHECK_EQ((status_t)OK, codec->getInputBuffers(&state->mInBuffers));
         CHECK_EQ((status_t)OK, codec->getOutputBuffers(&state->mOutBuffers));
 
-        ALOGV("got %d input and %d output buffers",
+        ALOGV("got %zu input and %zu output buffers",
               state->mInBuffers.size(), state->mOutBuffers.size());
-
-        while (state->mCSDIndex < state->mCSD.size()) {
-            size_t index;
-            status_t err = codec->dequeueInputBuffer(&index, -1ll);
-            CHECK_EQ(err, (status_t)OK);
-
-            const sp<ABuffer> &srcBuffer =
-                state->mCSD.itemAt(state->mCSDIndex++);
-
-            const sp<ABuffer> &buffer = state->mInBuffers.itemAt(index);
-
-            memcpy(buffer->data(), srcBuffer->data(), srcBuffer->size());
-
-            err = codec->queueInputBuffer(
-                    index,
-                    0 /* offset */,
-                    srcBuffer->size(),
-                    0ll /* timeUs */,
-                    MediaCodec::BUFFER_FLAG_CODECCONFIG);
-
-            CHECK_EQ(err, (status_t)OK);
-        }
     }
 
     bool sawInputEOS = false;
@@ -213,28 +172,20 @@ static int decode(
                 err = state->mCodec->dequeueInputBuffer(&index, kTimeout);
 
                 if (err == OK) {
-                    ALOGV("filling input buffer %d", index);
+                    ALOGV("filling input buffer %zu", index);
 
-                    const sp<ABuffer> &buffer = state->mInBuffers.itemAt(index);
+                    const sp<MediaCodecBuffer> &buffer = state->mInBuffers.itemAt(index);
+                    sp<ABuffer> abuffer = new ABuffer(buffer->base(), buffer->capacity());
 
-                    err = extractor->readSampleData(buffer);
+                    err = extractor->readSampleData(abuffer);
                     CHECK_EQ(err, (status_t)OK);
+                    buffer->setRange(abuffer->offset(), abuffer->size());
 
                     int64_t timeUs;
                     err = extractor->getSampleTime(&timeUs);
                     CHECK_EQ(err, (status_t)OK);
 
                     uint32_t bufferFlags = 0;
-
-                    uint32_t sampleFlags;
-                    err = extractor->getSampleFlags(&sampleFlags);
-                    CHECK_EQ(err, (status_t)OK);
-
-                    if (sampleFlags & NuMediaExtractor::SAMPLE_FLAG_ENCRYPTED) {
-                        CHECK(decryptInputBuffers);
-
-                        bufferFlags |= MediaCodec::BUFFER_FLAG_ENCRYPTED;
-                    }
 
                     err = state->mCodec->queueInputBuffer(
                             index,
@@ -260,7 +211,7 @@ static int decode(
                         state->mCodec->dequeueInputBuffer(&index, kTimeout);
 
                     if (err == OK) {
-                        ALOGV("signalling input EOS on track %d", i);
+                        ALOGV("signalling input EOS on track %zu", i);
 
                         err = state->mCodec->queueInputBuffer(
                                 index,
@@ -309,13 +260,29 @@ static int decode(
                     kTimeout);
 
             if (err == OK) {
-                ALOGV("draining output buffer %d, time = %lld us",
-                      index, presentationTimeUs);
+                ALOGV("draining output buffer %zu, time = %lld us",
+                      index, (long long)presentationTimeUs);
 
                 ++state->mNumBuffersDecoded;
                 state->mNumBytesDecoded += size;
 
-                err = state->mCodec->releaseOutputBuffer(index);
+                if (surface == NULL || !renderSurface) {
+                    err = state->mCodec->releaseOutputBuffer(index);
+                } else if (useTimestamp) {
+                    if (startTimeRender == -1) {
+                        // begin rendering 2 vsyncs (~33ms) after first decode
+                        startTimeRender =
+                                systemTime(SYSTEM_TIME_MONOTONIC) + 33000000
+                                - (presentationTimeUs * 1000);
+                    }
+                    presentationTimeUs =
+                            (presentationTimeUs * 1000) + startTimeRender;
+                    err = state->mCodec->renderOutputBufferAndRelease(
+                            index, presentationTimeUs);
+                } else {
+                    err = state->mCodec->renderOutputBufferAndRelease(index);
+                }
+
                 CHECK_EQ(err, (status_t)OK);
 
                 if (flags & MediaCodec::BUFFER_FLAG_EOS) {
@@ -328,7 +295,7 @@ static int decode(
                 CHECK_EQ((status_t)OK,
                          state->mCodec->getOutputBuffers(&state->mOutBuffers));
 
-                ALOGV("got %d output buffers", state->mOutBuffers.size());
+                ALOGV("got %zu output buffers", state->mOutBuffers.size());
             } else if (err == INFO_FORMAT_CHANGED) {
                 sp<AMessage> format;
                 CHECK_EQ((status_t)OK, state->mCodec->getOutputFormat(&format));
@@ -340,7 +307,7 @@ static int decode(
         }
     }
 
-    int64_t elapsedTimeUs = ALooper::GetNowUs() - startTimeUs;
+    int64_t elapsedTimeUs = android::ALooper::GetNowUs() - startTimeUs;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
         CodecState *state = &stateByTrack.editValueAt(i);
@@ -348,17 +315,17 @@ static int decode(
         CHECK_EQ((status_t)OK, state->mCodec->release());
 
         if (state->mIsAudio) {
-            printf("track %d: %lld bytes received. %.2f KB/sec\n",
+            printf("track %zu: %lld bytes received. %.2f KB/sec\n",
                    i,
-                   state->mNumBytesDecoded,
+                   (long long)state->mNumBytesDecoded,
                    state->mNumBytesDecoded * 1E6 / 1024 / elapsedTimeUs);
         } else {
-            printf("track %d: %lld frames decoded, %.2f fps. %lld bytes "
-                   "received. %.2f KB/sec\n",
+            printf("track %zu: %lld frames decoded, %.2f fps. %lld"
+                    " bytes received. %.2f KB/sec\n",
                    i,
-                   state->mNumBuffersDecoded,
+                   (long long)state->mNumBuffersDecoded,
                    state->mNumBuffersDecoded * 1E6 / elapsedTimeUs,
-                   state->mNumBytesDecoded,
+                   (long long)state->mNumBytesDecoded,
                    state->mNumBytesDecoded * 1E6 / 1024 / elapsedTimeUs);
         }
     }
@@ -375,41 +342,42 @@ int main(int argc, char **argv) {
     bool useVideo = false;
     bool playback = false;
     bool useSurface = false;
-    bool decryptInputBuffers = false;
+    bool renderSurface = false;
+    bool useTimestamp = false;
 
     int res;
-    while ((res = getopt(argc, argv, "havpSD")) >= 0) {
+    while ((res = getopt(argc, argv, "havpSDRT")) >= 0) {
         switch (res) {
             case 'a':
             {
                 useAudio = true;
                 break;
             }
-
             case 'v':
             {
                 useVideo = true;
                 break;
             }
-
             case 'p':
             {
                 playback = true;
                 break;
             }
-
+            case 'T':
+            {
+                useTimestamp = true;
+                FALLTHROUGH_INTENDED;
+            }
+            case 'R':
+            {
+                renderSurface = true;
+                FALLTHROUGH_INTENDED;
+            }
             case 'S':
             {
                 useSurface = true;
                 break;
             }
-
-            case 'D':
-            {
-                decryptInputBuffers = true;
-                break;
-            }
-
             case '?':
             case 'h':
             default:
@@ -432,9 +400,7 @@ int main(int argc, char **argv) {
 
     ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
-    sp<ALooper> looper = new ALooper;
+    sp<android::ALooper> looper = new android::ALooper;
     looper->start();
 
     sp<SurfaceComposerClient> composerClient;
@@ -445,14 +411,23 @@ int main(int argc, char **argv) {
         composerClient = new SurfaceComposerClient;
         CHECK_EQ(composerClient->initCheck(), (status_t)OK);
 
-        ssize_t displayWidth = composerClient->getDisplayWidth(0);
-        ssize_t displayHeight = composerClient->getDisplayHeight(0);
+        const std::vector<PhysicalDisplayId> ids = SurfaceComposerClient::getPhysicalDisplayIds();
+        CHECK(!ids.empty());
 
-        ALOGV("display is %ld x %ld\n", displayWidth, displayHeight);
+        const sp<IBinder> display = SurfaceComposerClient::getPhysicalDisplayToken(ids.front());
+        CHECK(display != nullptr);
+
+        ui::DisplayMode mode;
+        CHECK_EQ(SurfaceComposerClient::getActiveDisplayMode(display, &mode), NO_ERROR);
+
+        const ui::Size& resolution = mode.resolution;
+        const ssize_t displayWidth = resolution.getWidth();
+        const ssize_t displayHeight = resolution.getHeight();
+
+        ALOGV("display is %zd x %zd\n", displayWidth, displayHeight);
 
         control = composerClient->createSurface(
                 String8("A Surface"),
-                0,
                 displayWidth,
                 displayHeight,
                 PIXEL_FORMAT_RGB_565,
@@ -461,10 +436,10 @@ int main(int argc, char **argv) {
         CHECK(control != NULL);
         CHECK(control->isValid());
 
-        SurfaceComposerClient::openGlobalTransaction();
-        CHECK_EQ(control->setLayer(INT_MAX), (status_t)OK);
-        CHECK_EQ(control->show(), (status_t)OK);
-        SurfaceComposerClient::closeGlobalTransaction();
+        SurfaceComposerClient::Transaction{}
+                 .setLayer(control, INT_MAX)
+                 .show(control)
+                 .apply();
 
         surface = control->getSurface();
         CHECK(surface != NULL);
@@ -475,14 +450,14 @@ int main(int argc, char **argv) {
         looper->registerHandler(player);
 
         player->setDataSource(argv[0]);
-        player->setSurface(surface->getSurfaceTexture());
+        player->setSurface(surface->getIGraphicBufferProducer());
         player->start();
         sleep(60);
         player->stop();
         player->reset();
     } else {
-        decode(looper, argv[0],
-               useAudio, useVideo, surface, decryptInputBuffers);
+        decode(looper, argv[0], useAudio, useVideo, surface, renderSurface,
+                useTimestamp);
     }
 
     if (playback || (useSurface && useVideo)) {

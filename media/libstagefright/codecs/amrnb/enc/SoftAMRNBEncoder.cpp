@@ -49,7 +49,7 @@ SoftAMRNBEncoder::SoftAMRNBEncoder(
       mBitRate(0),
       mMode(MR475),
       mInputSize(0),
-      mInputTimeUs(-1ll),
+      mInputTimeUs(-1LL),
       mSawInputEOS(false),
       mSignalledError(false) {
     initPorts();
@@ -120,6 +120,10 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalGetParameter(
             OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
                 (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
 
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (formatParams->nPortIndex > 1) {
                 return OMX_ErrorUndefined;
             }
@@ -140,6 +144,10 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalGetParameter(
             OMX_AUDIO_PARAM_AMRTYPE *amrParams =
                 (OMX_AUDIO_PARAM_AMRTYPE *)params;
 
+            if (!isValidOMXParam(amrParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (amrParams->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
             }
@@ -157,6 +165,10 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalGetParameter(
         {
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (pcmParams->nPortIndex != 0) {
                 return OMX_ErrorUndefined;
@@ -188,6 +200,10 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalSetParameter(
             const OMX_PARAM_COMPONENTROLETYPE *roleParams =
                 (const OMX_PARAM_COMPONENTROLETYPE *)params;
 
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (strncmp((const char *)roleParams->cRole,
                         "audio_encoder.amrnb",
                         OMX_MAX_STRINGNAME_SIZE - 1)) {
@@ -202,12 +218,12 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalSetParameter(
             const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
                 (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
 
-            if (formatParams->nPortIndex > 1) {
-                return OMX_ErrorUndefined;
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
             }
 
-            if (formatParams->nIndex > 0) {
-                return OMX_ErrorNoMore;
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
             }
 
             if ((formatParams->nPortIndex == 0
@@ -224,6 +240,10 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalSetParameter(
         {
             OMX_AUDIO_PARAM_AMRTYPE *amrParams =
                 (OMX_AUDIO_PARAM_AMRTYPE *)params;
+
+            if (!isValidOMXParam(amrParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (amrParams->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
@@ -252,12 +272,16 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalSetParameter(
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
 
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (pcmParams->nPortIndex != 0) {
                 return OMX_ErrorUndefined;
             }
 
             if (pcmParams->nChannels != 1
-                    || pcmParams->nSamplingRate != kSampleRate) {
+                    || pcmParams->nSamplingRate != (OMX_U32)kSampleRate) {
                 return OMX_ErrorUndefined;
             }
 
@@ -270,7 +294,7 @@ OMX_ERRORTYPE SoftAMRNBEncoder::internalSetParameter(
     }
 }
 
-void SoftAMRNBEncoder::onQueueFilled(OMX_U32 portIndex) {
+void SoftAMRNBEncoder::onQueueFilled(OMX_U32 /* portIndex */) {
     if (mSignalledError) {
         return;
     }
@@ -316,7 +340,7 @@ void SoftAMRNBEncoder::onQueueFilled(OMX_U32 portIndex) {
             // "Time" on the input buffer has in effect advanced by the
             // number of audio frames we just advanced nOffset by.
             inHeader->nTimeStamp +=
-                (copy * 1000000ll / kSampleRate) / sizeof(int16_t);
+                (copy * 1000000LL / kSampleRate) / sizeof(int16_t);
 
             if (inHeader->nFilledLen == 0) {
                 if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
@@ -397,6 +421,7 @@ void SoftAMRNBEncoder::onQueueFilled(OMX_U32 portIndex) {
 
 }  // namespace android
 
+__attribute__((cfi_canonical_jump_table))
 android::SoftOMXComponent *createSoftOMXComponent(
         const char *name, const OMX_CALLBACKTYPE *callbacks,
         OMX_PTR appData, OMX_COMPONENTTYPE **component) {

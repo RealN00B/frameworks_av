@@ -14,33 +14,22 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
+#include <inttypes.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/AMRWriter.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
-#include <media/stagefright/MediaSource.h>
 #include <media/stagefright/MetaData.h>
+#include <media/stagefright/MediaSource.h>
 #include <media/mediarecorder.h>
-#include <sys/prctl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 namespace android {
-
-AMRWriter::AMRWriter(const char *filename)
-    : mFd(-1),
-      mInitCheck(NO_INIT),
-      mStarted(false),
-      mPaused(false),
-      mResumed(false) {
-
-    mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR);
-    if (mFd >= 0) {
-        mInitCheck = OK;
-    }
-}
 
 AMRWriter::AMRWriter(int fd)
     : mFd(dup(fd)),
@@ -105,7 +94,7 @@ status_t AMRWriter::addSource(const sp<MediaSource> &source) {
     return OK;
 }
 
-status_t AMRWriter::start(MetaData *params) {
+status_t AMRWriter::start(MetaData * /* params */) {
     if (mInitCheck != OK) {
         return mInitCheck;
     }
@@ -160,11 +149,11 @@ status_t AMRWriter::reset() {
     mDone = true;
 
     void *dummy;
+    status_t status = mSource->stop();
     pthread_join(mThread, &dummy);
 
-    status_t err = (status_t) dummy;
+    status_t err = static_cast<status_t>(reinterpret_cast<uintptr_t>(dummy));
     {
-        status_t status = mSource->stop();
         if (err == OK &&
             (status != OK && status != ERROR_END_OF_STREAM)) {
             err = status;
@@ -191,7 +180,7 @@ bool AMRWriter::exceedsFileDurationLimit() {
 
 // static
 void *AMRWriter::ThreadWrapper(void *me) {
-    return (void *) static_cast<AMRWriter *>(me)->threadFunc();
+    return (void *)(uintptr_t) static_cast<AMRWriter *>(me)->threadFunc();
 }
 
 status_t AMRWriter::threadFunc() {
@@ -204,7 +193,7 @@ status_t AMRWriter::threadFunc() {
 
     prctl(PR_SET_NAME, (unsigned long)"AMRWriter", 0, 0, 0);
     while (!mDone) {
-        MediaBuffer *buffer;
+        MediaBufferBase *buffer;
         err = mSource->read(&buffer);
 
         if (err != OK) {
@@ -226,7 +215,7 @@ status_t AMRWriter::threadFunc() {
         }
 
         int64_t timestampUs;
-        CHECK(buffer->meta_data()->findInt64(kKeyTime, &timestampUs));
+        CHECK(buffer->meta_data().findInt64(kKeyTime, &timestampUs));
         if (timestampUs > mEstimatedDurationUs) {
             mEstimatedDurationUs = timestampUs;
         }
@@ -235,7 +224,7 @@ status_t AMRWriter::threadFunc() {
             mResumed = false;
         }
         timestampUs -= previousPausedDurationUs;
-        ALOGV("time stamp: %lld, previous paused duration: %lld",
+        ALOGV("time stamp: %" PRId64 ", previous paused duration: %" PRId64,
                 timestampUs, previousPausedDurationUs);
         if (timestampUs > maxTimestampUs) {
             maxTimestampUs = timestampUs;
@@ -254,11 +243,14 @@ status_t AMRWriter::threadFunc() {
         if (n < (ssize_t)buffer->range_length()) {
             buffer->release();
             buffer = NULL;
-
+            err = ERROR_IO;
             break;
         }
 
-        // XXX: How to tell it is stopped prematurely?
+        if (err != OK) {
+            break;
+        }
+
         if (stoppedPrematurely) {
             stoppedPrematurely = false;
         }
@@ -267,8 +259,8 @@ status_t AMRWriter::threadFunc() {
         buffer = NULL;
     }
 
-    if (stoppedPrematurely) {
-        notify(MEDIA_RECORDER_EVENT_INFO, MEDIA_RECORDER_TRACK_INFO_COMPLETION_STATUS, UNKNOWN_ERROR);
+    if ((err == OK || err == ERROR_END_OF_STREAM) && stoppedPrematurely) {
+        err = ERROR_MALFORMED;
     }
 
     close(mFd);

@@ -18,7 +18,7 @@
 #define LOG_TAG "ASessionDescription"
 #include <utils/Log.h>
 
-#include "ASessionDescription.h"
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AString.h>
@@ -26,6 +26,8 @@
 #include <stdlib.h>
 
 namespace android {
+
+constexpr unsigned kDefaultAs = 960; // kbps?
 
 ASessionDescription::ASessionDescription()
     : mIsValid(false) {
@@ -80,7 +82,7 @@ bool ASessionDescription::parse(const void *data, size_t size) {
             return false;
         }
 
-        ALOGI("%s", line.c_str());
+        ALOGV("%s", line.c_str());
 
         switch (line.c_str()[0]) {
             case 'v':
@@ -103,7 +105,7 @@ bool ASessionDescription::parse(const void *data, size_t size) {
                     key.setTo(line, 0, colonPos);
 
                     if (key == "a=fmtp" || key == "a=rtpmap"
-                            || key == "a=framesize") {
+                            || key == "a=framesize" || key == "a=extmap") {
                         ssize_t spacePos = line.find(" ", colonPos + 1);
                         if (spacePos < 0) {
                             return false;
@@ -141,6 +143,12 @@ bool ASessionDescription::parse(const void *data, size_t size) {
                 AString key, value;
 
                 ssize_t equalPos = line.find("=");
+                /* The condition 'if (line.size() < 2 || line.c_str()[1] != '=')' a few lines above
+                 * ensures '=' is at position 1.  However for robustness we do the following check.
+                 */
+                if (equalPos < 0) {
+                    return false;
+                }
 
                 key = AString(line, 0, equalPos + 1);
                 value = AString(line, equalPos + 1, line.size() - equalPos - 1);
@@ -195,6 +203,33 @@ bool ASessionDescription::findAttribute(
     return true;
 }
 
+bool ASessionDescription::getCvoExtMap(
+        size_t index, int32_t *cvoExtMap) const {
+    CHECK_GE(index, 0u);
+    CHECK_LT(index, mTracks.size());
+
+    AString key, value;
+    *cvoExtMap = 0;
+
+    const Attribs &track = mTracks.itemAt(index);
+    for (size_t i = 0; i < track.size(); i++) {
+        value = track.valueAt(i);
+        if (value.size() > 0 && strcmp(value.c_str(), "urn:3gpp:video-orientation") == 0) {
+            key = track.keyAt(i);
+            break;
+        }
+    }
+
+    if (key.size() > 0) {
+        const char *colonPos = strrchr(key.c_str(), ':');
+        colonPos++;
+        *cvoExtMap = atoi(colonPos);
+        return true;
+    }
+
+    return false;
+}
+
 void ASessionDescription::getFormatType(
         size_t index, unsigned long *PT,
         AString *desc, AString *params) const {
@@ -212,12 +247,14 @@ void ASessionDescription::getFormatType(
     *PT = x;
 
     char key[20];
-    sprintf(key, "a=rtpmap:%lu", x);
-
-    CHECK(findAttribute(index, key, desc));
-
-    sprintf(key, "a=fmtp:%lu", x);
-    if (!findAttribute(index, key, params)) {
+    snprintf(key, sizeof(key), "a=rtpmap:%lu", x);
+    if (findAttribute(index, key, desc)) {
+        snprintf(key, sizeof(key), "a=fmtp:%lu", x);
+        if (!findAttribute(index, key, params)) {
+            params->clear();
+        }
+    } else {
+        desc->clear();
         params->clear();
     }
 }
@@ -229,7 +266,7 @@ bool ASessionDescription::getDimensions(
     *height = 0;
 
     char key[20];
-    sprintf(key, "a=framesize:%lu", PT);
+    snprintf(key, sizeof(key), "a=framesize:%lu", PT);
     AString value;
     if (!findAttribute(index, key, &value)) {
         return false;
@@ -259,7 +296,7 @@ bool ASessionDescription::getDurationUs(int64_t *durationUs) const {
         return false;
     }
 
-    if (strncmp(value.c_str(), "npt=", 4)) {
+    if (strncmp(value.c_str(), "npt=", 4) && strncmp(value.c_str(), "npt:", 4)) {
         return false;
     }
 
@@ -319,6 +356,11 @@ bool ASessionDescription::parseNTPRange(
 
     s = end + 1;  // skip the dash.
 
+    if (*s == '\0') {
+        *npt2 = FLT_MAX;  // open ended.
+        return true;
+    }
+
     if (!strncmp("now", s, 3)) {
         return false;  // no absolute end time available
     }
@@ -330,6 +372,75 @@ bool ASessionDescription::parseNTPRange(
     }
 
     return *npt2 > *npt1;
+}
+
+// static
+void ASessionDescription::SDPStringFactory(AString &sdp,
+        const char *ip, bool isAudio, unsigned port, unsigned payloadType,
+        unsigned as, const char *codec, const char *fmtp,
+        int32_t width, int32_t height, int32_t cvoExtMap)
+{
+    bool isIPv4 = (AString(ip).find("::") == -1) ? true : false;
+    sdp.clear();
+    sdp.append("v=0\r\n");
+
+    sdp.append("a=range:npt=now-\r\n");
+
+    sdp.append("m=");
+    sdp.append(isAudio ? "audio " : "video ");
+    sdp.append(port);
+    sdp.append(" RTP/AVP ");
+    sdp.append(payloadType);
+    sdp.append("\r\n");
+
+    sdp.append("c= IN IP");
+    if (isIPv4) {
+        sdp.append("4 ");
+    } else {
+        sdp.append("6 ");
+    }
+    sdp.append(ip);
+    sdp.append("\r\n");
+
+    sdp.append("b=AS:");
+    sdp.append(as > 0 ? as : kDefaultAs);
+    sdp.append("\r\n");
+
+    sdp.append("a=rtpmap:");
+    sdp.append(payloadType);
+    sdp.append(" ");
+    sdp.append(codec);
+    sdp.append("/");
+    sdp.append(isAudio ? "8000" : "90000");
+    sdp.append("\r\n");
+
+    if (fmtp != NULL) {
+        sdp.append("a=fmtp:");
+        sdp.append(payloadType);
+        sdp.append(" ");
+        sdp.append(fmtp);
+        sdp.append("\r\n");
+    }
+
+    if (!isAudio && width > 0 && height > 0) {
+        sdp.append("a=framesize:");
+        sdp.append(payloadType);
+        sdp.append(" ");
+        sdp.append(width);
+        sdp.append("-");
+        sdp.append(height);
+        sdp.append("\r\n");
+    }
+
+    if (cvoExtMap > 0) {
+        sdp.append("a=extmap:");
+        sdp.append(cvoExtMap);
+        sdp.append(" ");
+        sdp.append("urn:3gpp:video-orientation");
+        sdp.append("\r\n");
+    }
+
+    ALOGV("SDPStringFactory => %s", sdp.c_str());
 }
 
 }  // namespace android

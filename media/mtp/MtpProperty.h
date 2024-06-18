@@ -19,11 +19,16 @@
 
 #include "MtpTypes.h"
 
+#include <string>
+
 namespace android {
 
 class MtpDataPacket;
 
 struct MtpPropertyValue {
+    // pointer str initialized to NULL so that free operation
+    // is not called for pre-assigned value
+    MtpPropertyValue() : str (NULL) {}
     union {
         int8_t          i8;
         uint8_t         u8;
@@ -49,9 +54,9 @@ public:
     MtpPropertyValue    mCurrentValue;
 
     // for array types
-    int                 mDefaultArrayLength;
+    uint32_t            mDefaultArrayLength;
     MtpPropertyValue*   mDefaultArrayValues;
-    int                 mCurrentArrayLength;
+    uint32_t            mCurrentArrayLength;
     MtpPropertyValue*   mCurrentArrayValues;
 
     enum {
@@ -70,7 +75,7 @@ public:
     MtpPropertyValue    mStepSize;
 
     // for enum form
-    int                 mEnumLength;
+    uint16_t            mEnumLength;
     MtpPropertyValue*   mEnumValues;
 
 public:
@@ -81,20 +86,23 @@ public:
                                      int defaultValue = 0);
     virtual             ~MtpProperty();
 
-    inline MtpPropertyCode getPropertyCode() const { return mCode; }
+    MtpPropertyCode getPropertyCode() const { return mCode; }
+    MtpDataType getDataType() const { return mType; }
 
-    void                read(MtpDataPacket& packet);
+    bool                read(MtpDataPacket& packet);
     void                write(MtpDataPacket& packet);
 
     void                setDefaultValue(const uint16_t* string);
     void                setCurrentValue(const uint16_t* string);
+    void                setCurrentValue(const char* string);
+    void                setCurrentValue(MtpDataPacket& packet);
+    const MtpPropertyValue& getCurrentValue() { return mCurrentValue; }
 
     void                setFormRange(int min, int max, int step);
     void                setFormEnum(const int* values, int count);
     void                setFormDateTime();
 
     void                print();
-    void                print(MtpPropertyValue& value, MtpString& buffer);
 
     inline bool         isDeviceProperty() const {
                             return (   ((mCode & 0xF000) == 0x5000)
@@ -102,11 +110,12 @@ public:
                         }
 
 private:
-    void                readValue(MtpDataPacket& packet, MtpPropertyValue& value);
+    bool                readValue(MtpDataPacket& packet, MtpPropertyValue& value);
     void                writeValue(MtpDataPacket& packet, MtpPropertyValue& value);
-    MtpPropertyValue*   readArrayValues(MtpDataPacket& packet, int& length);
+    MtpPropertyValue*   readArrayValues(MtpDataPacket& packet, uint32_t& length);
     void                writeArrayValues(MtpDataPacket& packet,
-                                            MtpPropertyValue* values, int length);
+                                            MtpPropertyValue* values, uint32_t length);
+    void                print(MtpPropertyValue& value, std::string& buffer);
 };
 
 }; // namespace android

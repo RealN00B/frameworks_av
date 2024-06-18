@@ -18,13 +18,16 @@
 #define LOG_TAG "StagefrightMediaScanner"
 #include <utils/Log.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <media/stagefright/MediaExtractorFactory.h>
 #include <media/stagefright/StagefrightMediaScanner.h>
 
+#include <media/IMediaHTTPService.h>
 #include <media/mediametadataretriever.h>
 #include <private/media/VideoFrame.h>
-
-// Sonivox includes
-#include <libsonivox/eas.h>
 
 namespace android {
 
@@ -32,72 +35,21 @@ StagefrightMediaScanner::StagefrightMediaScanner() {}
 
 StagefrightMediaScanner::~StagefrightMediaScanner() {}
 
-static bool FileHasAcceptableExtension(const char *extension) {
-    static const char *kValidExtensions[] = {
-        ".mp3", ".mp4", ".m4a", ".3gp", ".3gpp", ".3g2", ".3gpp2",
-        ".mpeg", ".ogg", ".mid", ".smf", ".imy", ".wma", ".aac",
-        ".wav", ".amr", ".midi", ".xmf", ".rtttl", ".rtx", ".ota",
-        ".mkv", ".mka", ".webm", ".ts", ".fl", ".flac", ".mxmf",
-        ".avi", ".mpeg", ".mpg"
-    };
-    static const size_t kNumValidExtensions =
-        sizeof(kValidExtensions) / sizeof(kValidExtensions[0]);
+static std::vector<std::string> gSupportedExtensions;
 
-    for (size_t i = 0; i < kNumValidExtensions; ++i) {
-        if (!strcasecmp(extension, kValidExtensions[i])) {
+static bool FileHasAcceptableExtension(const char *extension) {
+
+    if (gSupportedExtensions.empty()) {
+        // get the list from the service
+        gSupportedExtensions = MediaExtractorFactory::getSupportedTypes();
+    }
+
+    for (auto ext: gSupportedExtensions) {
+        if (ext == (extension + 1)) {
             return true;
         }
     }
-
     return false;
-}
-
-static MediaScanResult HandleMIDI(
-        const char *filename, MediaScannerClient *client) {
-    // get the library configuration and do sanity check
-    const S_EAS_LIB_CONFIG* pLibConfig = EAS_Config();
-    if ((pLibConfig == NULL) || (LIB_VERSION != pLibConfig->libVersion)) {
-        ALOGE("EAS library/header mismatch\n");
-        return MEDIA_SCAN_RESULT_ERROR;
-    }
-    EAS_I32 temp;
-
-    // spin up a new EAS engine
-    EAS_DATA_HANDLE easData = NULL;
-    EAS_HANDLE easHandle = NULL;
-    EAS_RESULT result = EAS_Init(&easData);
-    if (result == EAS_SUCCESS) {
-        EAS_FILE file;
-        file.path = filename;
-        file.fd = 0;
-        file.offset = 0;
-        file.length = 0;
-        result = EAS_OpenFile(easData, &file, &easHandle);
-    }
-    if (result == EAS_SUCCESS) {
-        result = EAS_Prepare(easData, easHandle);
-    }
-    if (result == EAS_SUCCESS) {
-        result = EAS_ParseMetaData(easData, easHandle, &temp);
-    }
-    if (easHandle) {
-        EAS_CloseFile(easData, easHandle);
-    }
-    if (easData) {
-        EAS_Shutdown(easData);
-    }
-
-    if (result != EAS_SUCCESS) {
-        return MEDIA_SCAN_RESULT_SKIPPED;
-    }
-
-    char buffer[20];
-    sprintf(buffer, "%ld", temp);
-    status_t status = client->addStringTag("duration", buffer);
-    if (status != OK) {
-        return MEDIA_SCAN_RESULT_ERROR;
-    }
-    return MEDIA_SCAN_RESULT_OK;
 }
 
 MediaScanResult StagefrightMediaScanner::processFile(
@@ -108,12 +60,17 @@ MediaScanResult StagefrightMediaScanner::processFile(
     client.setLocale(locale());
     client.beginFile();
     MediaScanResult result = processFileInternal(path, mimeType, client);
+    ALOGV("result: %d", result);
+    if (mimeType == NULL && result != MEDIA_SCAN_RESULT_OK) {
+        ALOGW("media scan failed for %s", path);
+        client.setMimeType("application/octet-stream");
+    }
     client.endFile();
     return result;
 }
 
 MediaScanResult StagefrightMediaScanner::processFileInternal(
-        const char *path, const char *mimeType,
+        const char *path, const char * /* mimeType */,
         MediaScannerClient &client) {
     const char *extension = strrchr(path, '.');
 
@@ -125,21 +82,19 @@ MediaScanResult StagefrightMediaScanner::processFileInternal(
         return MEDIA_SCAN_RESULT_SKIPPED;
     }
 
-    if (!strcasecmp(extension, ".mid")
-            || !strcasecmp(extension, ".smf")
-            || !strcasecmp(extension, ".imy")
-            || !strcasecmp(extension, ".midi")
-            || !strcasecmp(extension, ".xmf")
-            || !strcasecmp(extension, ".rtttl")
-            || !strcasecmp(extension, ".rtx")
-            || !strcasecmp(extension, ".ota")
-            || !strcasecmp(extension, ".mxmf")) {
-        return HandleMIDI(path, &client);
-    }
-
     sp<MediaMetadataRetriever> mRetriever(new MediaMetadataRetriever);
 
-    status_t status = mRetriever->setDataSource(path);
+    int fd = open(path, O_RDONLY | O_LARGEFILE);
+    status_t status;
+    if (fd < 0) {
+        // couldn't open it locally, maybe the media server can?
+        sp<IMediaHTTPService> nullService;
+        status = mRetriever->setDataSource(nullService, path);
+    } else {
+        status = mRetriever->setDataSource(fd, 0, 0x7ffffffffffffffL);
+        close(fd);
+    }
+
     if (status) {
         return MEDIA_SCAN_RESULT_ERROR;
     }
@@ -171,6 +126,14 @@ MediaScanResult StagefrightMediaScanner::processFileInternal(
         { "writer", METADATA_KEY_WRITER },
         { "compilation", METADATA_KEY_COMPILATION },
         { "isdrm", METADATA_KEY_IS_DRM },
+        { "date", METADATA_KEY_DATE },
+        { "width", METADATA_KEY_VIDEO_WIDTH },
+        { "height", METADATA_KEY_VIDEO_HEIGHT },
+        { "colorstandard", METADATA_KEY_COLOR_STANDARD },
+        { "colortransfer", METADATA_KEY_COLOR_TRANSFER },
+        { "colorrange", METADATA_KEY_COLOR_RANGE },
+        { "samplerate", METADATA_KEY_SAMPLERATE },
+        { "bitspersample", METADATA_KEY_BITS_PER_SAMPLE },
     };
     static const size_t kNumEntries = sizeof(kKeyMap) / sizeof(kKeyMap[0]);
 
@@ -187,7 +150,7 @@ MediaScanResult StagefrightMediaScanner::processFileInternal(
     return MEDIA_SCAN_RESULT_OK;
 }
 
-char *StagefrightMediaScanner::extractAlbumArt(int fd) {
+MediaAlbumArt *StagefrightMediaScanner::extractAlbumArt(int fd) {
     ALOGV("extractAlbumArt %d", fd);
 
     off64_t size = lseek64(fd, 0, SEEK_END);
@@ -199,15 +162,13 @@ char *StagefrightMediaScanner::extractAlbumArt(int fd) {
     sp<MediaMetadataRetriever> mRetriever(new MediaMetadataRetriever);
     if (mRetriever->setDataSource(fd, 0, size) == OK) {
         sp<IMemory> mem = mRetriever->extractAlbumArt();
-
         if (mem != NULL) {
-            MediaAlbumArt *art = static_cast<MediaAlbumArt *>(mem->pointer());
-
-            char *data = (char *)malloc(art->mSize + 4);
-            *(int32_t *)data = art->mSize;
-            memcpy(&data[4], &art[1], art->mSize);
-
-            return data;
+            // TODO: Using unsecurePointer() has some associated security pitfalls
+            //       (see declaration for details).
+            //       Either document why it is safe in this case or address the
+            //       issue (e.g. by copying).
+            MediaAlbumArt *art = static_cast<MediaAlbumArt *>(mem->unsecurePointer());
+            return art->clone();
         }
     }
 

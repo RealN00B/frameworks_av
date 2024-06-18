@@ -16,10 +16,13 @@
 
 #define LOG_TAG "EffectReverb"
 //#define LOG_NDEBUG 0
-#include <cutils/log.h>
+
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
+
+#include <log/log.h>
+
 #include "EffectReverb.h"
 #include "EffectsMath.h"
 
@@ -94,23 +97,6 @@ static const effect_descriptor_t * const gDescriptors[] = {
 
 /*--- Effect Library Interface Implementation ---*/
 
-int EffectQueryNumberEffects(uint32_t *pNumEffects) {
-    *pNumEffects = sizeof(gDescriptors) / sizeof(const effect_descriptor_t *);
-    return 0;
-}
-
-int EffectQueryEffect(uint32_t index, effect_descriptor_t *pDescriptor) {
-    if (pDescriptor == NULL) {
-        return -EINVAL;
-    }
-    if (index >= sizeof(gDescriptors) / sizeof(const effect_descriptor_t *)) {
-        return -EINVAL;
-    }
-    memcpy(pDescriptor, gDescriptors[index],
-            sizeof(effect_descriptor_t));
-    return 0;
-}
-
 int EffectCreate(const effect_uuid_t *uuid,
         int32_t sessionId,
         int32_t ioId,
@@ -121,6 +107,8 @@ int EffectCreate(const effect_uuid_t *uuid,
     const effect_descriptor_t *desc;
     int aux = 0;
     int preset = 0;
+    (void)sessionId;
+    (void)ioId;
 
     ALOGV("EffectLibCreateEffect start");
 
@@ -163,7 +151,7 @@ int EffectCreate(const effect_uuid_t *uuid,
 
     module->context.mState = REVERB_STATE_INITIALIZED;
 
-    ALOGV("EffectLibCreateEffect %p ,size %d", module, sizeof(reverb_module_t));
+    ALOGV("EffectLibCreateEffect %p ,size %zu", module, sizeof(reverb_module_t));
 
     return 0;
 }
@@ -194,7 +182,7 @@ int EffectGetDescriptor(const effect_uuid_t *uuid,
 
     for (i = 0; i < length; i++) {
         if (memcmp(uuid, &gDescriptors[i]->uuid, sizeof(effect_uuid_t)) == 0) {
-            memcpy(pDescriptor, gDescriptors[i], sizeof(effect_descriptor_t));
+            *pDescriptor = *gDescriptors[i];
             ALOGV("EffectGetDescriptor - UUID matched Reverb type %d, UUID = %x",
                  i, gDescriptors[i]->uuid.timeLow);
             return 0;
@@ -297,7 +285,6 @@ static int Reverb_Command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSi
         void *pCmdData, uint32_t *replySize, void *pReplyData) {
     reverb_module_t *pRvbModule = (reverb_module_t *) self;
     reverb_object_t *pReverb;
-    int retsize;
 
     if (pRvbModule == NULL ||
             pRvbModule->context.mState == REVERB_STATE_UNINITIALIZED) {
@@ -440,7 +427,7 @@ int Reverb_GetDescriptor(effect_handle_t   self,
         }
     }
 
-    memcpy(pDescriptor, desc, sizeof(effect_descriptor_t));
+    *pDescriptor = *desc;
 
     return 0;
 }   /* end Reverb_getDescriptor */
@@ -546,7 +533,7 @@ int Reverb_setConfig(reverb_module_t *pRvbModule, effect_config_t *pConfig,
         return -EINVAL;
     }
 
-    memcpy(&pRvbModule->config, pConfig, sizeof(effect_config_t));
+    pRvbModule->config = *pConfig;
 
     pReverb->m_nSamplingRate = pRvbModule->config.outputCfg.samplingRate;
 
@@ -644,7 +631,7 @@ int Reverb_setConfig(reverb_module_t *pRvbModule, effect_config_t *pConfig,
 
 void Reverb_getConfig(reverb_module_t *pRvbModule, effect_config_t *pConfig)
 {
-    memcpy(pConfig, &pRvbModule->config, sizeof(effect_config_t));
+    *pConfig = pRvbModule->config;
 }
 
 /*----------------------------------------------------------------------------
@@ -767,15 +754,14 @@ void Reverb_Reset(reverb_object_t *pReverb, bool init) {
  *
  *----------------------------------------------------------------------------
  */
-int Reverb_getParameter(reverb_object_t *pReverb, int32_t param, size_t *pSize,
+int Reverb_getParameter(reverb_object_t *pReverb, int32_t param, uint32_t *pSize,
         void *pValue) {
     int32_t *pValue32;
     int16_t *pValue16;
     t_reverb_settings *pProperties;
-    int32_t i;
     int32_t temp;
     int32_t temp2;
-    size_t size;
+    uint32_t size;
 
     if (pReverb->m_Preset) {
         if (param != REVERB_PARAM_PRESET || *pSize < sizeof(int16_t)) {
@@ -1050,7 +1036,7 @@ int Reverb_getParameter(reverb_object_t *pReverb, int32_t param, size_t *pSize,
  *
  *----------------------------------------------------------------------------
  */
-int Reverb_setParameter(reverb_object_t *pReverb, int32_t param, size_t size,
+int Reverb_setParameter(reverb_object_t *pReverb, int32_t param, uint32_t size,
         void *pValue) {
     int32_t value32;
     int16_t value16;
@@ -1061,7 +1047,7 @@ int Reverb_setParameter(reverb_object_t *pReverb, int32_t param, size_t size,
     reverb_preset_t *pPreset;
     int maxSamples;
     int32_t averageDelay;
-    size_t paramSize;
+    uint32_t paramSize;
 
     ALOGV("Reverb_setParameter, context %p, param %d, value16 %d, value32 %d",
             pReverb, param, *(int16_t *)pValue, *(int32_t *)pValue);
@@ -1668,7 +1654,6 @@ static int Reverb(reverb_object_t *pReverb, int nNumSamplesToAdd,
     int32_t nApOut;
 
     int32_t j;
-    int32_t nEarlyOut;
 
     int32_t tempValue;
 
@@ -2217,13 +2202,12 @@ static int ReverbReadInPresets(reverb_object_t *pReverb) {
     return 0;
 }
 
+__attribute__ ((visibility ("default")))
 audio_effect_library_t AUDIO_EFFECT_LIBRARY_INFO_SYM = {
     .tag = AUDIO_EFFECT_LIBRARY_TAG,
     .version = EFFECT_LIBRARY_API_VERSION,
     .name = "Test Equalizer Library",
     .implementor = "The Android Open Source Project",
-    .query_num_effects = EffectQueryNumberEffects,
-    .query_effect = EffectQueryEffect,
     .create_effect = EffectCreate,
     .release_effect = EffectRelease,
     .get_descriptor = EffectGetDescriptor,

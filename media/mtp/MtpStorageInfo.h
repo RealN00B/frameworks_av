@@ -36,10 +36,10 @@ public:
     char*               mVolumeIdentifier;
 
 public:
-                        MtpStorageInfo(MtpStorageID id);
+    explicit            MtpStorageInfo(MtpStorageID id);
     virtual             ~MtpStorageInfo();
 
-    void                read(MtpDataPacket& packet);
+    bool                read(MtpDataPacket& packet);
 
     void                print();
 };

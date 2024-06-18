@@ -30,7 +30,7 @@ enum {
 class BpMediaRecorderClient: public BpInterface<IMediaRecorderClient>
 {
 public:
-    BpMediaRecorderClient(const sp<IBinder>& impl)
+    explicit BpMediaRecorderClient(const sp<IBinder>& impl)
         : BpInterface<IMediaRecorderClient>(impl)
     {
     }
@@ -67,4 +67,4 @@ status_t BnMediaRecorderClient::onTransact(
     }
 }
 
-}; // namespace android
+} // namespace android

@@ -30,6 +30,7 @@
 
 namespace android {
 
+struct IMediaHTTPService;
 class IMediaPlayerService;
 class MemoryDealer;
 
@@ -43,14 +44,24 @@ public:
     virtual void                    disconnect();
 
     virtual status_t                setDataSource(
-            const char *url, const KeyedVector<String8, String8> *headers);
+            const sp<IMediaHTTPService> &httpService,
+            const char *url,
+            const KeyedVector<String8, String8> *headers);
 
     virtual status_t                setDataSource(int fd, int64_t offset, int64_t length);
-    virtual sp<IMemory>             getFrameAtTime(int64_t timeUs, int option);
+    virtual status_t                setDataSource(const sp<IDataSource>& source, const char *mime);
+    virtual sp<IMemory>             getFrameAtTime(
+            int64_t timeUs, int option, int colorFormat, bool metaOnly);
+    virtual sp<IMemory>             getImageAtIndex(
+            int index, int colorFormat, bool metaOnly, bool thumbnail);
+    virtual sp<IMemory>             getImageRectAtIndex(
+            int index, int colorFormat, int left, int top, int right, int bottom);
+    virtual sp<IMemory>             getFrameAtIndex(
+            int index, int colorFormat, bool metaOnly);
     virtual sp<IMemory>             extractAlbumArt();
     virtual const char*             extractMetadata(int keyCode);
 
-    virtual status_t                dump(int fd, const Vector<String16>& args) const;
+    virtual status_t                dump(int fd, const Vector<String16>& args);
 
 private:
     friend class MediaPlayerService;
@@ -59,12 +70,12 @@ private:
     virtual ~MetadataRetrieverClient();
 
     mutable Mutex                          mLock;
+    static  Mutex                          sLock;
     sp<MediaMetadataRetrieverBase>         mRetriever;
     pid_t                                  mPid;
 
-    // Keep the shared memory copy of album art and capture frame (for thumbnail)
+    // Keep the shared memory copy of album art
     sp<IMemory>                            mAlbumArt;
-    sp<IMemory>                            mThumbnail;
 };
 
 }; // namespace android

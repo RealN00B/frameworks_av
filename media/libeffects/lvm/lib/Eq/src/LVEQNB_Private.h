@@ -18,18 +18,14 @@
 #ifndef __LVEQNB_PRIVATE_H__
 #define __LVEQNB_PRIVATE_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
-
 /****************************************************************************************/
 /*                                                                                      */
 /*  Includes                                                                            */
 /*                                                                                      */
 /****************************************************************************************/
 
-#include "LVEQNB.h"                                     /* Calling or Application layer definitions */
+#include <audio_utils/BiquadFilter.h>
+#include "LVEQNB.h" /* Calling or Application layer definitions */
 #include "BIQUAD.h"
 #include "LVC_Mixer.h"
 
@@ -40,16 +36,8 @@ extern "C" {
 /****************************************************************************************/
 
 /* General */
-#define LVEQNB_INVALID              0xFFFF              /* Invalid init parameter */
-
-/* Memory */
-#define LVEQNB_INSTANCE_ALIGN       4                   /* 32-bit alignment for instance structures */
-#define LVEQNB_DATA_ALIGN           4                   /* 32-bit alignment for structures */
-#define LVEQNB_COEF_ALIGN           4                   /* 32-bit alignment for long words */
-#define LVEQNB_SCRATCHBUFFERS       4                   /* Number of buffers required for inplace processing */
-#define LVEQNB_SCRATCH_ALIGN        4                   /* 32-bit alignment for long data */
-
-#define LVEQNB_BYPASS_MIXER_TC      100                 /* Bypass Mixer TC */
+#define LVEQNB_INVALID 0xFFFF      /* Invalid init parameter */
+#define LVEQNB_BYPASS_MIXER_TC 100 /* Bypass Mixer TC */
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -58,14 +46,13 @@ extern "C" {
 /****************************************************************************************/
 
 /* Filter biquad types */
-typedef enum
-{
+typedef enum {
+    LVEQNB_SinglePrecision_Float = -1,
     LVEQNB_SinglePrecision = 0,
     LVEQNB_DoublePrecision = 1,
-    LVEQNB_OutOfRange      = 2,
-    LVEQNB_BIQUADTYPE_MAX  = LVM_MAXINT_32
+    LVEQNB_OutOfRange = 2,
+    LVEQNB_BIQUADTYPE_MAX = LVM_MAXINT_32
 } LVEQNB_BiquadType_en;
-
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -73,34 +60,31 @@ typedef enum
 /*                                                                                      */
 /****************************************************************************************/
 
-
-
 /* Instance structure */
-typedef struct
-{
+typedef struct {
     /* Public parameters */
-    LVEQNB_MemTab_t                 MemoryTable;        /* Instance memory allocation table */
-    LVEQNB_Params_t                 Params;             /* Instance parameters */
-    LVEQNB_Capabilities_t           Capabilities;       /* Instance capabilities */
+    void* pScratch;                     /* Pointer to bundle scratch buffer */
+    LVEQNB_Params_t Params;             /* Instance parameters */
+    LVEQNB_Capabilities_t Capabilities; /* Instance capabilities */
 
     /* Aligned memory pointers */
-    LVM_INT16                      *pFastTemporary;        /* Fast temporary data base address */
+    LVM_FLOAT* pFastTemporary; /* Fast temporary data base address */
 
-    /* Process variables */
-    Biquad_2I_Order2_Taps_t         *pEQNB_Taps;        /* Equaliser Taps */
-    Biquad_Instance_t               *pEQNB_FilterState; /* State for each filter band */
+    std::vector<android::audio_utils::BiquadFilter<LVM_FLOAT>>
+            eqBiquad;            /* Biquad filter instances */
+    std::vector<LVM_FLOAT> gain; /* Gain values for all bands*/
 
     /* Filter definitions and call back */
-    LVM_UINT16                      NBands;             /* Number of bands */
-    LVEQNB_BandDef_t                *pBandDefinitions;  /* Filter band definitions */
-    LVEQNB_BiquadType_en            *pBiquadType;       /* Filter biquad types */
+    LVM_UINT16 NBands;                  /* Number of bands */
+    LVEQNB_BandDef_t* pBandDefinitions; /* Filter band definitions */
+    LVEQNB_BiquadType_en* pBiquadType;  /* Filter biquad types */
 
     /* Bypass variable */
-    LVMixer3_2St_st           BypassMixer;              /* Bypass mixer used in transitions */
-    LVM_INT16               bInOperatingModeTransition; /* Operating mode transition flag */
+    LVMixer3_2St_FLOAT_st BypassMixer;
+
+    LVM_INT16 bInOperatingModeTransition; /* Operating mode transition flag */
 
 } LVEQNB_Instance_t;
-
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -108,26 +92,15 @@ typedef struct
 /*                                                                                      */
 /****************************************************************************************/
 
-void    LVEQNB_SetFilters(LVEQNB_Instance_t   *pInstance,
-                          LVEQNB_Params_t     *pParams);
+void LVEQNB_SetFilters(LVEQNB_Instance_t* pInstance, LVEQNB_Params_t* pParams);
 
-void    LVEQNB_SetCoefficients(LVEQNB_Instance_t    *pInstance);
+void LVEQNB_SetCoefficients(LVEQNB_Instance_t* pInstance);
 
-void    LVEQNB_ClearFilterHistory(LVEQNB_Instance_t *pInstance);
+void LVEQNB_ClearFilterHistory(LVEQNB_Instance_t* pInstance);
+LVEQNB_ReturnStatus_en LVEQNB_SinglePrecCoefs(LVM_UINT16 Fs, LVEQNB_BandDef_t* pFilterDefinition,
+                                              PK_FLOAT_Coefs_t* pCoefficients);
 
-LVEQNB_ReturnStatus_en LVEQNB_SinglePrecCoefs(LVM_UINT16        Fs,
-                                              LVEQNB_BandDef_t  *pFilterDefinition,
-                                              PK_C16_Coefs_t    *pCoefficients);
-
-LVEQNB_ReturnStatus_en LVEQNB_DoublePrecCoefs(LVM_UINT16        Fs,
-                                              LVEQNB_BandDef_t  *pFilterDefinition,
-                                              PK_C32_Coefs_t    *pCoefficients);
-
-LVM_INT32 LVEQNB_BypassMixerCallBack (void* hInstance, void *pGeneralPurpose, LVM_INT16 CallbackParam);
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
+LVM_INT32 LVEQNB_BypassMixerCallBack(void* hInstance, void* pGeneralPurpose,
+                                     LVM_INT16 CallbackParam);
 
 #endif /* __LVEQNB_PRIVATE_H__ */
-

@@ -33,12 +33,13 @@
 
 #include "IDrmManagerService.h"
 
-#define INVALID_BUFFER_LENGTH -1
+#define INVALID_BUFFER_LENGTH (-1)
+#define MAX_BINDER_TRANSACTION_SIZE ((1*1024*1024)-(4096*2))
 
 using namespace android;
 
 static void writeDecryptHandleToParcelData(
-        const DecryptHandle* handle, Parcel* data) {
+        const sp<DecryptHandle>& handle, Parcel* data) {
     data->writeInt32(handle->decryptId);
     data->writeString8(handle->mimeType);
     data->writeInt32(handle->decryptApiType);
@@ -66,7 +67,7 @@ static void writeDecryptHandleToParcelData(
 }
 
 static void readDecryptHandleFromParcelData(
-        DecryptHandle* handle, const Parcel& data) {
+        sp<DecryptHandle>& handle, const Parcel& data) {
     if (0 == data.dataAvail()) {
         return;
     }
@@ -98,7 +99,7 @@ static void readDecryptHandleFromParcelData(
     }
 }
 
-static void clearDecryptHandle(DecryptHandle* handle) {
+static void clearDecryptHandle(sp<DecryptHandle> &handle) {
     if (handle == NULL) {
         return;
     }
@@ -148,20 +149,8 @@ status_t BpDrmManagerService::setDrmServiceListener(
 
     data.writeInterfaceToken(IDrmManagerService::getInterfaceDescriptor());
     data.writeInt32(uniqueId);
-    data.writeStrongBinder(drmServiceListener->asBinder());
+    data.writeStrongBinder(IInterface::asBinder(drmServiceListener));
     remote()->transact(SET_DRM_SERVICE_LISTENER, data, &reply);
-    return reply.readInt32();
-}
-
-status_t BpDrmManagerService::installDrmEngine(int uniqueId, const String8& drmEngineFile) {
-    ALOGV("Install DRM Engine");
-    Parcel data, reply;
-
-    data.writeInterfaceToken(IDrmManagerService::getInterfaceDescriptor());
-    data.writeInt32(uniqueId);
-    data.writeString8(drmEngineFile);
-
-    remote()->transact(INSTALL_DRM_ENGINE, data, &reply);
     return reply.readInt32();
 }
 
@@ -190,8 +179,9 @@ DrmConstraints* BpDrmManagerService::getConstraints(
             if (0 < bufferSize) {
                 data = new char[bufferSize];
                 reply.read(data, bufferSize);
+                drmConstraints->put(&key, data);
+                delete[] data;
             }
-            drmConstraints->put(&key, data);
         }
     }
     return drmConstraints;
@@ -219,8 +209,9 @@ DrmMetadata* BpDrmManagerService::getMetadata(int uniqueId, const String8* path)
             if (0 < bufferSize) {
                 data = new char[bufferSize];
                 reply.read(data, bufferSize);
+                drmMetadata->put(&key, data);
+                delete[] data;
             }
-            drmMetadata->put(&key, data);
         }
     }
     return drmMetadata;
@@ -310,7 +301,15 @@ DrmInfo* BpDrmManagerService::acquireDrmInfo(int uniqueId, const DrmInfoRequest*
         const String8 key = keyIt.next();
         data.writeString8(key);
         const String8 value = drmInforequest->get(key);
-        data.writeString8((value == String8("")) ? String8("NULL") : value);
+        if (key == String8("FileDescriptorKey")) {
+            int fd = -1;
+            if (sscanf(value.c_str(), "FileDescriptor[%d]", &fd) != 1) {
+                sscanf(value.c_str(), "%d", &fd);
+            }
+            data.writeFileDescriptor(fd);
+        } else {
+            data.writeString8((value == String8("")) ? String8("NULL") : value);
+        }
     }
 
     remote()->transact(ACQUIRE_DRM_INFO, data, &reply);
@@ -368,13 +367,18 @@ status_t BpDrmManagerService::saveRights(
     return reply.readInt32();
 }
 
-String8 BpDrmManagerService::getOriginalMimeType(int uniqueId, const String8& path) {
+String8 BpDrmManagerService::getOriginalMimeType(int uniqueId, const String8& path, int fd) {
     ALOGV("Get Original MimeType");
     Parcel data, reply;
 
     data.writeInterfaceToken(IDrmManagerService::getInterfaceDescriptor());
     data.writeInt32(uniqueId);
     data.writeString8(path);
+    int32_t isFdValid = (fd >= 0);
+    data.writeInt32(isFdValid);
+    if (isFdValid) {
+        data.writeFileDescriptor(fd);
+    }
 
     remote()->transact(GET_ORIGINAL_MIMETYPE, data, &reply);
     return reply.readString8();
@@ -410,7 +414,7 @@ int BpDrmManagerService::checkRightsStatus(int uniqueId, const String8& path, in
 }
 
 status_t BpDrmManagerService::consumeRights(
-            int uniqueId, DecryptHandle* decryptHandle, int action, bool reserve) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int action, bool reserve) {
     ALOGV("consumeRights");
     Parcel data, reply;
 
@@ -427,7 +431,7 @@ status_t BpDrmManagerService::consumeRights(
 }
 
 status_t BpDrmManagerService::setPlaybackStatus(
-            int uniqueId, DecryptHandle* decryptHandle, int playbackStatus, int64_t position) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int playbackStatus, int64_t position) {
     ALOGV("setPlaybackStatus");
     Parcel data, reply;
 
@@ -599,7 +603,7 @@ status_t BpDrmManagerService::getAllSupportInfo(
     return reply.readInt32();
 }
 
-DecryptHandle* BpDrmManagerService::openDecryptSession(
+sp<DecryptHandle> BpDrmManagerService::openDecryptSession(
             int uniqueId, int fd, off64_t offset, off64_t length, const char* mime) {
     ALOGV("Entering BpDrmManagerService::openDecryptSession");
     Parcel data, reply;
@@ -617,7 +621,7 @@ DecryptHandle* BpDrmManagerService::openDecryptSession(
 
     remote()->transact(OPEN_DECRYPT_SESSION, data, &reply);
 
-    DecryptHandle* handle = NULL;
+    sp<DecryptHandle> handle;
     if (0 != reply.dataAvail()) {
         handle = new DecryptHandle();
         readDecryptHandleFromParcelData(handle, reply);
@@ -625,7 +629,7 @@ DecryptHandle* BpDrmManagerService::openDecryptSession(
     return handle;
 }
 
-DecryptHandle* BpDrmManagerService::openDecryptSession(
+sp<DecryptHandle> BpDrmManagerService::openDecryptSession(
         int uniqueId, const char* uri, const char* mime) {
 
     ALOGV("Entering BpDrmManagerService::openDecryptSession: mime=%s", mime? mime: "NULL");
@@ -642,7 +646,7 @@ DecryptHandle* BpDrmManagerService::openDecryptSession(
 
     remote()->transact(OPEN_DECRYPT_SESSION_FROM_URI, data, &reply);
 
-    DecryptHandle* handle = NULL;
+    sp<DecryptHandle> handle;
     if (0 != reply.dataAvail()) {
         handle = new DecryptHandle();
         readDecryptHandleFromParcelData(handle, reply);
@@ -652,7 +656,34 @@ DecryptHandle* BpDrmManagerService::openDecryptSession(
     return handle;
 }
 
-status_t BpDrmManagerService::closeDecryptSession(int uniqueId, DecryptHandle* decryptHandle) {
+sp<DecryptHandle> BpDrmManagerService::openDecryptSession(
+            int uniqueId, const DrmBuffer& buf, const String8& mimeType) {
+    ALOGV("Entering BpDrmManagerService::openDecryptSession");
+    Parcel data, reply;
+
+    data.writeInterfaceToken(IDrmManagerService::getInterfaceDescriptor());
+    data.writeInt32(uniqueId);
+    if (buf.data != NULL && buf.length > 0) {
+        data.writeInt32(buf.length);
+        data.write(buf.data, buf.length);
+    } else {
+        data.writeInt32(0);
+    }
+    data.writeString8(mimeType);
+
+    remote()->transact(OPEN_DECRYPT_SESSION_FOR_STREAMING, data, &reply);
+
+    sp<DecryptHandle> handle;
+    if (0 != reply.dataAvail()) {
+        handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, reply);
+    } else {
+        ALOGV("no decryptHandle is generated in service side");
+    }
+    return handle;
+}
+
+status_t BpDrmManagerService::closeDecryptSession(int uniqueId, sp<DecryptHandle>& decryptHandle) {
     ALOGV("closeDecryptSession");
     Parcel data, reply;
 
@@ -667,7 +698,7 @@ status_t BpDrmManagerService::closeDecryptSession(int uniqueId, DecryptHandle* d
 }
 
 status_t BpDrmManagerService::initializeDecryptUnit(
-            int uniqueId, DecryptHandle* decryptHandle,
+            int uniqueId, sp<DecryptHandle>& decryptHandle,
             int decryptUnitId, const DrmBuffer* headerInfo) {
     ALOGV("initializeDecryptUnit");
     Parcel data, reply;
@@ -687,7 +718,7 @@ status_t BpDrmManagerService::initializeDecryptUnit(
 }
 
 status_t BpDrmManagerService::decrypt(
-            int uniqueId, DecryptHandle* decryptHandle, int decryptUnitId,
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int decryptUnitId,
             const DrmBuffer* encBuffer, DrmBuffer** decBuffer, DrmBuffer* IV) {
     ALOGV("decrypt");
     Parcel data, reply;
@@ -713,15 +744,17 @@ status_t BpDrmManagerService::decrypt(
     const status_t status = reply.readInt32();
     ALOGV("Return value of decrypt() is %d", status);
 
-    const int size = reply.readInt32();
-    (*decBuffer)->length = size;
-    reply.read((void *)(*decBuffer)->data, size);
+    if (status == NO_ERROR) {
+        const int size = reply.readInt32();
+        (*decBuffer)->length = size;
+        reply.read((void *)(*decBuffer)->data, size);
+    }
 
     return status;
 }
 
 status_t BpDrmManagerService::finalizeDecryptUnit(
-            int uniqueId, DecryptHandle* decryptHandle, int decryptUnitId) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int decryptUnitId) {
     ALOGV("finalizeDecryptUnit");
     Parcel data, reply;
 
@@ -737,7 +770,7 @@ status_t BpDrmManagerService::finalizeDecryptUnit(
 }
 
 ssize_t BpDrmManagerService::pread(
-            int uniqueId, DecryptHandle* decryptHandle, void* buffer,
+            int uniqueId, sp<DecryptHandle>& decryptHandle, void* buffer,
             ssize_t numBytes, off64_t offset) {
     ALOGV("read");
     Parcel data, reply;
@@ -815,19 +848,6 @@ status_t BnDrmManagerService::onTransact(
         return DRM_NO_ERROR;
     }
 
-    case INSTALL_DRM_ENGINE:
-    {
-        ALOGV("BnDrmManagerService::onTransact :INSTALL_DRM_ENGINE");
-        CHECK_INTERFACE(IDrmManagerService, data, reply);
-
-        const int uniqueId = data.readInt32();
-        const String8 engineFile = data.readString8();
-        status_t status = installDrmEngine(uniqueId, engineFile);
-
-        reply->writeInt32(status);
-        return DRM_NO_ERROR;
-    }
-
     case GET_CONSTRAINTS_FROM_CONTENT:
     {
         ALOGV("BnDrmManagerService::onTransact :GET_CONSTRAINTS_FROM_CONTENT");
@@ -851,9 +871,11 @@ status_t BnDrmManagerService::onTransact(
                 int bufferSize = 0;
                 if (NULL != value) {
                     bufferSize = strlen(value);
+                    reply->writeInt32(bufferSize + 1);
+                    reply->write(value, bufferSize + 1);
+                } else {
+                    reply->writeInt32(0);
                 }
-                reply->writeInt32(bufferSize + 1);
-                reply->write(value, bufferSize + 1);
             }
         }
         delete drmConstraints; drmConstraints = NULL;
@@ -916,7 +938,12 @@ status_t BnDrmManagerService::onTransact(
 
         //Filling DRM info
         const int infoType = data.readInt32();
-        const int bufferSize = data.readInt32();
+        const uint32_t bufferSize = data.readInt32();
+
+        if (bufferSize > data.dataAvail()) {
+            return BAD_VALUE;
+        }
+
         char* buffer = NULL;
         if (0 < bufferSize) {
             buffer = (char *)data.readInplace(bufferSize);
@@ -969,9 +996,19 @@ status_t BnDrmManagerService::onTransact(
 
         const int size = data.readInt32();
         for (int index = 0; index < size; ++index) {
+            if (!data.dataAvail()) {
+                break;
+            }
             const String8 key(data.readString8());
-            const String8 value(data.readString8());
-            drmInfoRequest->put(key, (value == String8("NULL")) ? String8("") : value);
+            if (key == String8("FileDescriptorKey")) {
+                char buffer[16];
+                int fd = data.readFileDescriptor();
+                sprintf(buffer, "%lu", (unsigned long)fd);
+                drmInfoRequest->put(key, String8(buffer));
+            } else {
+                const String8 value(data.readString8());
+                drmInfoRequest->put(key, (value == String8("NULL")) ? String8("") : value);
+            }
         }
 
         DrmInfo* drmInfo = acquireDrmInfo(uniqueId, drmInfoRequest);
@@ -1011,7 +1048,12 @@ status_t BnDrmManagerService::onTransact(
         const int uniqueId = data.readInt32();
 
         //Filling DRM Rights
-        const int bufferSize = data.readInt32();
+        const uint32_t bufferSize = data.readInt32();
+        if (bufferSize > data.dataAvail()) {
+            reply->writeInt32(BAD_VALUE);
+            return DRM_NO_ERROR;
+        }
+
         const DrmBuffer drmBuffer((char *)data.readInplace(bufferSize), bufferSize);
 
         const String8 mimeType(data.readString8());
@@ -1040,7 +1082,12 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
         const String8 path = data.readString8();
-        const String8 originalMimeType = getOriginalMimeType(uniqueId, path);
+        const int32_t isFdValid = data.readInt32();
+        int fd = -1;
+        if (isFdValid) {
+            fd = data.readFileDescriptor();
+        }
+        const String8 originalMimeType = getOriginalMimeType(uniqueId, path, fd);
 
         reply->writeString8(originalMimeType);
         return DRM_NO_ERROR;
@@ -1081,16 +1128,16 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, data);
 
         const int action = data.readInt32();
         const bool reserve = static_cast<bool>(data.readInt32());
         const status_t status
-            = consumeRights(uniqueId, &handle, action, reserve);
+            = consumeRights(uniqueId, handle, action, reserve);
         reply->writeInt32(status);
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         return DRM_NO_ERROR;
     }
 
@@ -1101,16 +1148,16 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, data);
 
         const int playbackStatus = data.readInt32();
         const int64_t position = data.readInt64();
         const status_t status
-            = setPlaybackStatus(uniqueId, &handle, playbackStatus, position);
+            = setPlaybackStatus(uniqueId, handle, playbackStatus, position);
         reply->writeInt32(status);
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         return DRM_NO_ERROR;
     }
 
@@ -1177,10 +1224,13 @@ status_t BnDrmManagerService::onTransact(
         const int convertId = data.readInt32();
 
         //Filling input data
-        const int bufferSize = data.readInt32();
+        const uint32_t bufferSize = data.readInt32();
+        if (bufferSize > data.dataAvail()) {
+            return BAD_VALUE;
+        }
         DrmBuffer* inputData = new DrmBuffer((char *)data.readInplace(bufferSize), bufferSize);
 
-        DrmConvertedStatus*    drmConvertedStatus = convertData(uniqueId, convertId, inputData);
+        DrmConvertedStatus* drmConvertedStatus = convertData(uniqueId, convertId, inputData);
 
         if (NULL != drmConvertedStatus) {
             //Filling Drm Converted Ststus
@@ -1279,13 +1329,13 @@ status_t BnDrmManagerService::onTransact(
         const off64_t length = data.readInt64();
         const String8 mime = data.readString8();
 
-        DecryptHandle* handle
-            = openDecryptSession(uniqueId, fd, offset, length, mime.string());
+        sp<DecryptHandle> handle
+            = openDecryptSession(uniqueId, fd, offset, length, mime.c_str());
 
-        if (NULL != handle) {
-            writeDecryptHandleToParcelData(handle, reply);
+        if (NULL != handle.get()) {
+            writeDecryptHandleToParcelData(handle.get(), reply);
             clearDecryptHandle(handle);
-            delete handle; handle = NULL;
+            handle.clear();
         }
         return DRM_NO_ERROR;
     }
@@ -1299,13 +1349,36 @@ status_t BnDrmManagerService::onTransact(
         const String8 uri = data.readString8();
         const String8 mime = data.readString8();
 
-        DecryptHandle* handle = openDecryptSession(uniqueId, uri.string(), mime.string());
+        sp<DecryptHandle> handle = openDecryptSession(uniqueId, uri.c_str(), mime.c_str());
 
-        if (NULL != handle) {
-            writeDecryptHandleToParcelData(handle, reply);
+        if (NULL != handle.get()) {
+            writeDecryptHandleToParcelData(handle.get(), reply);
 
             clearDecryptHandle(handle);
-            delete handle; handle = NULL;
+            handle.clear();
+        } else {
+            ALOGV("NULL decryptHandle is returned");
+        }
+        return DRM_NO_ERROR;
+    }
+
+    case OPEN_DECRYPT_SESSION_FOR_STREAMING:
+    {
+        ALOGV("BnDrmManagerService::onTransact :OPEN_DECRYPT_SESSION_FOR_STREAMING");
+        CHECK_INTERFACE(IDrmManagerService, data, reply);
+
+        const int uniqueId = data.readInt32();
+        const int bufferSize = data.readInt32();
+        DrmBuffer buf((bufferSize > 0) ? (char *)data.readInplace(bufferSize) : NULL,
+                bufferSize);
+        const String8 mimeType(data.readString8());
+
+        sp<DecryptHandle> handle = openDecryptSession(uniqueId, buf, mimeType);
+
+        if (handle != NULL) {
+            writeDecryptHandleToParcelData(handle, reply);
+            clearDecryptHandle(handle);
+            handle.clear();
         } else {
             ALOGV("NULL decryptHandle is returned");
         }
@@ -1319,7 +1392,7 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle* handle = new DecryptHandle();
+        sp<DecryptHandle> handle = new DecryptHandle();
         readDecryptHandleFromParcelData(handle, data);
 
         const status_t status = closeDecryptSession(uniqueId, handle);
@@ -1334,21 +1407,26 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, data);
 
         const int decryptUnitId = data.readInt32();
 
         //Filling Header info
-        const int bufferSize = data.readInt32();
+        const uint32_t bufferSize = data.readInt32();
+        if (bufferSize > data.dataAvail()) {
+            reply->writeInt32(BAD_VALUE);
+            clearDecryptHandle(handle);
+            return DRM_NO_ERROR;
+        }
         DrmBuffer* headerInfo = NULL;
         headerInfo = new DrmBuffer((char *)data.readInplace(bufferSize), bufferSize);
 
         const status_t status
-            = initializeDecryptUnit(uniqueId, &handle, decryptUnitId, headerInfo);
+            = initializeDecryptUnit(uniqueId, handle, decryptUnitId, headerInfo);
         reply->writeInt32(status);
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         delete headerInfo; headerInfo = NULL;
         return DRM_NO_ERROR;
     }
@@ -1360,13 +1438,21 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle;
+        readDecryptHandleFromParcelData(handle, data);
 
         const int decryptUnitId = data.readInt32();
-        const int decBufferSize = data.readInt32();
+        const uint32_t decBufferSize = data.readInt32();
+        const uint32_t encBufferSize = data.readInt32();
 
-        const int encBufferSize = data.readInt32();
+        if (encBufferSize > data.dataAvail() ||
+            decBufferSize > MAX_BINDER_TRANSACTION_SIZE) {
+            reply->writeInt32(BAD_VALUE);
+            reply->writeInt32(0);
+            clearDecryptHandle(handle);
+            return DRM_NO_ERROR;
+        }
+
         DrmBuffer* encBuffer
             = new DrmBuffer((char *)data.readInplace(encBufferSize), encBufferSize);
 
@@ -1376,20 +1462,24 @@ status_t BnDrmManagerService::onTransact(
 
         DrmBuffer* IV = NULL;
         if (0 != data.dataAvail()) {
-            const int ivBufferlength = data.readInt32();
-            IV = new DrmBuffer((char *)data.readInplace(ivBufferlength), ivBufferlength);
+            const uint32_t ivBufferlength = data.readInt32();
+            if (ivBufferlength <= data.dataAvail()) {
+                IV = new DrmBuffer((char *)data.readInplace(ivBufferlength), ivBufferlength);
+            }
         }
 
         const status_t status
-            = decrypt(uniqueId, &handle, decryptUnitId, encBuffer, &decBuffer, IV);
+            = decrypt(uniqueId, handle, decryptUnitId, encBuffer, &decBuffer, IV);
 
         reply->writeInt32(status);
 
-        const int size = decBuffer->length;
-        reply->writeInt32(size);
-        reply->write(decBuffer->data, size);
+        if (status == NO_ERROR) {
+            const int size = decBuffer->length;
+            reply->writeInt32(size);
+            reply->write(decBuffer->data, size);
+        }
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         delete encBuffer; encBuffer = NULL;
         delete decBuffer; decBuffer = NULL;
         delete [] buffer; buffer = NULL;
@@ -1404,13 +1494,13 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, data);
 
-        const status_t status = finalizeDecryptUnit(uniqueId, &handle, data.readInt32());
+        const status_t status = finalizeDecryptUnit(uniqueId, handle, data.readInt32());
         reply->writeInt32(status);
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         return DRM_NO_ERROR;
     }
 
@@ -1421,21 +1511,25 @@ status_t BnDrmManagerService::onTransact(
 
         const int uniqueId = data.readInt32();
 
-        DecryptHandle handle;
-        readDecryptHandleFromParcelData(&handle, data);
+        sp<DecryptHandle> handle = new DecryptHandle();
+        readDecryptHandleFromParcelData(handle, data);
 
-        const int numBytes = data.readInt32();
+        const uint32_t numBytes = data.readInt32();
+        if (numBytes > MAX_BINDER_TRANSACTION_SIZE) {
+            reply->writeInt32(BAD_VALUE);
+            return DRM_NO_ERROR;
+        }
         char* buffer = new char[numBytes];
 
         const off64_t offset = data.readInt64();
 
-        ssize_t result = pread(uniqueId, &handle, buffer, numBytes, offset);
+        ssize_t result = pread(uniqueId, handle, buffer, numBytes, offset);
         reply->writeInt32(result);
         if (0 < result) {
             reply->write(buffer, result);
         }
 
-        clearDecryptHandle(&handle);
+        clearDecryptHandle(handle);
         delete [] buffer, buffer = NULL;
         return DRM_NO_ERROR;
     }
@@ -1444,4 +1538,3 @@ status_t BnDrmManagerService::onTransact(
         return BBinder::onTransact(code, data, reply, flags);
     }
 }
-

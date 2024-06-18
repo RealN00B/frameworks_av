@@ -20,7 +20,9 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <camera/CameraParameters.h>
+#include <system/graphics.h>
 
 namespace android {
 // Parameter keys to communicate between camera application and driver.
@@ -90,6 +92,7 @@ const char CameraParameters::KEY_RECORDING_HINT[] = "recording-hint";
 const char CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED[] = "video-snapshot-supported";
 const char CameraParameters::KEY_VIDEO_STABILIZATION[] = "video-stabilization";
 const char CameraParameters::KEY_VIDEO_STABILIZATION_SUPPORTED[] = "video-stabilization-supported";
+const char CameraParameters::KEY_LIGHTFX[] = "light-fx";
 
 const char CameraParameters::TRUE[] = "true";
 const char CameraParameters::FALSE[] = "false";
@@ -146,6 +149,7 @@ const char CameraParameters::SCENE_MODE_SPORTS[] = "sports";
 const char CameraParameters::SCENE_MODE_PARTY[] = "party";
 const char CameraParameters::SCENE_MODE_CANDLELIGHT[] = "candlelight";
 const char CameraParameters::SCENE_MODE_BARCODE[] = "barcode";
+const char CameraParameters::SCENE_MODE_HDR[] = "hdr";
 
 const char CameraParameters::PIXEL_FORMAT_YUV422SP[] = "yuv422sp";
 const char CameraParameters::PIXEL_FORMAT_YUV420SP[] = "yuv420sp";
@@ -155,6 +159,7 @@ const char CameraParameters::PIXEL_FORMAT_RGB565[] = "rgb565";
 const char CameraParameters::PIXEL_FORMAT_RGBA8888[] = "rgba8888";
 const char CameraParameters::PIXEL_FORMAT_JPEG[] = "jpeg";
 const char CameraParameters::PIXEL_FORMAT_BAYER_RGGB[] = "bayer-rggb";
+const char CameraParameters::PIXEL_FORMAT_ANDROID_OPAQUE[] = "android-opaque";
 
 // Values for focus mode settings.
 const char CameraParameters::FOCUS_MODE_AUTO[] = "auto";
@@ -164,6 +169,10 @@ const char CameraParameters::FOCUS_MODE_FIXED[] = "fixed";
 const char CameraParameters::FOCUS_MODE_EDOF[] = "edof";
 const char CameraParameters::FOCUS_MODE_CONTINUOUS_VIDEO[] = "continuous-video";
 const char CameraParameters::FOCUS_MODE_CONTINUOUS_PICTURE[] = "continuous-picture";
+
+// Values for light fx settings
+const char CameraParameters::LIGHTFX_LOWLIGHT[] = "low-light";
+const char CameraParameters::LIGHTFX_HDR[] = "high-dynamic-range";
 
 CameraParameters::CameraParameters()
                 : mMap()
@@ -196,7 +205,7 @@ String8 CameraParameters::flatten() const
 
 void CameraParameters::unflatten(const String8 &params)
 {
-    const char *a = params.string();
+    const char *a = params.c_str();
     const char *b;
 
     mMap.clear();
@@ -235,7 +244,7 @@ void CameraParameters::set(const char *key, const char *value)
         return;
     }
 
-    if (strchr(value, '=') || strchr(key, ';')) {
+    if (strchr(value, '=') || strchr(value, ';')) {
         //XXX ALOGE("Value \"%s\"contains invalid character (= or ;)", value);
         return;
     }
@@ -262,7 +271,7 @@ const char *CameraParameters::get(const char *key) const
     String8 v = mMap.valueFor(String8(key));
     if (v.length() == 0)
         return 0;
-    return v.string();
+    return v.c_str();
 }
 
 int CameraParameters::getInt(const char *key) const
@@ -449,31 +458,81 @@ const char *CameraParameters::getPictureFormat() const
 
 void CameraParameters::dump() const
 {
-    ALOGD("dump: mMap.size = %d", mMap.size());
+    ALOGD("dump: mMap.size = %zu", mMap.size());
     for (size_t i = 0; i < mMap.size(); i++) {
         String8 k, v;
         k = mMap.keyAt(i);
         v = mMap.valueAt(i);
-        ALOGD("%s: %s\n", k.string(), v.string());
+        ALOGD("%s: %s\n", k.c_str(), v.c_str());
     }
 }
 
-status_t CameraParameters::dump(int fd, const Vector<String16>& args) const
+status_t CameraParameters::dump(int fd, const Vector<String16>& /*args*/) const
 {
     const size_t SIZE = 256;
     char buffer[SIZE];
     String8 result;
-    snprintf(buffer, 255, "CameraParameters::dump: mMap.size = %d\n", mMap.size());
+    snprintf(buffer, 255, "CameraParameters::dump: mMap.size = %zu\n", mMap.size());
     result.append(buffer);
     for (size_t i = 0; i < mMap.size(); i++) {
         String8 k, v;
         k = mMap.keyAt(i);
         v = mMap.valueAt(i);
-        snprintf(buffer, 255, "\t%s: %s\n", k.string(), v.string());
+        snprintf(buffer, 255, "\t%s: %s\n", k.c_str(), v.c_str());
         result.append(buffer);
     }
-    write(fd, result.string(), result.size());
+    write(fd, result.c_str(), result.size());
     return NO_ERROR;
+}
+
+void CameraParameters::getSupportedPreviewFormats(Vector<int>& formats) const {
+    const char* supportedPreviewFormats =
+          get(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS);
+
+    if (supportedPreviewFormats == NULL) {
+        ALOGW("%s: No supported preview formats.", __FUNCTION__);
+        return;
+    }
+
+    String8 fmtStr(supportedPreviewFormats);
+    char* prevFmts = fmtStr.lockBuffer(fmtStr.size());
+
+    char* savePtr;
+    char* fmt = strtok_r(prevFmts, ",", &savePtr);
+    while (fmt) {
+        int actual = previewFormatToEnum(fmt);
+        if (actual != -1) {
+            formats.add(actual);
+        }
+        fmt = strtok_r(NULL, ",", &savePtr);
+    }
+    fmtStr.unlockBuffer(fmtStr.size());
+}
+
+
+int CameraParameters::previewFormatToEnum(const char* format) {
+    return
+        !format ?
+            HAL_PIXEL_FORMAT_YCrCb_420_SP :
+        !strcmp(format, PIXEL_FORMAT_YUV422SP) ?
+            HAL_PIXEL_FORMAT_YCbCr_422_SP : // NV16
+        !strcmp(format, PIXEL_FORMAT_YUV420SP) ?
+            HAL_PIXEL_FORMAT_YCrCb_420_SP : // NV21
+        !strcmp(format, PIXEL_FORMAT_YUV422I) ?
+            HAL_PIXEL_FORMAT_YCbCr_422_I :  // YUY2
+        !strcmp(format, PIXEL_FORMAT_YUV420P) ?
+            HAL_PIXEL_FORMAT_YV12 :         // YV12
+        !strcmp(format, PIXEL_FORMAT_RGB565) ?
+            HAL_PIXEL_FORMAT_RGB_565 :      // RGB565
+        !strcmp(format, PIXEL_FORMAT_RGBA8888) ?
+            HAL_PIXEL_FORMAT_RGBA_8888 :    // RGB8888
+        !strcmp(format, PIXEL_FORMAT_BAYER_RGGB) ?
+            HAL_PIXEL_FORMAT_RAW16 :   // Raw sensor data
+        -1;
+}
+
+bool CameraParameters::isEmpty() const {
+    return mMap.isEmpty();
 }
 
 }; // namespace android

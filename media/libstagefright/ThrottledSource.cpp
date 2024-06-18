@@ -17,15 +17,9 @@
 #include "include/ThrottledSource.h"
 
 #include <media/stagefright/foundation/ADebug.h>
+#include <media/stagefright/foundation/ALooper.h>
 
 namespace android {
-
-static int64_t getNowUs() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-
-    return (int64_t)tv.tv_usec + tv.tv_sec * 1000000ll;
-}
 
 ThrottledSource::ThrottledSource(
         const sp<DataSource> &source,
@@ -35,10 +29,6 @@ ThrottledSource::ThrottledSource(
       mStartTimeUs(-1),
       mTotalTransferred(0) {
     CHECK(mBandwidthLimitBytesPerSecond > 0);
-}
-
-status_t ThrottledSource::initCheck() const {
-    return mSource->initCheck();
 }
 
 ssize_t ThrottledSource::readAt(off64_t offset, void *data, size_t size) {
@@ -52,7 +42,7 @@ ssize_t ThrottledSource::readAt(off64_t offset, void *data, size_t size) {
 
     mTotalTransferred += n;
 
-    int64_t nowUs = getNowUs();
+    int64_t nowUs = ALooper::GetNowUs();
 
     if (mStartTimeUs < 0) {
         mStartTimeUs = nowUs;
@@ -61,24 +51,16 @@ ssize_t ThrottledSource::readAt(off64_t offset, void *data, size_t size) {
     // How long would it have taken to transfer everything we ever
     // transferred given the limited bandwidth.
     int64_t durationUs =
-        mTotalTransferred * 1000000ll / mBandwidthLimitBytesPerSecond;
+        mTotalTransferred * 1000000LL / mBandwidthLimitBytesPerSecond;
 
     int64_t whenUs = mStartTimeUs + durationUs;
 
     if (whenUs > nowUs) {
         usleep(whenUs - nowUs);
     }
-
     return n;
 }
 
-status_t ThrottledSource::getSize(off64_t *size) {
-    return mSource->getSize(size);
-}
-
-uint32_t ThrottledSource::flags() {
-    return mSource->flags();
-}
 
 }  // namespace android
 

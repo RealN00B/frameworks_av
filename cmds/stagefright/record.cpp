@@ -17,28 +17,31 @@
 #include "SineSource.h"
 
 #include <binder/ProcessState.h>
+#include <datasource/FileSource.h>
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/AudioPlayer.h>
+#include <media/stagefright/foundation/ALooper.h>
+#include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/CameraSource.h>
-#include <media/stagefright/FileSource.h>
 #include <media/stagefright/MediaBufferGroup.h>
 #include <media/stagefright/MediaDefs.h>
+#include <media/stagefright/MediaCodecSource.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaExtractor.h>
+#include <media/stagefright/MediaExtractorFactory.h>
 #include <media/stagefright/MPEG4Writer.h>
-#include <media/stagefright/OMXClient.h>
-#include <media/stagefright/OMXCodec.h>
+#include <media/stagefright/SimpleDecodingSource.h>
 #include <media/MediaPlayerInterface.h>
+
 
 using namespace android;
 
+static const int32_t kAudioBitRate = 12200;
+#if 0
 static const int32_t kFramerate = 24;  // fps
 static const int32_t kIFramesIntervalSec = 1;
 static const int32_t kVideoBitRate = 512 * 1024;
-static const int32_t kAudioBitRate = 12200;
 static const int64_t kDurationUs = 10000000LL;  // 10 seconds
 
-#if 0
 class DummySource : public MediaSource {
 
 public:
@@ -86,6 +89,9 @@ public:
         if (err != OK) {
             return err;
         }
+        if (buffer == nullptr) {
+            return AMEDIA_ERROR_UNKNOWN;
+        }
 
         char x = (char)((double)rand() / RAND_MAX * 255);
         memset((*buffer)->data(), x, mSize);
@@ -118,7 +124,7 @@ sp<MediaSource> createSource(const char *filename) {
     sp<MediaSource> source;
 
     sp<MediaExtractor> extractor =
-        MediaExtractor::Create(new FileSource(filename));
+        MediaExtractorFactory::Create(new FileSource(filename));
     if (extractor == NULL) {
         return NULL;
     }
@@ -168,8 +174,6 @@ static int translateColorToOmxEnumValue(int color) {
 int main(int argc, char **argv) {
     android::ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
 #if 1
     if (argc != 3) {
         fprintf(stderr, "usage: %s <filename> <input_color_format>\n", argv[0]);
@@ -182,9 +186,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "input color format must be 0 (YUV420SP) or 1 (YUV420P)\n");
         return 1;
     }
-    OMXClient client;
-    CHECK_EQ(client.connect(), (status_t)OK);
-
     status_t err = OK;
 
 #if 0
@@ -197,8 +198,7 @@ int main(int argc, char **argv) {
 
     sp<MetaData> meta = source->getFormat();
 
-    sp<MediaSource> decoder = OMXCodec::Create(
-            client.interface(), meta, false /* createEncoder */, source);
+    sp<MediaSource> decoder = SimpleDecodingSource::Create(source);
 
     int width, height;
     bool success = meta->findInt32(kKeyWidth, &width);
@@ -210,22 +210,21 @@ int main(int argc, char **argv) {
     sp<MediaSource> decoder = new DummySource(width, height, colorFormat);
 #endif
 
-    sp<MetaData> enc_meta = new MetaData;
-    // enc_meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_H263);
-    // enc_meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_MPEG4);
-    enc_meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_AVC);
-    enc_meta->setInt32(kKeyWidth, width);
-    enc_meta->setInt32(kKeyHeight, height);
-    enc_meta->setInt32(kKeySampleRate, kFramerate);
-    enc_meta->setInt32(kKeyBitRate, kVideoBitRate);
-    enc_meta->setInt32(kKeyStride, width);
-    enc_meta->setInt32(kKeySliceHeight, height);
-    enc_meta->setInt32(kKeyIFramesInterval, kIFramesIntervalSec);
-    enc_meta->setInt32(kKeyColorFormat, colorFormat);
+    sp<AMessage> enc_meta = new AMessage;
+    // enc_meta->setString("mime", MEDIA_MIMETYPE_VIDEO_H263);
+    // enc_meta->setString("mime", MEDIA_MIMETYPE_VIDEO_MPEG4);
+    enc_meta->setString("mime", MEDIA_MIMETYPE_VIDEO_AVC);
+    enc_meta->setInt32("width", width);
+    enc_meta->setInt32("height", height);
+    enc_meta->setInt32("sample-rate", kFramerate);
+    enc_meta->setInt32("bitrate", kVideoBitRate);
+    // enc_meta->setInt32("stride", width);
+    // enc_meta->setInt32("slice-height", height);
+    enc_meta->setInt32("i-frame-interval", kIFramesIntervalSec);
+    enc_meta->setInt32("color-format", colorFormat);
 
     sp<MediaSource> encoder =
-        OMXCodec::Create(
-                client.interface(), enc_meta, true /* createEncoder */, decoder);
+        MediaCodecSource::Create(looper, format, decoder);
 
 #if 1
     sp<MPEG4Writer> writer = new MPEG4Writer("/sdcard/output.mp4");
@@ -260,31 +259,6 @@ int main(int argc, char **argv) {
 #endif
 
     printf("$\n");
-    client.disconnect();
-#endif
-
-#if 0
-    CameraSource *source = CameraSource::Create();
-    source->start();
-
-    printf("source = %p\n", source);
-
-    for (int i = 0; i < 100; ++i) {
-        MediaBuffer *buffer;
-        status_t err = source->read(&buffer);
-        CHECK_EQ(err, (status_t)OK);
-
-        printf("got a frame, data=%p, size=%d\n",
-               buffer->data(), buffer->range_length());
-
-        buffer->release();
-        buffer = NULL;
-    }
-
-    err = source->stop();
-
-    delete source;
-    source = NULL;
 #endif
 
     if (err != OK && err != ERROR_END_OF_STREAM) {
@@ -295,43 +269,33 @@ int main(int argc, char **argv) {
 }
 #else
 
-int main(int argc, char **argv) {
+int main(int /* argc */, char ** /* argv */) {
     android::ProcessState::self()->startThreadPool();
-
-    OMXClient client;
-    CHECK_EQ(client.connect(), (status_t)OK);
 
     const int32_t kSampleRate = 22050;
     const int32_t kNumChannels = 2;
     sp<MediaSource> audioSource = new SineSource(kSampleRate, kNumChannels);
 
-#if 0
-    sp<MediaPlayerBase::AudioSink> audioSink;
-    AudioPlayer *player = new AudioPlayer(audioSink);
-    player->setSource(audioSource);
-    player->start();
-
-    sleep(10);
-
-    player->stop();
-#endif
-
-    sp<MetaData> encMeta = new MetaData;
-    encMeta->setCString(kKeyMIMEType,
+    sp<AMessage> encMeta = new AMessage;
+    encMeta->setString("mime",
             0 ? MEDIA_MIMETYPE_AUDIO_AMR_WB : MEDIA_MIMETYPE_AUDIO_AAC);
-    encMeta->setInt32(kKeySampleRate, kSampleRate);
-    encMeta->setInt32(kKeyChannelCount, kNumChannels);
-    encMeta->setInt32(kKeyMaxInputSize, 8192);
-    encMeta->setInt32(kKeyBitRate, kAudioBitRate);
+    encMeta->setInt32("sample-rate", kSampleRate);
+    encMeta->setInt32("channel-count", kNumChannels);
+    encMeta->setInt32("max-input-size", 8192);
+    encMeta->setInt32("bitrate", kAudioBitRate);
+
+    sp<ALooper> looper = new ALooper;
+    looper->setName("record");
+    looper->start();
 
     sp<MediaSource> encoder =
-        OMXCodec::Create(client.interface(), encMeta, true, audioSource);
+        MediaCodecSource::Create(looper, encMeta, audioSource);
 
     encoder->start();
 
     int32_t n = 0;
     status_t err;
-    MediaBuffer *buffer;
+    MediaBufferBase *buffer;
     while ((err = encoder->read(&buffer)) == OK) {
         printf(".");
         fflush(stdout);
@@ -346,8 +310,6 @@ int main(int argc, char **argv) {
     printf("$\n");
 
     encoder->stop();
-
-    client.disconnect();
 
     return 0;
 }

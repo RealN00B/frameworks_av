@@ -19,28 +19,36 @@
 #include "utils/Log.h"
 
 #include <binder/ProcessState.h>
+#include <cutils/properties.h> // for property_get
 
+#include <datasource/DataSourceFactory.h>
+#include <media/DataSource.h>
+#include <media/IMediaHTTPService.h>
 #include <media/IStreamSource.h>
 #include <media/mediaplayer.h>
+#include <media/stagefright/MediaSource.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/DataSource.h>
+#include <media/stagefright/InterfaceUtils.h>
 #include <media/stagefright/MPEG2TSWriter.h>
 #include <media/stagefright/MediaExtractor.h>
-#include <media/stagefright/MediaSource.h>
+#include <media/stagefright/MediaExtractorFactory.h>
 #include <media/stagefright/MetaData.h>
 
 #include <binder/IServiceManager.h>
 #include <media/IMediaPlayerService.h>
+#include <gui/ISurfaceComposer.h>
 #include <gui/SurfaceComposerClient.h>
+#include <gui/Surface.h>
 
 #include <fcntl.h>
+#include <ui/DisplayMode.h>
 
 using namespace android;
 
 struct MyStreamSource : public BnStreamSource {
     // Object assumes ownership of fd.
-    MyStreamSource(int fd);
+    explicit MyStreamSource(int fd);
 
     virtual void setListener(const sp<IStreamListener> &listener);
     virtual void setBuffers(const Vector<sp<IMemory> > &buffers);
@@ -108,7 +116,7 @@ void MyStreamSource::onBufferAvailable(size_t index) {
 
     sp<IMemory> mem = mBuffers.itemAt(index);
 
-    ssize_t n = read(mFd, mem->pointer(), mem->size());
+    ssize_t n = read(mFd, mem->unsecurePointer(), mem->size());
     if (n <= 0) {
         mListener->issueCommand(IStreamListener::EOS, false /* synchronous */);
     } else {
@@ -120,7 +128,7 @@ void MyStreamSource::onBufferAvailable(size_t index) {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct MyConvertingStreamSource : public BnStreamSource {
-    MyConvertingStreamSource(const char *filename);
+    explicit MyConvertingStreamSource(const char *filename);
 
     virtual void setListener(const sp<IStreamListener> &listener);
     virtual void setBuffers(const Vector<sp<IMemory> > &buffers);
@@ -155,16 +163,19 @@ private:
 MyConvertingStreamSource::MyConvertingStreamSource(const char *filename)
     : mCurrentBufferIndex(-1),
       mCurrentBufferOffset(0) {
-    sp<DataSource> dataSource = DataSource::CreateFromURI(filename);
+    sp<DataSource> dataSource =
+        DataSourceFactory::getInstance()->CreateFromURI(NULL /* httpService */, filename);
+
     CHECK(dataSource != NULL);
 
-    sp<MediaExtractor> extractor = MediaExtractor::Create(dataSource);
+    sp<IMediaExtractor> extractor = MediaExtractorFactory::Create(dataSource);
     CHECK(extractor != NULL);
 
     mWriter = new MPEG2TSWriter(
             this, &MyConvertingStreamSource::WriteDataWrapper);
 
-    for (size_t i = 0; i < extractor->countTracks(); ++i) {
+    size_t numTracks = extractor->countTracks();
+    for (size_t i = 0; i < numTracks; ++i) {
         const sp<MetaData> &meta = extractor->getTrackMetaData(i);
 
         const char *mime;
@@ -174,7 +185,12 @@ MyConvertingStreamSource::MyConvertingStreamSource(const char *filename)
             continue;
         }
 
-        CHECK_EQ(mWriter->addSource(extractor->getTrack(i)), (status_t)OK);
+        sp<MediaSource> track = CreateMediaSourceFromIMediaSource(extractor->getTrack(i));
+        if (track == nullptr) {
+            fprintf(stderr, "skip NULL track %zu, total tracks %zu\n", i, numTracks);
+            continue;
+        }
+        CHECK_EQ(mWriter->addSource(track), (status_t)OK);
     }
 
     CHECK_EQ(mWriter->start(), (status_t)OK);
@@ -222,7 +238,7 @@ ssize_t MyConvertingStreamSource::writeData(const void *data, size_t size) {
             copy = mem->size() - mCurrentBufferOffset;
         }
 
-        memcpy((uint8_t *)mem->pointer() + mCurrentBufferOffset, data, copy);
+        memcpy((uint8_t *)mem->unsecurePointer() + mCurrentBufferOffset, data, copy);
         mCurrentBufferOffset += copy;
 
         if (mCurrentBufferOffset == mem->size()) {
@@ -262,7 +278,7 @@ struct MyClient : public BnMediaPlayerClient {
         : mEOS(false) {
     }
 
-    virtual void notify(int msg, int ext1, int ext2, const Parcel *obj) {
+    virtual void notify(int msg, int ext1 __unused, int ext2 __unused, const Parcel *obj __unused) {
         Mutex::Autolock autoLock(mLock);
 
         if (msg == MEDIA_ERROR || msg == MEDIA_PLAYBACK_COMPLETE) {
@@ -294,8 +310,6 @@ private:
 int main(int argc, char **argv) {
     android::ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
     if (argc != 2) {
         fprintf(stderr, "Usage: %s filename\n", argv[0]);
         return 1;
@@ -304,15 +318,27 @@ int main(int argc, char **argv) {
     sp<SurfaceComposerClient> composerClient = new SurfaceComposerClient;
     CHECK_EQ(composerClient->initCheck(), (status_t)OK);
 
-    ssize_t displayWidth = composerClient->getDisplayWidth(0);
-    ssize_t displayHeight = composerClient->getDisplayHeight(0);
+    const std::vector<PhysicalDisplayId> ids = SurfaceComposerClient::getPhysicalDisplayIds();
+    if (ids.empty()) {
+        SLOGE("Failed to get ID for any displays\n");
+        return 1;
+    }
 
-    ALOGV("display is %d x %d\n", displayWidth, displayHeight);
+    const sp<IBinder> display = SurfaceComposerClient::getPhysicalDisplayToken(ids.front());
+    CHECK(display != nullptr);
+
+    ui::DisplayMode mode;
+    CHECK_EQ(SurfaceComposerClient::getActiveDisplayMode(display, &mode), NO_ERROR);
+
+    const ui::Size& resolution = mode.resolution;
+    const ssize_t displayWidth = resolution.getWidth();
+    const ssize_t displayHeight = resolution.getHeight();
+
+    ALOGV("display is %zd x %zd\n", displayWidth, displayHeight);
 
     sp<SurfaceControl> control =
         composerClient->createSurface(
                 String8("A Surface"),
-                0,
                 displayWidth,
                 displayHeight,
                 PIXEL_FORMAT_RGB_565,
@@ -321,10 +347,10 @@ int main(int argc, char **argv) {
     CHECK(control != NULL);
     CHECK(control->isValid());
 
-    SurfaceComposerClient::openGlobalTransaction();
-    CHECK_EQ(control->setLayer(INT_MAX), (status_t)OK);
-    CHECK_EQ(control->show(), (status_t)OK);
-    SurfaceComposerClient::closeGlobalTransaction();
+    SurfaceComposerClient::Transaction{}
+            .setLayer(control, INT_MAX)
+            .show(control)
+            .apply();
 
     sp<Surface> surface = control->getSurface();
     CHECK(surface != NULL);
@@ -339,8 +365,14 @@ int main(int argc, char **argv) {
 
     sp<IStreamSource> source;
 
+    bool usemp4 = property_get_bool("media.stagefright.use-mp4source", false);
+
     size_t len = strlen(argv[1]);
-    if (len >= 3 && !strcasecmp(".ts", &argv[1][len - 3])) {
+    if ((!usemp4 && len >= 3 && !strcasecmp(".ts", &argv[1][len - 3])) ||
+        (usemp4 && len >= 4 &&
+         (!strcasecmp(".mp4", &argv[1][len - 4])
+            || !strcasecmp(".3gp", &argv[1][len- 4])
+            || !strcasecmp(".3g2", &argv[1][len- 4])))) {
         int fd = open(argv[1], O_RDONLY);
 
         if (fd < 0) {
@@ -356,10 +388,10 @@ int main(int argc, char **argv) {
     }
 
     sp<IMediaPlayer> player =
-        service->create(getpid(), client, 0);
+        service->create(client, AUDIO_SESSION_ALLOCATE);
 
     if (player != NULL && player->setDataSource(source) == NO_ERROR) {
-        player->setVideoSurfaceTexture(surface->getSurfaceTexture());
+        player->setVideoSurfaceTexture(surface->getIGraphicBufferProducer());
         player->start();
 
         client->waitForEOS();

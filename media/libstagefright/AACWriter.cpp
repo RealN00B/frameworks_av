@@ -14,39 +14,27 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
+#include <inttypes.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 //#define LOG_NDEBUG 0
 #define LOG_TAG "AACWriter"
 #include <utils/Log.h>
 
+#include <media/openmax/OMX_Audio.h>
 #include <media/stagefright/AACWriter.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
-#include <media/stagefright/MediaSource.h>
 #include <media/stagefright/MetaData.h>
+#include <media/stagefright/MediaSource.h>
 #include <media/mediarecorder.h>
-#include <sys/prctl.h>
-#include <fcntl.h>
 
 namespace android {
-
-AACWriter::AACWriter(const char *filename)
-    : mFd(-1),
-      mInitCheck(NO_INIT),
-      mStarted(false),
-      mPaused(false),
-      mResumed(false),
-      mChannelCount(-1),
-      mSampleRate(-1) {
-
-    ALOGV("AACWriter Constructor");
-
-    mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR);
-    if (mFd >= 0) {
-        mInitCheck = OK;
-    }
-}
 
 AACWriter::AACWriter(int fd)
     : mFd(dup(fd)),
@@ -54,8 +42,13 @@ AACWriter::AACWriter(int fd)
       mStarted(false),
       mPaused(false),
       mResumed(false),
+      mThread(0),
+      mEstimatedSizeBytes(0),
+      mEstimatedDurationUs(0),
       mChannelCount(-1),
-      mSampleRate(-1) {
+      mSampleRate(-1),
+      mAACProfile(OMX_AUDIO_AACObjectLC),
+      mFrameDurationUs(0) {
 }
 
 AACWriter::~AACWriter() {
@@ -71,10 +64,6 @@ AACWriter::~AACWriter() {
 
 status_t AACWriter::initCheck() const {
     return mInitCheck;
-}
-
-static int writeInt8(int fd, uint8_t x) {
-    return ::write(fd, &x, 1);
 }
 
 
@@ -96,13 +85,18 @@ status_t AACWriter::addSource(const sp<MediaSource> &source) {
     CHECK(!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC));
     CHECK(meta->findInt32(kKeyChannelCount, &mChannelCount));
     CHECK(meta->findInt32(kKeySampleRate, &mSampleRate));
-    CHECK(mChannelCount >= 1 && mChannelCount <= 2);
+    CHECK(mChannelCount >= 1 && mChannelCount <= 7);
+
+    // Optionally, we want to check whether AACProfile is also set.
+    if (meta->findInt32(kKeyAACProfile, &mAACProfile)) {
+        ALOGI("AAC profile is changed to %d", mAACProfile);
+    }
 
     mSource = source;
     return OK;
 }
 
-status_t AACWriter::start(MetaData *params) {
+status_t AACWriter::start(MetaData * /* params */) {
     if (mInitCheck != OK) {
         return mInitCheck;
     }
@@ -160,11 +154,11 @@ status_t AACWriter::reset() {
     mDone = true;
 
     void *dummy;
+    status_t status = mSource->stop();
     pthread_join(mThread, &dummy);
 
-    status_t err = (status_t) dummy;
+    status_t err = static_cast<status_t>(reinterpret_cast<uintptr_t>(dummy));
     {
-        status_t status = mSource->stop();
         if (err == OK &&
             (status != OK && status != ERROR_END_OF_STREAM)) {
             err = status;
@@ -191,7 +185,7 @@ bool AACWriter::exceedsFileDurationLimit() {
 
 // static
 void *AACWriter::ThreadWrapper(void *me) {
-    return (void *) static_cast<AACWriter *>(me)->threadFunc();
+    return (void *)(uintptr_t)static_cast<AACWriter *>(me)->threadFunc();
 }
 
 /*
@@ -254,7 +248,7 @@ status_t AACWriter::writeAdtsHeader(uint32_t frameLength) {
     data |= kProtectionAbsense;
     write(mFd, &data, 1);
 
-    const uint8_t kProfileCode = 1;  // AAC-LC
+    const uint8_t kProfileCode = mAACProfile - 1;
     uint8_t kSampleFreqIndex;
     CHECK(getSampleRateTableIndex(mSampleRate, &kSampleFreqIndex));
     const uint8_t kPrivateStream = 0;
@@ -295,11 +289,12 @@ status_t AACWriter::threadFunc() {
     int64_t previousPausedDurationUs = 0;
     int64_t maxTimestampUs = 0;
     status_t err = OK;
+    bool stoppedPrematurely = true;
 
     prctl(PR_SET_NAME, (unsigned long)"AACWriterThread", 0, 0, 0);
 
     while (!mDone && err == OK) {
-        MediaBuffer *buffer;
+        MediaBufferBase *buffer;
         err = mSource->read(&buffer);
 
         if (err != OK) {
@@ -321,7 +316,7 @@ status_t AACWriter::threadFunc() {
         }
 
         int32_t isCodecSpecific = 0;
-        if (buffer->meta_data()->findInt32(kKeyIsCodecConfig, &isCodecSpecific) && isCodecSpecific) {
+        if (buffer->meta_data().findInt32(kKeyIsCodecConfig, &isCodecSpecific) && isCodecSpecific) {
             ALOGV("Drop codec specific info buffer");
             buffer->release();
             buffer = NULL;
@@ -329,7 +324,7 @@ status_t AACWriter::threadFunc() {
         }
 
         int64_t timestampUs;
-        CHECK(buffer->meta_data()->findInt64(kKeyTime, &timestampUs));
+        CHECK(buffer->meta_data().findInt64(kKeyTime, &timestampUs));
         if (timestampUs > mEstimatedDurationUs) {
             mEstimatedDurationUs = timestampUs;
         }
@@ -338,7 +333,7 @@ status_t AACWriter::threadFunc() {
             mResumed = false;
         }
         timestampUs -= previousPausedDurationUs;
-        ALOGV("time stamp: %lld, previous paused duration: %lld",
+        ALOGV("time stamp: %" PRId64 ", previous paused duration: %" PRId64,
             timestampUs, previousPausedDurationUs);
         if (timestampUs > maxTimestampUs) {
             maxTimestampUs = timestampUs;
@@ -363,6 +358,18 @@ status_t AACWriter::threadFunc() {
 
         buffer->release();
         buffer = NULL;
+
+        if (err != OK) {
+            break;
+        }
+
+        if (stoppedPrematurely) {
+            stoppedPrematurely = false;
+        }
+    }
+
+    if ((err == OK || err == ERROR_END_OF_STREAM) && stoppedPrematurely) {
+        err = ERROR_MALFORMED;
     }
 
     close(mFd);

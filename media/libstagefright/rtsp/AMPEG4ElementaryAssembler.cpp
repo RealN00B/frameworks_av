@@ -18,16 +18,17 @@
 #define LOG_TAG "AMPEG4ElementaryAssembler"
 #include <utils/Log.h>
 
-#include "AMPEG4ElementaryAssembler.h"
+#include <media/stagefright/rtsp/AMPEG4ElementaryAssembler.h>
 
-#include "ARTPSource.h"
+#include <media/stagefright/rtsp/ARTPSource.h>
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <media/stagefright/foundation/ABitReader.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/ByteUtils.h>
 #include <media/stagefright/foundation/hexdump.h>
-#include <media/stagefright/Utils.h>
 
 #include <ctype.h>
 #include <stdint.h>
@@ -85,6 +86,25 @@ static bool GetIntegerAttribute(
     return true;
 }
 
+static bool GetSampleRateIndex(int32_t sampleRate, size_t *tableIndex) {
+    static const int32_t kSampleRateTable[] = {
+        96000, 88200, 64000, 48000, 44100, 32000,
+        24000, 22050, 16000, 12000, 11025, 8000
+    };
+    const size_t kNumSampleRates =
+        sizeof(kSampleRateTable) / sizeof(kSampleRateTable[0]);
+
+    *tableIndex = 0;
+    for (size_t index = 0; index < kNumSampleRates; ++index) {
+        if (sampleRate == kSampleRateTable[index]) {
+            *tableIndex = index;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // static
 AMPEG4ElementaryAssembler::AMPEG4ElementaryAssembler(
         const sp<AMessage> &notify, const AString &desc, const AString &params)
@@ -100,6 +120,8 @@ AMPEG4ElementaryAssembler::AMPEG4ElementaryAssembler(
       mStreamStateIndication(0),
       mAuxiliaryDataSizeLength(0),
       mHasAUHeader(false),
+      mChannelConfig(0),
+      mSampleRateIndex(0),
       mAccessUnitRTPTime(0),
       mNextExpectedSeqNoValid(false),
       mNextExpectedSeqNo(0),
@@ -163,6 +185,13 @@ AMPEG4ElementaryAssembler::AMPEG4ElementaryAssembler(
             || mDTSDeltaLength > 0
             || mRandomAccessIndication
             || mStreamStateIndication > 0;
+
+        int32_t sampleRate, numChannels;
+        ASessionDescription::ParseFormatDesc(
+                desc.c_str(), &sampleRate, &numChannels);
+
+        mChannelConfig = numChannels;
+        CHECK(GetSampleRateIndex(sampleRate, &mSampleRateIndex));
     }
 }
 
@@ -173,6 +202,14 @@ struct AUHeader {
     unsigned mSize;
     unsigned mSerial;
 };
+
+bool AMPEG4ElementaryAssembler::initCheck() {
+    if(mIsGeneric && (mSizeLength == 0 || mIndexLength == 0 || mIndexDeltaLength == 0)) {
+        android_errorWriteLog(0x534e4554, "124777537");
+        return false;
+    }
+    return true;
+}
 
 ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
         const sp<ARTPSource> &source) {
@@ -220,11 +257,19 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
         mPackets.push_back(buffer);
     } else {
         // hexdump(buffer->data(), buffer->size());
+        if (buffer->size() < 2) {
+            android_errorWriteLog(0x534e4554, "124783982");
+            queue->erase(queue->begin());
+            return MALFORMED_PACKET;
+        }
 
-        CHECK_GE(buffer->size(), 2u);
         unsigned AU_headers_length = U16_AT(buffer->data());  // in bits
 
-        CHECK_GE(buffer->size(), 2 + (AU_headers_length + 7) / 8);
+        if (buffer->size() < 2 + (AU_headers_length + 7) / 8) {
+            android_errorWriteLog(0x534e4554, "124783982");
+            queue->erase(queue->begin());
+            return MALFORMED_PACKET;
+        }
 
         List<AUHeader> headers;
 
@@ -305,6 +350,12 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
             ABitReader bits(buffer->data() + offset, buffer->size() - offset);
 
             unsigned auxSize = bits.getBits(mAuxiliaryDataSizeLength);
+            if (buffer->size() < auxSize) {
+                ALOGE("b/123940919 auxSize %u", auxSize);
+                android_errorWriteLog(0x534e4554, "123940919");
+                queue->erase(queue->begin());
+                return MALFORMED_PACKET;
+            }
 
             offset += (mAuxiliaryDataSizeLength + auxSize + 7) / 8;
         }
@@ -313,7 +364,17 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
              it != headers.end(); ++it) {
             const AUHeader &header = *it;
 
-            CHECK_LE(offset + header.mSize, buffer->size());
+            if (buffer->size() < header.mSize) {
+                ALOGE("b/123940919 AU_size %u", header.mSize);
+                android_errorWriteLog(0x534e4554, "123940919");
+                queue->erase(queue->begin());
+                return MALFORMED_PACKET;
+            }
+            if (buffer->size() < offset + header.mSize) {
+                android_errorWriteLog(0x534e4554, "124783982");
+                queue->erase(queue->begin());
+                return MALFORMED_PACKET;
+            }
 
             sp<ABuffer> accessUnit = new ABuffer(header.mSize);
             memcpy(accessUnit->data(), buffer->data() + offset, header.mSize);
@@ -324,7 +385,10 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
             mPackets.push_back(accessUnit);
         }
 
-        CHECK_EQ(offset, buffer->size());
+        if (offset != buffer->size()) {
+            ALOGW("potentially malformed packet (offset %zu, size %zu)",
+                    offset, buffer->size());
+        }
     }
 
     queue->erase(queue->begin());
@@ -336,24 +400,19 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
 void AMPEG4ElementaryAssembler::submitAccessUnit() {
     CHECK(!mPackets.empty());
 
-    ALOGV("Access unit complete (%d nal units)", mPackets.size());
+    ALOGV("Access unit complete (%zu nal units)", mPackets.size());
 
-    size_t totalSize = 0;
-    for (List<sp<ABuffer> >::iterator it = mPackets.begin();
-         it != mPackets.end(); ++it) {
-        totalSize += (*it)->size();
+    sp<ABuffer> accessUnit;
+
+    if (mIsGeneric) {
+        accessUnit = MakeADTSCompoundFromAACFrames(
+                OMX_AUDIO_AACObjectLC - 1,
+                mSampleRateIndex,
+                mChannelConfig,
+                mPackets);
+    } else {
+        accessUnit = MakeCompoundFromPackets(mPackets);
     }
-
-    sp<ABuffer> accessUnit = new ABuffer(totalSize);
-    size_t offset = 0;
-    for (List<sp<ABuffer> >::iterator it = mPackets.begin();
-         it != mPackets.end(); ++it) {
-        sp<ABuffer> nal = *it;
-        memcpy(accessUnit->data() + offset, nal->data(), nal->size());
-        offset += nal->size();
-    }
-
-    CopyTimes(accessUnit, *mPackets.begin());
 
 #if 0
     printf(mAccessUnitDamaged ? "X" : ".");
@@ -376,6 +435,7 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::assembleMore(
         const sp<ARTPSource> &source) {
     AssemblyStatus status = addPacket(source);
     if (status == MALFORMED_PACKET) {
+        ALOGI("access unit is damaged");
         mAccessUnitDamaged = true;
     }
     return status;

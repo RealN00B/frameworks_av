@@ -18,8 +18,8 @@
 #define LOG_TAG "SoftOMXPlugin"
 #include <utils/Log.h>
 
-#include "SoftOMXPlugin.h"
-#include "include/SoftOMXComponent.h"
+#include <media/stagefright/omx/SoftOMXPlugin.h>
+#include <media/stagefright/omx/SoftOMXComponent.h>
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AString.h>
@@ -40,18 +40,41 @@ static const struct {
     { "OMX.google.amrnb.encoder", "amrnbenc", "audio_encoder.amrnb" },
     { "OMX.google.amrwb.decoder", "amrdec", "audio_decoder.amrwb" },
     { "OMX.google.amrwb.encoder", "amrwbenc", "audio_encoder.amrwb" },
-    { "OMX.google.h264.decoder", "h264dec", "video_decoder.avc" },
+    { "OMX.google.h264.decoder", "avcdec", "video_decoder.avc" },
+    { "OMX.google.h264.encoder", "avcenc", "video_encoder.avc" },
+    { "OMX.google.hevc.decoder", "hevcdec", "video_decoder.hevc" },
     { "OMX.google.g711.alaw.decoder", "g711dec", "audio_decoder.g711alaw" },
     { "OMX.google.g711.mlaw.decoder", "g711dec", "audio_decoder.g711mlaw" },
+    { "OMX.google.mpeg2.decoder", "mpeg2dec", "video_decoder.mpeg2" },
     { "OMX.google.h263.decoder", "mpeg4dec", "video_decoder.h263" },
+    { "OMX.google.h263.encoder", "mpeg4enc", "video_encoder.h263" },
     { "OMX.google.mpeg4.decoder", "mpeg4dec", "video_decoder.mpeg4" },
+    { "OMX.google.mpeg4.encoder", "mpeg4enc", "video_encoder.mpeg4" },
     { "OMX.google.mp3.decoder", "mp3dec", "audio_decoder.mp3" },
     { "OMX.google.vorbis.decoder", "vorbisdec", "audio_decoder.vorbis" },
-    { "OMX.google.vpx.decoder", "vpxdec", "video_decoder.vpx" },
+    { "OMX.google.opus.decoder", "opusdec", "audio_decoder.opus" },
+    { "OMX.google.vp8.decoder", "vpxdec", "video_decoder.vp8" },
+    { "OMX.google.vp9.decoder", "vpxdec", "video_decoder.vp9" },
+    { "OMX.google.vp8.encoder", "vpxenc", "video_encoder.vp8" },
+    { "OMX.google.vp9.encoder", "vpxenc", "video_encoder.vp9" },
+    { "OMX.google.raw.decoder", "rawdec", "audio_decoder.raw" },
+    { "OMX.google.flac.decoder", "flacdec", "audio_decoder.flac" },
+    { "OMX.google.flac.encoder", "flacenc", "audio_encoder.flac" },
+    { "OMX.google.gsm.decoder", "gsmdec", "audio_decoder.gsm" },
 };
 
 static const size_t kNumComponents =
     sizeof(kComponents) / sizeof(kComponents[0]);
+
+extern "C" OMXPluginBase* createOMXPlugin() {
+    ALOGI("createOMXPlugin");
+    return new SoftOMXPlugin();
+}
+
+extern "C" void destroyOMXPlugin(OMXPluginBase* plugin) {
+    ALOGI("destroyOMXPlugin");
+    delete plugin;
+}
 
 SoftOMXPlugin::SoftOMXPlugin() {
 }
@@ -72,10 +95,24 @@ OMX_ERRORTYPE SoftOMXPlugin::makeComponentInstance(
         libName.append(kComponents[i].mLibNameSuffix);
         libName.append(".so");
 
-        void *libHandle = dlopen(libName.c_str(), RTLD_NOW);
+        // RTLD_NODELETE means we keep the shared library around forever.
+        // this eliminates thrashing during sequences like loading soundpools.
+        // It also leaves the rest of the logic around the dlopen()/dlclose()
+        // calls in this file unchanged.
+        //
+        // Implications of the change:
+        // -- the codec process (where this happens) will have a slightly larger
+        //    long-term memory footprint as it accumulates the loaded shared libraries.
+        //    This is expected to be a small amount of memory.
+        // -- plugin codecs can no longer (and never should have) depend on a
+        //    free reset of any static data as the library would have crossed
+        //    a dlclose/dlopen cycle.
+        //
+
+        void *libHandle = dlopen(libName.c_str(), RTLD_NOW|RTLD_NODELETE);
 
         if (libHandle == NULL) {
-            ALOGE("unable to dlopen %s", libName.c_str());
+            ALOGE("unable to dlopen %s: %s", libName.c_str(), dlerror());
 
             return OMX_ErrorComponentNotFound;
         }
@@ -146,7 +183,7 @@ OMX_ERRORTYPE SoftOMXPlugin::destroyComponentInstance(
 
 OMX_ERRORTYPE SoftOMXPlugin::enumerateComponents(
         OMX_STRING name,
-        size_t size,
+        size_t /* size */,
         OMX_U32 index) {
     if (index >= kNumComponents) {
         return OMX_ErrorNoMore;

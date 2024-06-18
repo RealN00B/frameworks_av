@@ -18,65 +18,103 @@
 
 #define STAGEFRIGHT_RECORDER_H_
 
+#include <media/MediaMetricsItem.h>
 #include <media/MediaRecorderBase.h>
 #include <camera/CameraParameters.h>
 #include <utils/String8.h>
 
 #include <system/audio.h>
 
+#include <media/hardware/MetadataBufferType.h>
+#include <media/stagefright/foundation/AString.h>
+#include <android/content/AttributionSourceState.h>
+
 namespace android {
+
+using content::AttributionSourceState;
 
 class Camera;
 class ICameraRecordingProxy;
 class CameraSource;
 class CameraSourceTimeLapse;
+struct MediaCodecSource;
 struct MediaSource;
 struct MediaWriter;
 class MetaData;
 struct AudioSource;
 class MediaProfiles;
-class ISurfaceTexture;
-class SurfaceMediaSource;
+struct ALooper;
 
 struct StagefrightRecorder : public MediaRecorderBase {
-    StagefrightRecorder();
+    explicit StagefrightRecorder(const AttributionSourceState& attributionSource);
     virtual ~StagefrightRecorder();
-
     virtual status_t init();
+    virtual status_t setLogSessionId(const String8 &id);
     virtual status_t setAudioSource(audio_source_t as);
+            status_t setPrivacySensitive(bool privacySensitive) override;
+            status_t isPrivacySensitive(bool *privacySensitive) const override;
     virtual status_t setVideoSource(video_source vs);
     virtual status_t setOutputFormat(output_format of);
     virtual status_t setAudioEncoder(audio_encoder ae);
     virtual status_t setVideoEncoder(video_encoder ve);
     virtual status_t setVideoSize(int width, int height);
     virtual status_t setVideoFrameRate(int frames_per_second);
-    virtual status_t setCamera(const sp<ICamera>& camera, const sp<ICameraRecordingProxy>& proxy);
-    virtual status_t setPreviewSurface(const sp<Surface>& surface);
-    virtual status_t setOutputFile(const char *path);
-    virtual status_t setOutputFile(int fd, int64_t offset, int64_t length);
-    virtual status_t setParameters(const String8& params);
-    virtual status_t setListener(const sp<IMediaRecorderClient>& listener);
+    virtual status_t setCamera(const sp<hardware::ICamera>& camera, const sp<ICameraRecordingProxy>& proxy);
+    virtual status_t setPreviewSurface(const sp<IGraphicBufferProducer>& surface);
+    virtual status_t setInputSurface(const sp<PersistentSurface>& surface);
+    virtual status_t setOutputFile(int fd);
+    virtual status_t setNextOutputFile(int fd);
+    virtual status_t setParameters(const String8 &params);
+    virtual status_t setListener(const sp<IMediaRecorderClient> &listener);
+    virtual status_t setClientName(const String16 &clientName);
     virtual status_t prepare();
     virtual status_t start();
     virtual status_t pause();
+    virtual status_t resume();
     virtual status_t stop();
     virtual status_t close();
     virtual status_t reset();
     virtual status_t getMaxAmplitude(int *max);
-    virtual status_t dump(int fd, const Vector<String16>& args) const;
+    virtual status_t getMetrics(Parcel *reply);
+    virtual status_t dump(int fd, const Vector<String16> &args) const;
     // Querying a SurfaceMediaSourcer
-    virtual sp<ISurfaceTexture> querySurfaceMediaSource() const;
+    virtual sp<IGraphicBufferProducer> querySurfaceMediaSource() const;
+    virtual status_t setInputDevice(audio_port_handle_t deviceId);
+    virtual status_t getRoutedDeviceId(audio_port_handle_t* deviceId);
+    virtual void setAudioDeviceCallback(const sp<AudioSystem::AudioDeviceCallback>& callback);
+    virtual status_t enableAudioDeviceCallback(bool enabled);
+    virtual status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones);
+    virtual status_t setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
+    virtual status_t setPreferredMicrophoneFieldDimension(float zoom);
+            status_t getPortId(audio_port_handle_t *portId) const override;
+    virtual status_t getRtpDataUsage(uint64_t *bytes);
 
 private:
-    sp<ICamera> mCamera;
+
+    enum privacy_sensitive_t {
+        PRIVACY_SENSITIVE_DEFAULT = -1,
+        PRIVACY_SENSITIVE_DISABLED = 0,
+        PRIVACY_SENSITIVE_ENABLED = 1,
+    };
+
+    mutable Mutex mLock;
+    sp<hardware::ICamera> mCamera;
     sp<ICameraRecordingProxy> mCameraProxy;
-    sp<Surface> mPreviewSurface;
+    sp<IGraphicBufferProducer> mPreviewSurface;
+    sp<PersistentSurface> mPersistentSurface;
     sp<IMediaRecorderClient> mListener;
     sp<MediaWriter> mWriter;
     int mOutputFd;
     sp<AudioSource> mAudioSourceNode;
 
+    mediametrics::Item *mMetricsItem;
+    bool mAnalyticsDirty;
+    void flushAndResetMetrics(bool reinitialize);
+    void updateMetrics();
+
+    AString mLogSessionId;
     audio_source_t mAudioSource;
+    privacy_sensitive_t mPrivacySensitive;
     video_source mVideoSource;
     output_format mOutputFormat;
     audio_encoder mAudioEncoder;
@@ -85,6 +123,7 @@ private:
     int32_t mVideoWidth, mVideoHeight;
     int32_t mFrameRate;
     int32_t mVideoBitRate;
+    int32_t mVideoBitRateMode;
     int32_t mAudioBitRate;
     int32_t mAudioChannels;
     int32_t mSampleRate;
@@ -103,39 +142,68 @@ private:
     int32_t mLatitudex10000;
     int32_t mLongitudex10000;
     int32_t mStartTimeOffsetMs;
+    int32_t mTotalBitRate;
+    String8 mLocalIp;
+    String8 mRemoteIp;
+    int32_t mLocalPort;
+    int32_t mRemotePort;
+    int32_t mSelfID;
+    int32_t mOpponentID;
+    int32_t mPayloadType;
+    int32_t mRTPCVOExtMap;
+    int32_t mRTPCVODegrees;
+    int32_t mRTPSockDscp;
+    int32_t mRTPSockOptEcn;
+    int64_t mRTPSockNetwork;
+    uint32_t mLastSeqNo;
 
-    bool mCaptureTimeLapse;
-    int64_t mTimeBetweenTimeLapseFrameCaptureUs;
+    int64_t mDurationRecordedUs;
+    int64_t mStartedRecordingUs;
+    int64_t mDurationPausedUs;
+    int32_t mNPauses;
+
+    bool mCaptureFpsEnable;
+    double mCaptureFps;
+    int64_t mTimeBetweenCaptureUs;
     sp<CameraSourceTimeLapse> mCameraSourceTimeLapse;
-
 
     String8 mParams;
 
-    bool mIsMetaDataStoredInVideoBuffers;
+    MetadataBufferType mMetaDataStoredInVideoBuffers;
     MediaProfiles *mEncoderProfiles;
+
+    int64_t mPauseStartTimeUs;
+    int64_t mTotalPausedDurationUs;
+    sp<MediaCodecSource> mAudioEncoderSource;
+    sp<MediaCodecSource> mVideoEncoderSource;
 
     bool mStarted;
     // Needed when GLFrames are encoded.
-    // An <ISurfaceTexture> pointer
+    // An <IGraphicBufferProducer> pointer
     // will be sent to the client side using which the
     // frame buffers will be queued and dequeued
-    sp<SurfaceMediaSource> mSurfaceMediaSource;
+    sp<IGraphicBufferProducer> mGraphicBufferProducer;
+    sp<ALooper> mLooper;
 
-    status_t setupMPEG4Recording(
-        int outputFd,
-        int32_t videoWidth, int32_t videoHeight,
-        int32_t videoBitRate,
-        int32_t *totalBitRate,
-        sp<MediaWriter> *mediaWriter);
-    void setupMPEG4MetaData(int64_t startTimeUs, int32_t totalBitRate,
-        sp<MetaData> *meta);
-    status_t startMPEG4Recording();
-    status_t startAMRRecording();
-    status_t startAACRecording();
-    status_t startRawAudioRecording();
-    status_t startRTPRecording();
-    status_t startMPEG2TSRecording();
-    sp<MediaSource> createAudioSource();
+    audio_port_handle_t mSelectedDeviceId;
+    bool mDeviceCallbackEnabled;
+    wp<AudioSystem::AudioDeviceCallback> mAudioDeviceCallback;
+
+    audio_microphone_direction_t mSelectedMicDirection;
+    float mSelectedMicFieldDimension;
+
+    static const int kMaxHighSpeedFps = 1000;
+
+    status_t prepareInternal();
+    status_t setupMPEG4orWEBMRecording();
+    void setupMPEG4orWEBMMetaData(sp<MetaData> *meta);
+    status_t setupAMRRecording();
+    status_t setupAACRecording();
+    status_t setupOggRecording();
+    status_t setupRawAudioRecording();
+    status_t setupRTPRecording();
+    status_t setupMPEG2TSRecording();
+    sp<MediaCodecSource> createAudioSource();
     status_t checkVideoEncoderCapabilities();
     status_t checkAudioEncoderCapabilities();
     // Generic MediaSource set-up. Returns the appropriate
@@ -143,14 +211,8 @@ private:
     // depending on the videosource type
     status_t setupMediaSource(sp<MediaSource> *mediaSource);
     status_t setupCameraSource(sp<CameraSource> *cameraSource);
-    // setup the surfacemediasource for the encoder
-    status_t setupSurfaceMediaSource();
-
     status_t setupAudioEncoder(const sp<MediaWriter>& writer);
-    status_t setupVideoEncoder(
-            sp<MediaSource> cameraSource,
-            int32_t videoBitRate,
-            sp<MediaSource> *source);
+    status_t setupVideoEncoder(const sp<MediaSource>& cameraSource, sp<MediaCodecSource> *source);
 
     // Encoding parameter handling utilities
     status_t setParameter(const String8 &key, const String8 &value);
@@ -158,9 +220,10 @@ private:
     status_t setParamAudioNumberOfChannels(int32_t channles);
     status_t setParamAudioSamplingRate(int32_t sampleRate);
     status_t setParamAudioTimeScale(int32_t timeScale);
-    status_t setParamTimeLapseEnable(int32_t timeLapseEnable);
-    status_t setParamTimeBetweenTimeLapseFrameCapture(int64_t timeUs);
+    status_t setParamCaptureFpsEnable(int32_t timeLapseEnable);
+    status_t setParamCaptureFps(double fps);
     status_t setParamVideoEncodingBitRate(int32_t bitRate);
+    status_t setParamVideoBitRateMode(int32_t bitRateMode);
     status_t setParamVideoIFramesInterval(int32_t seconds);
     status_t setParamVideoEncoderProfile(int32_t profile);
     status_t setParamVideoEncoderLevel(int32_t level);
@@ -175,6 +238,19 @@ private:
     status_t setParamMovieTimeScale(int32_t timeScale);
     status_t setParamGeoDataLongitude(int64_t longitudex10000);
     status_t setParamGeoDataLatitude(int64_t latitudex10000);
+    status_t setParamRtpLocalIp(const String8 &localIp);
+    status_t setParamRtpLocalPort(int32_t localPort);
+    status_t setParamRtpRemoteIp(const String8 &remoteIp);
+    status_t setParamRtpRemotePort(int32_t remotePort);
+    status_t setParamSelfID(int32_t selfID);
+    status_t setParamVideoOpponentID(int32_t opponentID);
+    status_t setParamPayloadType(int32_t payloadType);
+    status_t setRTPCVOExtMap(int32_t extmap);
+    status_t setRTPCVODegrees(int32_t cvoDegrees);
+    status_t setParamRtpDscp(int32_t dscp);
+    status_t setParamRtpEcn(int32_t ecn);
+    status_t setSocketNetwork(int64_t networkHandle);
+    status_t requestIDRFrame();
     void clipVideoBitRate();
     void clipVideoFrameRate();
     void clipVideoFrameWidth();
@@ -183,6 +259,7 @@ private:
     void clipAudioSampleRate();
     void clipNumberOfAudioChannels();
     void setDefaultProfileIfNecessary();
+    void setDefaultVideoEncoderIfNecessary();
 
 
     StagefrightRecorder(const StagefrightRecorder &);

@@ -20,6 +20,7 @@
 #include "MtpPacket.h"
 #include "mtp.h"
 
+class IMtpHandle;
 struct usb_request;
 
 namespace android {
@@ -31,8 +32,8 @@ public:
     virtual             ~MtpRequestPacket();
 
 #ifdef MTP_DEVICE
-    // fill our buffer with data from the given file descriptor
-    int                 read(int fd);
+    // fill our buffer with data from the given usb handle
+    int                 read(IMtpHandle *h);
 #endif
 
 #ifdef MTP_HOST
@@ -43,6 +44,10 @@ public:
     inline MtpOperationCode    getOperationCode() const { return getContainerCode(); }
     inline void                setOperationCode(MtpOperationCode code)
                                                     { return setContainerCode(code); }
+    inline int                  getParameterCount() const { return mParameterCount; }
+
+private:
+    int     mParameterCount;
 };
 
 }; // namespace android

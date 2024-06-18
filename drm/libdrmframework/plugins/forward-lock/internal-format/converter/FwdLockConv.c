@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -245,7 +246,9 @@ static int FwdLockConv_DeriveKeys(FwdLockConv_Session_t *pSession) {
         AES_KEY sessionRoundKeys;
         unsigned char value[KEY_SIZE];
         unsigned char key[KEY_SIZE];
-    } *pData = malloc(sizeof *pData);
+    };
+    const size_t kSize = sizeof(struct FwdLockConv_DeriveKeys_Data);
+    struct FwdLockConv_DeriveKeys_Data *pData = malloc(kSize);
     if (pData == NULL) {
         status = FwdLockConv_Status_OutOfMemory;
     } else {
@@ -268,7 +271,7 @@ static int FwdLockConv_DeriveKeys(FwdLockConv_Session_t *pSession) {
                 status = FwdLockConv_Status_OK;
             }
         }
-        memset(pData, 0, sizeof pData); // Zero out key data.
+        memset(pData, 0, kSize); // Zero out key data.
         free(pData);
     }
     return status;
@@ -1310,37 +1313,6 @@ FwdLockConv_Status_t FwdLockConv_ConvertOpenFile(int inputFileDesc,
                 }
             }
             free(pReadBuffer);
-        }
-    }
-    return status;
-}
-
-FwdLockConv_Status_t FwdLockConv_ConvertFile(const char *pInputFilename,
-                                             const char *pOutputFilename,
-                                             off64_t *pErrorPos) {
-    FwdLockConv_Status_t status;
-    if (pErrorPos != NULL) {
-        *pErrorPos = INVALID_OFFSET;
-    }
-    if (pInputFilename == NULL || pOutputFilename == NULL) {
-        status = FwdLockConv_Status_InvalidArgument;
-    } else {
-        int inputFileDesc = open(pInputFilename, O_RDONLY);
-        if (inputFileDesc < 0) {
-            status = FwdLockConv_Status_FileNotFound;
-        } else {
-            int outputFileDesc = open(pOutputFilename, O_CREAT | O_TRUNC | O_WRONLY,
-                                      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-            if (outputFileDesc < 0) {
-                status = FwdLockConv_Status_FileCreationFailed;
-            } else {
-                status = FwdLockConv_ConvertOpenFile(inputFileDesc, read, outputFileDesc, write,
-                                                     lseek64, pErrorPos);
-                if (close(outputFileDesc) == 0 && status != FwdLockConv_Status_OK) {
-                    remove(pOutputFilename);
-                }
-            }
-            (void)close(inputFileDesc);
         }
     }
     return status;

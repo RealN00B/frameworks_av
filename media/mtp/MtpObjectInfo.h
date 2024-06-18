@@ -47,10 +47,10 @@ public:
     char*               mKeywords;
 
 public:
-                        MtpObjectInfo(MtpObjectHandle handle);
+    explicit            MtpObjectInfo(MtpObjectHandle handle);
     virtual             ~MtpObjectInfo();
 
-    void                read(MtpDataPacket& packet);
+    bool                read(MtpDataPacket& packet);
 
     void                print();
 };

@@ -18,11 +18,6 @@
 #ifndef __LVCS_BYPASSMIX_H__
 #define __LVCS_BYPASSMIX_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
-
 /************************************************************************************/
 /*                                                                                  */
 /*    Includes                                                                      */
@@ -31,7 +26,6 @@ extern "C" {
 
 #include "LVC_Mixer.h"
 
-
 /************************************************************************************/
 /*                                                                                  */
 /*    Structures                                                                    */
@@ -39,43 +33,29 @@ extern "C" {
 /************************************************************************************/
 
 /* Bypass mixer structure */
-typedef struct
-{
+typedef struct {
     /* Mixer settings */
-    LVMixer3_2St_st         Mixer_Instance;             /* Mixer instance */
-    LVM_UINT16              Output_Shift;               /* Correcting gain output shift */
+    LVMixer3_2St_FLOAT_st Mixer_Instance; /* Mixer instance */
+    LVM_UINT16 Output_Shift;              /* Correcting gain output shift */
 
 } LVCS_BypassMix_t;
 
-
-/* Output gain type */
-typedef struct
-{
+typedef struct {
     /* Output gain settings, Gain = (Loss/32768) * 2^Shift */
-    LVM_UINT16              Shift;                      /* Left shifts required */
-    LVM_UINT16              Loss;                       /* Loss required */
-    LVM_UINT16              UnprocLoss;                 /* Unprocessed path loss */
+    LVM_UINT16 Shift;     /* Left shifts required */
+    LVM_FLOAT Loss;       /* Loss required */
+    LVM_FLOAT UnprocLoss; /* Unprocessed path loss */
 } Gain_t;
-
-
 /************************************************************************************/
 /*                                                                                    */
 /*    Function prototypes                                                                */
 /*                                                                                    */
 /************************************************************************************/
 
-LVCS_ReturnStatus_en LVCS_BypassMixInit(LVCS_Handle_t       hInstance,
-                                           LVCS_Params_t    *pParams);
+LVCS_ReturnStatus_en LVCS_BypassMixInit(LVCS_Handle_t hInstance, LVCS_Params_t* pParams);
 
+LVCS_ReturnStatus_en LVCS_BypassMixer(LVCS_Handle_t hInstance, const LVM_FLOAT* pProcessed,
+                                      const LVM_FLOAT* unProcessed, LVM_FLOAT* pOutData,
+                                      LVM_UINT16 NumSamples);
 
-LVCS_ReturnStatus_en LVCS_BypassMixer(LVCS_Handle_t         hInstance,
-                                      const LVM_INT16       *pProcessed,
-                                      const LVM_INT16       *unProcessed,
-                                            LVM_INT16       *pOutData,
-                                            LVM_UINT16      NumSamples);
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-
-#endif  /* BYPASSMIX_H */
+#endif /* BYPASSMIX_H */

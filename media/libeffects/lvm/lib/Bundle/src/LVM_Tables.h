@@ -18,10 +18,6 @@
 #ifndef __LVM_TABLES_H__
 #define __LVM_TABLES_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
 /************************************************************************************/
 /*                                                                                  */
 /*    Includes                                                                      */
@@ -37,23 +33,15 @@ extern "C" {
 /*                                                                                  */
 /************************************************************************************/
 
-extern FO_C16_LShx_Coefs_t     LVM_TrebleBoostCoefs[];
-
+extern FO_FLOAT_LShx_Coefs_t LVM_TrebleBoostCoefs[];
 
 /************************************************************************************/
 /*                                                                                  */
 /*    Volume control gain and time constant tables                                  */
 /*                                                                                  */
 /************************************************************************************/
+extern const LVM_FLOAT LVM_VolumeTable[];
 
-extern const LVM_INT16 LVM_VolumeTable[];
 extern const LVM_INT16 LVM_MixerTCTable[];
 
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-
 #endif /* __LVM_TABLES_H__ */
-
-

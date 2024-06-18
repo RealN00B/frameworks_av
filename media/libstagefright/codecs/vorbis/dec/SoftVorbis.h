@@ -18,7 +18,7 @@
 
 #define SOFT_VORBIS_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 
 struct vorbis_dsp_state;
 struct vorbis_info;
@@ -43,6 +43,7 @@ protected:
     virtual void onQueueFilled(OMX_U32 portIndex);
     virtual void onPortFlushCompleted(OMX_U32 portIndex);
     virtual void onPortEnableCompleted(OMX_U32 portIndex, bool enabled);
+    virtual void onReset();
 
 private:
     enum {
@@ -58,6 +59,9 @@ private:
     int64_t mAnchorTimeUs;
     int64_t mNumFramesOutput;
     int32_t mNumFramesLeftOnPage;
+    bool mSawInputEos;
+    bool mSignalledOutputEos;
+    bool mSignalledError;
 
     enum {
         NONE,
@@ -68,6 +72,7 @@ private:
     void initPorts();
     status_t initDecoder();
     bool isConfigured() const;
+    void handleEOS();
 
     DISALLOW_EVIL_CONSTRUCTORS(SoftVorbis);
 };

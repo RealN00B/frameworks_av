@@ -17,7 +17,13 @@
 #ifndef _MTP_STRING_BUFFER_H
 #define _MTP_STRING_BUFFER_H
 
+#include <log/log.h>
 #include <stdint.h>
+#include <string>
+#include <string_view>
+
+// Max Character number of a MTP String
+#define MTP_STRING_MAX_CHARACTER_NUMBER             255
 
 namespace android {
 
@@ -27,30 +33,39 @@ class MtpDataPacket;
 class MtpStringBuffer {
 
 private:
-    // mBuffer contains string in UTF8 format
-    // maximum 3 bytes/character, with 1 extra for zero termination
-    uint8_t         mBuffer[255 * 3 + 1];
-    int             mCharCount;
-    int             mByteCount;
+    std::string     mString;
 
 public:
-                    MtpStringBuffer();
-                    MtpStringBuffer(const char* src);
-                    MtpStringBuffer(const uint16_t* src);
+                    MtpStringBuffer() {};
+                    ~MtpStringBuffer() {};
+
+    explicit        MtpStringBuffer(const char* src);
+    explicit        MtpStringBuffer(const uint16_t* src);
                     MtpStringBuffer(const MtpStringBuffer& src);
-    virtual         ~MtpStringBuffer();
 
     void            set(const char* src);
     void            set(const uint16_t* src);
 
-    void            readFromPacket(MtpDataPacket* packet);
+    inline void     append(const char* other);
+    inline void     append(MtpStringBuffer &other);
+
+    bool            readFromPacket(MtpDataPacket* packet);
     void            writeToPacket(MtpDataPacket* packet) const;
 
-    inline int      getCharCount() const { return mCharCount; }
-    inline int      getByteCount() const { return mByteCount; }
+    inline bool     isEmpty() const { return mString.empty(); }
+    inline int      size() const { return mString.length(); }
 
-	inline operator const char*() const { return (const char *)mBuffer; }
+    inline operator const char*() const { return mString.c_str(); }
+    operator std::string_view() const { return mString; }
 };
+
+inline void MtpStringBuffer::append(const char* other) {
+    mString += other;
+}
+
+inline void MtpStringBuffer::append(MtpStringBuffer &other) {
+    mString += other.mString;
+}
 
 }; // namespace android
 

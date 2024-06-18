@@ -17,9 +17,12 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "SimpleSoftOMXComponent"
 #include <utils/Log.h>
+#include <OMX_Core.h>
+#include <OMX_Audio.h>
+#include <OMX_IndexExt.h>
+#include <OMX_AudioExt.h>
 
-#include "include/SimpleSoftOMXComponent.h"
-
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AMessage.h>
@@ -35,14 +38,15 @@ SimpleSoftOMXComponent::SimpleSoftOMXComponent(
       mLooper(new ALooper),
       mHandler(new AHandlerReflector<SimpleSoftOMXComponent>(this)),
       mState(OMX_StateLoaded),
-      mTargetState(OMX_StateLoaded) {
+      mTargetState(OMX_StateLoaded),
+      mFrameConfig(false) {
     mLooper->setName(name);
     mLooper->registerHandler(mHandler);
 
     mLooper->start(
             false, // runOnCallingThread
             false, // canCallJava
-            ANDROID_PRIORITY_FOREGROUND);
+            ANDROID_PRIORITY_VIDEO);
 }
 
 void SimpleSoftOMXComponent::prepareForDestruction() {
@@ -58,7 +62,7 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::sendCommand(
         OMX_COMMANDTYPE cmd, OMX_U32 param, OMX_PTR data) {
     CHECK(data == NULL);
 
-    sp<AMessage> msg = new AMessage(kWhatSendCommand, mHandler->id());
+    sp<AMessage> msg = new AMessage(kWhatSendCommand, mHandler);
     msg->setInt32("cmd", cmd);
     msg->setInt32("param", param);
     msg->post();
@@ -74,24 +78,52 @@ bool SimpleSoftOMXComponent::isSetParameterAllowed(
 
     OMX_U32 portIndex;
 
-    switch (index) {
+    switch ((int)index) {
         case OMX_IndexParamPortDefinition:
         {
-            portIndex = ((OMX_PARAM_PORTDEFINITIONTYPE *)params)->nPortIndex;
+            const OMX_PARAM_PORTDEFINITIONTYPE *portDefs =
+                    (const OMX_PARAM_PORTDEFINITIONTYPE *) params;
+            if (!isValidOMXParam(portDefs)) {
+                return false;
+            }
+            portIndex = portDefs->nPortIndex;
             break;
         }
 
         case OMX_IndexParamAudioPcm:
         {
-            portIndex = ((OMX_AUDIO_PARAM_PCMMODETYPE *)params)->nPortIndex;
+            const OMX_AUDIO_PARAM_PCMMODETYPE *pcmMode =
+                    (const OMX_AUDIO_PARAM_PCMMODETYPE *) params;
+            if (!isValidOMXParam(pcmMode)) {
+                return false;
+            }
+            portIndex = pcmMode->nPortIndex;
             break;
         }
 
         case OMX_IndexParamAudioAac:
         {
-            portIndex = ((OMX_AUDIO_PARAM_AACPROFILETYPE *)params)->nPortIndex;
+            const OMX_AUDIO_PARAM_AACPROFILETYPE *aacMode =
+                    (const OMX_AUDIO_PARAM_AACPROFILETYPE *) params;
+            if (!isValidOMXParam(aacMode)) {
+                return false;
+            }
+            portIndex = aacMode->nPortIndex;
             break;
         }
+
+         case OMX_IndexParamAudioAndroidAacDrcPresentation:
+        {
+            if (mState == OMX_StateInvalid) {
+                return false;
+            }
+            const OMX_AUDIO_PARAM_ANDROID_AACDRCPRESENTATIONTYPE *aacPresParams =
+                            (const OMX_AUDIO_PARAM_ANDROID_AACDRCPRESENTATIONTYPE *)params;
+            if (!isValidOMXParam(aacPresParams)) {
+                return false;
+            }
+            return true;
+         }
 
         default:
             return false;
@@ -125,6 +157,10 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::internalGetParameter(
             OMX_PARAM_PORTDEFINITIONTYPE *defParams =
                 (OMX_PARAM_PORTDEFINITIONTYPE *)params;
 
+            if (!isValidOMXParam(defParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (defParams->nPortIndex >= mPorts.size()
                     || defParams->nSize
                             != sizeof(OMX_PARAM_PORTDEFINITIONTYPE)) {
@@ -152,34 +188,53 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::internalSetParameter(
             OMX_PARAM_PORTDEFINITIONTYPE *defParams =
                 (OMX_PARAM_PORTDEFINITIONTYPE *)params;
 
-            if (defParams->nPortIndex >= mPorts.size()
-                    || defParams->nSize
-                            != sizeof(OMX_PARAM_PORTDEFINITIONTYPE)) {
-                return OMX_ErrorUndefined;
+            if (!isValidOMXParam(defParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (defParams->nPortIndex >= mPorts.size()) {
+                return OMX_ErrorBadPortIndex;
+            }
+            if (defParams->nSize != sizeof(OMX_PARAM_PORTDEFINITIONTYPE)) {
+                return OMX_ErrorUnsupportedSetting;
             }
 
             PortInfo *port =
                 &mPorts.editItemAt(defParams->nPortIndex);
 
-            if (defParams->nBufferSize != port->mDef.nBufferSize) {
-                CHECK_GE(defParams->nBufferSize, port->mDef.nBufferSize);
+            // default behavior is that we only allow buffer size to increase
+            if (defParams->nBufferSize > port->mDef.nBufferSize) {
                 port->mDef.nBufferSize = defParams->nBufferSize;
             }
 
-            if (defParams->nBufferCountActual
-                    != port->mDef.nBufferCountActual) {
-                CHECK_GE(defParams->nBufferCountActual,
-                         port->mDef.nBufferCountMin);
-
-                port->mDef.nBufferCountActual = defParams->nBufferCountActual;
+            if (defParams->nBufferCountActual < port->mDef.nBufferCountMin) {
+                ALOGW("component requires at least %u buffers (%u requested)",
+                        port->mDef.nBufferCountMin, defParams->nBufferCountActual);
+                return OMX_ErrorUnsupportedSetting;
             }
 
+            port->mDef.nBufferCountActual = defParams->nBufferCountActual;
             return OMX_ErrorNone;
         }
 
         default:
             return OMX_ErrorUnsupportedIndex;
     }
+}
+
+OMX_ERRORTYPE SimpleSoftOMXComponent::internalSetConfig(
+        OMX_INDEXTYPE index, const OMX_PTR params, bool *frameConfig) {
+    return OMX_ErrorUndefined;
+}
+
+OMX_ERRORTYPE SimpleSoftOMXComponent::setConfig(
+        OMX_INDEXTYPE index, const OMX_PTR params) {
+    bool frameConfig = mFrameConfig;
+    OMX_ERRORTYPE err = internalSetConfig(index, params, &frameConfig);
+    if (err == OMX_ErrorNone) {
+        mFrameConfig = frameConfig;
+    }
+    return err;
 }
 
 OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
@@ -190,6 +245,13 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
         OMX_U8 *ptr) {
     Mutex::Autolock autoLock(mLock);
     CHECK_LT(portIndex, mPorts.size());
+
+    PortInfo *port = &mPorts.editItemAt(portIndex);
+    if (size < port->mDef.nBufferSize) {
+        ALOGE("b/63522430, Buffer size is too small.");
+        android_errorWriteLog(0x534e4554, "63522430");
+        return OMX_ErrorBadParameter;
+    }
 
     *header = new OMX_BUFFERHEADERTYPE;
     (*header)->nSize = sizeof(OMX_BUFFERHEADERTYPE);
@@ -212,8 +274,6 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
     (*header)->nFlags = 0;
     (*header)->nOutputPortIndex = portIndex;
     (*header)->nInputPortIndex = portIndex;
-
-    PortInfo *port = &mPorts.editItemAt(portIndex);
 
     CHECK(mState == OMX_StateLoaded || port->mDef.bEnabled == OMX_FALSE);
 
@@ -307,8 +367,12 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::freeBuffer(
 
 OMX_ERRORTYPE SimpleSoftOMXComponent::emptyThisBuffer(
         OMX_BUFFERHEADERTYPE *buffer) {
-    sp<AMessage> msg = new AMessage(kWhatEmptyThisBuffer, mHandler->id());
+    sp<AMessage> msg = new AMessage(kWhatEmptyThisBuffer, mHandler);
     msg->setPointer("header", buffer);
+    if (mFrameConfig) {
+        msg->setInt32("frame-config", mFrameConfig);
+        mFrameConfig = false;
+    }
     msg->post();
 
     return OMX_ErrorNone;
@@ -316,7 +380,7 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::emptyThisBuffer(
 
 OMX_ERRORTYPE SimpleSoftOMXComponent::fillThisBuffer(
         OMX_BUFFERHEADERTYPE *buffer) {
-    sp<AMessage> msg = new AMessage(kWhatFillThisBuffer, mHandler->id());
+    sp<AMessage> msg = new AMessage(kWhatFillThisBuffer, mHandler);
     msg->setPointer("header", buffer);
     msg->post();
 
@@ -351,6 +415,10 @@ void SimpleSoftOMXComponent::onMessageReceived(const sp<AMessage> &msg) {
         {
             OMX_BUFFERHEADERTYPE *header;
             CHECK(msg->findPointer("header", (void **)&header));
+            int32_t frameConfig;
+            if (!msg->findInt32("frame-config", &frameConfig)) {
+                frameConfig = 0;
+            }
 
             CHECK(mState == OMX_StateExecuting && mTargetState == mState);
 
@@ -366,6 +434,7 @@ void SimpleSoftOMXComponent::onMessageReceived(const sp<AMessage> &msg) {
                     CHECK(!buffer->mOwnedByUs);
 
                     buffer->mOwnedByUs = true;
+                    buffer->mFrameConfig = (bool)frameConfig;
 
                     CHECK((msgType == kWhatEmptyThisBuffer
                             && port->mDef.eDir == OMX_DirInput)
@@ -418,8 +487,25 @@ void SimpleSoftOMXComponent::onSendCommand(
 }
 
 void SimpleSoftOMXComponent::onChangeState(OMX_STATETYPE state) {
+    ALOGV("%p requesting change from %d to %d", this, mState, state);
     // We shouldn't be in a state transition already.
-    CHECK_EQ((int)mState, (int)mTargetState);
+
+    if (mState == OMX_StateLoaded
+            && mTargetState == OMX_StateIdle
+            && state == OMX_StateLoaded) {
+        // OMX specifically allows "canceling" a state transition from loaded
+        // to idle. Pretend we made it to idle, and go back to loaded
+        ALOGV("load->idle canceled");
+        mState = mTargetState = OMX_StateIdle;
+        state = OMX_StateLoaded;
+    }
+
+    if (mState != mTargetState) {
+        ALOGE("State change to state %d requested while still transitioning from state %d to %d",
+                state, mState, mTargetState);
+        notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+        return;
+    }
 
     switch (mState) {
         case OMX_StateLoaded:
@@ -450,12 +536,23 @@ void SimpleSoftOMXComponent::onChangeState(OMX_STATETYPE state) {
     checkTransitions();
 }
 
+void SimpleSoftOMXComponent::onReset() {
+    // no-op
+}
+
 void SimpleSoftOMXComponent::onPortEnable(OMX_U32 portIndex, bool enable) {
     CHECK_LT(portIndex, mPorts.size());
 
     PortInfo *port = &mPorts.editItemAt(portIndex);
     CHECK_EQ((int)port->mTransition, (int)PortInfo::NONE);
     CHECK(port->mDef.bEnabled == !enable);
+
+    if (port->mDef.eDir != OMX_DirOutput) {
+        ALOGE("Port enable/disable allowed only on output ports.");
+        notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+        android_errorWriteLog(0x534e4554, "29421804");
+        return;
+    }
 
     if (!enable) {
         port->mDef.bEnabled = OMX_FALSE;
@@ -501,7 +598,15 @@ void SimpleSoftOMXComponent::onPortFlush(
     CHECK_LT(portIndex, mPorts.size());
 
     PortInfo *port = &mPorts.editItemAt(portIndex);
-    CHECK_EQ((int)port->mTransition, (int)PortInfo::NONE);
+    // Ideally, the port should not in transitioning state when flushing.
+    // However, in error handling case, e.g., the client can't allocate buffers
+    // when it tries to re-enable the port, the port will be stuck in ENABLING.
+    // The client will then transition the component from Executing to Idle,
+    // which leads to flushing ports. At this time, it should be ok to notify
+    // the client of the error and still clear all buffers on the port.
+    if (port->mTransition != PortInfo::NONE) {
+        notify(OMX_EventError, OMX_ErrorUndefined, 0, 0);
+    }
 
     for (size_t i = 0; i < port->mBuffers.size(); ++i) {
         BufferInfo *buffer = &port->mBuffers.editItemAt(i);
@@ -579,9 +684,16 @@ void SimpleSoftOMXComponent::checkTransitions() {
         }
 
         if (transitionComplete) {
+            ALOGV("state transition from %d to %d complete", mState, mTargetState);
             mState = mTargetState;
 
+            if (mState == OMX_StateLoaded) {
+                onReset();
+            }
+
             notify(OMX_EventCmdComplete, OMX_CommandStateSet, mState, NULL);
+        } else {
+            ALOGV("state transition from %d to %d not yet complete", mState, mTargetState);
         }
     }
 
@@ -590,7 +702,7 @@ void SimpleSoftOMXComponent::checkTransitions() {
 
         if (port->mTransition == PortInfo::DISABLING) {
             if (port->mBuffers.empty()) {
-                ALOGV("Port %d now disabled.", i);
+                ALOGV("Port %zu now disabled.", i);
 
                 port->mTransition = PortInfo::NONE;
                 notify(OMX_EventCmdComplete, OMX_CommandPortDisable, i, NULL);
@@ -599,7 +711,7 @@ void SimpleSoftOMXComponent::checkTransitions() {
             }
         } else if (port->mTransition == PortInfo::ENABLING) {
             if (port->mDef.bPopulated == OMX_TRUE) {
-                ALOGV("Port %d now enabled.", i);
+                ALOGV("Port %zu now enabled.", i);
 
                 port->mTransition = PortInfo::NONE;
                 port->mDef.bEnabled = OMX_TRUE;
@@ -620,14 +732,14 @@ void SimpleSoftOMXComponent::addPort(const OMX_PARAM_PORTDEFINITIONTYPE &def) {
     info->mTransition = PortInfo::NONE;
 }
 
-void SimpleSoftOMXComponent::onQueueFilled(OMX_U32 portIndex) {
+void SimpleSoftOMXComponent::onQueueFilled(OMX_U32 portIndex __unused) {
 }
 
-void SimpleSoftOMXComponent::onPortFlushCompleted(OMX_U32 portIndex) {
+void SimpleSoftOMXComponent::onPortFlushCompleted(OMX_U32 portIndex __unused) {
 }
 
 void SimpleSoftOMXComponent::onPortEnableCompleted(
-        OMX_U32 portIndex, bool enabled) {
+        OMX_U32 portIndex __unused, bool enabled __unused) {
 }
 
 List<SimpleSoftOMXComponent::BufferInfo *> &

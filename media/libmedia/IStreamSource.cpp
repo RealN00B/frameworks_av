@@ -20,23 +20,19 @@
 
 #include <media/IStreamSource.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/MediaKeys.h>
 
 #include <binder/IMemory.h>
 #include <binder/Parcel.h>
 
 namespace android {
 
-// static
-const char *const IStreamListener::kKeyResumeAtPTS = "resume-at-PTS";
-
-// static
-const char *const IStreamListener::kKeyDiscontinuityMask = "discontinuity-mask";
-
 enum {
     // IStreamSource
     SET_LISTENER = IBinder::FIRST_CALL_TRANSACTION,
     SET_BUFFERS,
     ON_BUFFER_AVAILABLE,
+    FLAGS,
 
     // IStreamListener
     QUEUE_BUFFER,
@@ -44,23 +40,23 @@ enum {
 };
 
 struct BpStreamSource : public BpInterface<IStreamSource> {
-    BpStreamSource(const sp<IBinder> &impl)
+    explicit BpStreamSource(const sp<IBinder> &impl)
         : BpInterface<IStreamSource>(impl) {
     }
 
     virtual void setListener(const sp<IStreamListener> &listener) {
         Parcel data, reply;
         data.writeInterfaceToken(IStreamSource::getInterfaceDescriptor());
-        data.writeStrongBinder(listener->asBinder());
+        data.writeStrongBinder(IInterface::asBinder(listener));
         remote()->transact(SET_LISTENER, data, &reply);
     }
 
     virtual void setBuffers(const Vector<sp<IMemory> > &buffers) {
         Parcel data, reply;
         data.writeInterfaceToken(IStreamSource::getInterfaceDescriptor());
-        data.writeInt32(static_cast<int32_t>(buffers.size()));
+        data.writeInt64(static_cast<int64_t>(buffers.size()));
         for (size_t i = 0; i < buffers.size(); ++i) {
-            data.writeStrongBinder(buffers.itemAt(i)->asBinder());
+            data.writeStrongBinder(IInterface::asBinder(buffers.itemAt(i)));
         }
         remote()->transact(SET_BUFFERS, data, &reply);
     }
@@ -68,9 +64,17 @@ struct BpStreamSource : public BpInterface<IStreamSource> {
     virtual void onBufferAvailable(size_t index) {
         Parcel data, reply;
         data.writeInterfaceToken(IStreamSource::getInterfaceDescriptor());
-        data.writeInt32(static_cast<int32_t>(index));
+        data.writeInt64(static_cast<int64_t>(index));
         remote()->transact(
                 ON_BUFFER_AVAILABLE, data, &reply, IBinder::FLAG_ONEWAY);
+    }
+
+    virtual uint32_t flags() const {
+        Parcel data, reply;
+        data.writeInterfaceToken(IStreamSource::getInterfaceDescriptor());
+        remote()->transact(FLAGS, data, &reply);
+
+        return reply.readInt32();
     }
 };
 
@@ -90,13 +94,17 @@ status_t BnStreamSource::onTransact(
         case SET_BUFFERS:
         {
             CHECK_INTERFACE(IStreamSource, data, reply);
-            size_t n = static_cast<size_t>(data.readInt32());
+            size_t n = static_cast<size_t>(data.readInt64());
             Vector<sp<IMemory> > buffers;
             for (size_t i = 0; i < n; ++i) {
                 sp<IMemory> mem =
                     interface_cast<IMemory>(data.readStrongBinder());
 
-                buffers.push(mem);
+                if (mem != NULL) {
+                    buffers.push(mem);
+                } else if (data.dataAvail() == 0) {
+                    break;
+                }
             }
             setBuffers(buffers);
             break;
@@ -105,7 +113,14 @@ status_t BnStreamSource::onTransact(
         case ON_BUFFER_AVAILABLE:
         {
             CHECK_INTERFACE(IStreamSource, data, reply);
-            onBufferAvailable(static_cast<size_t>(data.readInt32()));
+            onBufferAvailable(static_cast<size_t>(data.readInt64()));
+            break;
+        }
+
+        case FLAGS:
+        {
+            CHECK_INTERFACE(IStreamSource, data, reply);
+            reply->writeInt32(this->flags());
             break;
         }
 
@@ -119,15 +134,15 @@ status_t BnStreamSource::onTransact(
 ////////////////////////////////////////////////////////////////////////////////
 
 struct BpStreamListener : public BpInterface<IStreamListener> {
-    BpStreamListener(const sp<IBinder> &impl)
+    explicit BpStreamListener(const sp<IBinder> &impl)
         : BpInterface<IStreamListener>(impl) {
     }
 
     virtual void queueBuffer(size_t index, size_t size) {
         Parcel data, reply;
         data.writeInterfaceToken(IStreamListener::getInterfaceDescriptor());
-        data.writeInt32(static_cast<int32_t>(index));
-        data.writeInt32(static_cast<int32_t>(size));
+        data.writeInt64(static_cast<int64_t>(index));
+        data.writeInt64(static_cast<int64_t>(size));
 
         remote()->transact(QUEUE_BUFFER, data, &reply, IBinder::FLAG_ONEWAY);
     }
@@ -158,8 +173,8 @@ status_t BnStreamListener::onTransact(
         case QUEUE_BUFFER:
         {
             CHECK_INTERFACE(IStreamListener, data, reply);
-            size_t index = static_cast<size_t>(data.readInt32());
-            size_t size = static_cast<size_t>(data.readInt32());
+            size_t index = static_cast<size_t>(data.readInt64());
+            size_t size = static_cast<size_t>(data.readInt64());
 
             queueBuffer(index, size);
             break;

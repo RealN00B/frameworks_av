@@ -31,28 +31,22 @@ sp<IMediaDeathNotifier::DeathNotifier> IMediaDeathNotifier::sDeathNotifier;
 SortedVector< wp<IMediaDeathNotifier> > IMediaDeathNotifier::sObitRecipients;
 
 // establish binder interface to MediaPlayerService
-/*static*/const sp<IMediaPlayerService>&
+/*static*/const sp<IMediaPlayerService>
 IMediaDeathNotifier::getMediaPlayerService()
 {
     ALOGV("getMediaPlayerService");
     Mutex::Autolock _l(sServiceLock);
     if (sMediaPlayerService == 0) {
         sp<IServiceManager> sm = defaultServiceManager();
-        sp<IBinder> binder;
-        do {
-            binder = sm->getService(String16("media.player"));
-            if (binder != 0) {
-                break;
-            }
-            ALOGW("Media player service not published, waiting...");
-            usleep(500000); // 0.5 s
-        } while (true);
-
+        sp<IBinder> binder = sm->waitForService(String16("media.player"));
+        if (binder == nullptr) {
+            return nullptr;
+        }
         if (sDeathNotifier == NULL) {
-        sDeathNotifier = new DeathNotifier();
-    }
-    binder->linkToDeath(sDeathNotifier);
-    sMediaPlayerService = interface_cast<IMediaPlayerService>(binder);
+            sDeathNotifier = new DeathNotifier();
+        }
+        binder->linkToDeath(sDeathNotifier);
+        sMediaPlayerService = interface_cast<IMediaPlayerService>(binder);
     }
     ALOGE_IF(sMediaPlayerService == 0, "no media player service!?");
     return sMediaPlayerService;
@@ -75,7 +69,7 @@ IMediaDeathNotifier::removeObitRecipient(const wp<IMediaDeathNotifier>& recipien
 }
 
 void
-IMediaDeathNotifier::DeathNotifier::binderDied(const wp<IBinder>& who) {
+IMediaDeathNotifier::DeathNotifier::binderDied(const wp<IBinder>& who __unused) {
     ALOGW("media server died");
 
     // Need to do this with the lock held
@@ -104,8 +98,8 @@ IMediaDeathNotifier::DeathNotifier::~DeathNotifier()
     Mutex::Autolock _l(sServiceLock);
     sObitRecipients.clear();
     if (sMediaPlayerService != 0) {
-        sMediaPlayerService->asBinder()->unlinkToDeath(this);
+        IInterface::asBinder(sMediaPlayerService)->unlinkToDeath(this);
     }
 }
 
-}; // namespace android
+} // namespace android

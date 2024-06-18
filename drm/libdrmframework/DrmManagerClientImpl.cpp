@@ -21,12 +21,14 @@
 #include <utils/String8.h>
 #include <utils/Vector.h>
 #include <binder/IServiceManager.h>
+#include <cutils/properties.h>
 
 #include "DrmManagerClientImpl.h"
+#include "NoOpDrmManagerClientImpl.h"
 
 using namespace android;
 
-#define INVALID_VALUE -1
+#define INVALID_VALUE (-1)
 
 Mutex DrmManagerClientImpl::sMutex;
 sp<IDrmManagerService> DrmManagerClientImpl::sDrmManagerService;
@@ -35,9 +37,12 @@ const String8 DrmManagerClientImpl::EMPTY_STRING("");
 
 DrmManagerClientImpl* DrmManagerClientImpl::create(
         int* pUniqueId, bool isNative) {
-    *pUniqueId = getDrmManagerService()->addUniqueId(isNative);
-
-    return new DrmManagerClientImpl();
+    sp<IDrmManagerService> service = getDrmManagerService();
+    if (service != NULL) {
+        *pUniqueId = getDrmManagerService()->addUniqueId(isNative);
+        return new DrmManagerClientImpl();
+    }
+    return new NoOpDrmManagerClientImpl();
 }
 
 void DrmManagerClientImpl::remove(int uniqueId) {
@@ -48,18 +53,10 @@ const sp<IDrmManagerService>& DrmManagerClientImpl::getDrmManagerService() {
     Mutex::Autolock lock(sMutex);
     if (NULL == sDrmManagerService.get()) {
         sp<IServiceManager> sm = defaultServiceManager();
-        sp<IBinder> binder;
-        do {
-            binder = sm->getService(String16("drm.drmManager"));
-            if (binder != 0) {
-                break;
-            }
-            ALOGW("DrmManagerService not published, waiting...");
-            struct timespec reqt;
-            reqt.tv_sec  = 0;
-            reqt.tv_nsec = 500000000; //0.5 sec
-            nanosleep(&reqt, NULL);
-        } while (true);
+        sp<IBinder> binder = sm->checkService(String16("drm.drmManager"));
+        if (binder == NULL) {
+            return sDrmManagerService;
+        }
         if (NULL == sDeathNotifier.get()) {
             sDeathNotifier = new DeathNotifier();
         }
@@ -84,15 +81,6 @@ status_t DrmManagerClientImpl::setOnInfoListener(
     mOnInfoListener = infoListener;
     return getDrmManagerService()->setDrmServiceListener(uniqueId,
             (NULL != infoListener.get()) ? this : NULL);
-}
-
-status_t DrmManagerClientImpl::installDrmEngine(
-        int uniqueId, const String8& drmEngineFile) {
-    status_t status = DRM_ERROR_UNKNOWN;
-    if (EMPTY_STRING != drmEngineFile) {
-        status = getDrmManagerService()->installDrmEngine(uniqueId, drmEngineFile);
-    }
-    return status;
 }
 
 DrmConstraints* DrmManagerClientImpl::getConstraints(
@@ -147,10 +135,10 @@ status_t DrmManagerClientImpl::saveRights(int uniqueId, const DrmRights& drmRigh
 }
 
 String8 DrmManagerClientImpl::getOriginalMimeType(
-        int uniqueId, const String8& path) {
+        int uniqueId, const String8& path, int fd) {
     String8 mimeType = EMPTY_STRING;
     if (EMPTY_STRING != path) {
-        mimeType = getDrmManagerService()->getOriginalMimeType(uniqueId, path);
+        mimeType = getDrmManagerService()->getOriginalMimeType(uniqueId, path, fd);
     }
     return mimeType;
 }
@@ -181,7 +169,7 @@ status_t DrmManagerClientImpl::consumeRights(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->consumeRights(
-                uniqueId, decryptHandle.get(), action, reserve);
+                uniqueId, decryptHandle, action, reserve);
     }
     return status;
 }
@@ -192,7 +180,7 @@ status_t DrmManagerClientImpl::setPlaybackStatus(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->setPlaybackStatus(
-                uniqueId, decryptHandle.get(), playbackStatus, position);
+                uniqueId, decryptHandle, playbackStatus, position);
     }
     return status;
 }
@@ -265,11 +253,16 @@ sp<DecryptHandle> DrmManagerClientImpl::openDecryptSession(
 sp<DecryptHandle> DrmManagerClientImpl::openDecryptSession(
         int uniqueId, const char* uri, const char* mime) {
 
-    DecryptHandle* handle = NULL;
+    sp<DecryptHandle> handle;
     if (NULL != uri) {
         handle = getDrmManagerService()->openDecryptSession(uniqueId, uri, mime);
     }
     return handle;
+}
+
+sp<DecryptHandle> DrmManagerClientImpl::openDecryptSession(
+            int uniqueId, const DrmBuffer& buf, const String8& mimeType) {
+    return getDrmManagerService()->openDecryptSession(uniqueId, buf, mimeType);
 }
 
 status_t DrmManagerClientImpl::closeDecryptSession(
@@ -277,7 +270,7 @@ status_t DrmManagerClientImpl::closeDecryptSession(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->closeDecryptSession(
-                uniqueId, decryptHandle.get());
+                uniqueId, decryptHandle);
     }
     return status;
 }
@@ -288,7 +281,7 @@ status_t DrmManagerClientImpl::initializeDecryptUnit(
     status_t status = DRM_ERROR_UNKNOWN;
     if ((NULL != decryptHandle.get()) && (NULL != headerInfo)) {
         status = getDrmManagerService()->initializeDecryptUnit(
-                uniqueId, decryptHandle.get(), decryptUnitId, headerInfo);
+                uniqueId, decryptHandle, decryptUnitId, headerInfo);
     }
     return status;
 }
@@ -301,7 +294,7 @@ status_t DrmManagerClientImpl::decrypt(
     if ((NULL != decryptHandle.get()) && (NULL != encBuffer)
         && (NULL != decBuffer) && (NULL != *decBuffer)) {
         status = getDrmManagerService()->decrypt(
-                uniqueId, decryptHandle.get(), decryptUnitId,
+                uniqueId, decryptHandle, decryptUnitId,
                 encBuffer, decBuffer, IV);
     }
     return status;
@@ -312,7 +305,7 @@ status_t DrmManagerClientImpl::finalizeDecryptUnit(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->finalizeDecryptUnit(
-                    uniqueId, decryptHandle.get(), decryptUnitId);
+                    uniqueId, decryptHandle, decryptUnitId);
     }
     return status;
 }
@@ -322,7 +315,7 @@ ssize_t DrmManagerClientImpl::pread(int uniqueId, sp<DecryptHandle> &decryptHand
     ssize_t retCode = INVALID_VALUE;
     if ((NULL != decryptHandle.get()) && (NULL != buffer) && (0 < numBytes)) {
         retCode = getDrmManagerService()->pread(
-                uniqueId, decryptHandle.get(), buffer, numBytes, offset);
+                uniqueId, decryptHandle, buffer, numBytes, offset);
     }
     return retCode;
 }
@@ -339,11 +332,12 @@ status_t DrmManagerClientImpl::notify(const DrmInfoEvent& event) {
 DrmManagerClientImpl::DeathNotifier::~DeathNotifier() {
     Mutex::Autolock lock(sMutex);
     if (NULL != sDrmManagerService.get()) {
-        sDrmManagerService->asBinder()->unlinkToDeath(this);
+        IInterface::asBinder(sDrmManagerService)->unlinkToDeath(this);
     }
 }
 
-void DrmManagerClientImpl::DeathNotifier::binderDied(const wp<IBinder>& who) {
+void DrmManagerClientImpl::DeathNotifier::binderDied(
+            const wp<IBinder>& /* who */) {
     Mutex::Autolock lock(sMutex);
     DrmManagerClientImpl::sDrmManagerService.clear();
     ALOGW("DrmManager server died!");

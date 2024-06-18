@@ -33,29 +33,30 @@
 /*  The timer currently does not suport changes in sampling rate while timing.          */
 /****************************************************************************************/
 
-
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
 /****************************************************************************************/
 /*  TYPE DEFINITIONS                                                                    */
 /****************************************************************************************/
 
-typedef struct
-{
-    LVM_INT32 Storage[6];
+typedef struct {
+    /*
+     * The memory area created using this structure is internally
+     * typecast to LVM_Timer_Instance_Private_t and used.
+     * The LVM_Timer_Instance_Private_t structure has 3 pointer type elements
+     * 2 elements of type LVM_INT32 and one element of type LVM_INT16.
+     * Inorder to cater both 32 and 64 bit builds, Storage array should
+     * have a minimum of 9 elements of type LVM_INT32.
+     */
+    LVM_INT32 Storage[9];
 
 } LVM_Timer_Instance_t;
 
-typedef struct
-{
-    LVM_INT32  SamplingRate;
-    LVM_INT16  TimeInMs;
-    LVM_INT32  CallBackParam;
-    void       *pCallBackParams;
-    void       *pCallbackInstance;
-    void       (*pCallBack)(void*,void*,LVM_INT32);
+typedef struct {
+    LVM_INT32 SamplingRate;
+    LVM_INT16 TimeInMs;
+    LVM_INT32 CallBackParam;
+    void* pCallBackParams;
+    void* pCallbackInstance;
+    void (*pCallBack)(void*, void*, LVM_INT32);
 
 } LVM_Timer_Params_t;
 
@@ -63,20 +64,12 @@ typedef struct
 /*  FUNCTION PROTOTYPES                                                                 */
 /****************************************************************************************/
 
-void LVM_Timer_Init (   LVM_Timer_Instance_t       *pInstance,
-                        LVM_Timer_Params_t         *pParams     );
+void LVM_Timer_Init(LVM_Timer_Instance_t* pInstance, LVM_Timer_Params_t* pParams);
 
-
-void LVM_Timer      (   LVM_Timer_Instance_t       *pInstance,
-                        LVM_INT16                       BlockSize );
-
+void LVM_Timer(LVM_Timer_Instance_t* pInstance, LVM_INT16 BlockSize);
 
 /****************************************************************************************/
 /*  END OF HEADER                                                                       */
 /****************************************************************************************/
 
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-
-#endif  /* __LVM_TIMER_H__ */
+#endif /* __LVM_TIMER_H__ */

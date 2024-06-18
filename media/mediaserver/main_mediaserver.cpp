@@ -21,25 +21,27 @@
 #include <binder/IPCThreadState.h>
 #include <binder/ProcessState.h>
 #include <binder/IServiceManager.h>
+#include <hidl/HidlTransportSupport.h>
 #include <utils/Log.h>
+#include "RegisterExtensions.h"
 
-// from LOCAL_C_INCLUDES
-#include "AudioFlinger.h"
-#include "CameraService.h"
-#include "MediaPlayerService.h"
-#include "AudioPolicyService.h"
+#include <MediaPlayerService.h>
+#include <ResourceManagerService.h>
 
 using namespace android;
 
-int main(int argc, char** argv)
+int main(int argc __unused, char **argv __unused)
 {
+    signal(SIGPIPE, SIG_IGN);
+
     sp<ProcessState> proc(ProcessState::self());
-    sp<IServiceManager> sm = defaultServiceManager();
+    sp<IServiceManager> sm(defaultServiceManager());
     ALOGI("ServiceManager: %p", sm.get());
-    AudioFlinger::instantiate();
     MediaPlayerService::instantiate();
-    CameraService::instantiate();
-    AudioPolicyService::instantiate();
+    ResourceManagerService::instantiate();
+    registerExtensions();
+    ::android::hardware::configureRpcThreadpool(16, false);
     ProcessState::self()->startThreadPool();
     IPCThreadState::self()->joinThreadPool();
+    ::android::hardware::joinRpcThreadpool();
 }

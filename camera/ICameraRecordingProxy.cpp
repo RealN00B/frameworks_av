@@ -16,10 +16,11 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ICameraRecordingProxy"
+#include <camera/CameraUtils.h>
 #include <camera/ICameraRecordingProxy.h>
-#include <camera/ICameraRecordingProxyListener.h>
 #include <binder/IMemory.h>
 #include <binder/Parcel.h>
+#include <media/hardware/HardwareAPI.h>
 #include <stdint.h>
 #include <utils/Log.h>
 
@@ -27,25 +28,23 @@ namespace android {
 
 enum {
     START_RECORDING = IBinder::FIRST_CALL_TRANSACTION,
-    STOP_RECORDING,
-    RELEASE_RECORDING_FRAME,
+    STOP_RECORDING
 };
 
 
 class BpCameraRecordingProxy: public BpInterface<ICameraRecordingProxy>
 {
 public:
-    BpCameraRecordingProxy(const sp<IBinder>& impl)
+    explicit BpCameraRecordingProxy(const sp<IBinder>& impl)
         : BpInterface<ICameraRecordingProxy>(impl)
     {
     }
 
-    status_t startRecording(const sp<ICameraRecordingProxyListener>& listener)
+    status_t startRecording()
     {
         ALOGV("startRecording");
         Parcel data, reply;
         data.writeInterfaceToken(ICameraRecordingProxy::getInterfaceDescriptor());
-        data.writeStrongBinder(listener->asBinder());
         remote()->transact(START_RECORDING, data, &reply);
         return reply.readInt32();
     }
@@ -56,15 +55,6 @@ public:
         Parcel data, reply;
         data.writeInterfaceToken(ICameraRecordingProxy::getInterfaceDescriptor());
         remote()->transact(STOP_RECORDING, data, &reply);
-    }
-
-    void releaseRecordingFrame(const sp<IMemory>& mem)
-    {
-        ALOGV("releaseRecordingFrame");
-        Parcel data, reply;
-        data.writeInterfaceToken(ICameraRecordingProxy::getInterfaceDescriptor());
-        data.writeStrongBinder(mem->asBinder());
-        remote()->transact(RELEASE_RECORDING_FRAME, data, &reply);
     }
 };
 
@@ -79,9 +69,7 @@ status_t BnCameraRecordingProxy::onTransact(
         case START_RECORDING: {
             ALOGV("START_RECORDING");
             CHECK_INTERFACE(ICameraRecordingProxy, data, reply);
-            sp<ICameraRecordingProxyListener> listener =
-                interface_cast<ICameraRecordingProxyListener>(data.readStrongBinder());
-            reply->writeInt32(startRecording(listener));
+            reply->writeInt32(startRecording());
             return NO_ERROR;
         } break;
         case STOP_RECORDING: {
@@ -90,14 +78,6 @@ status_t BnCameraRecordingProxy::onTransact(
             stopRecording();
             return NO_ERROR;
         } break;
-        case RELEASE_RECORDING_FRAME: {
-            ALOGV("RELEASE_RECORDING_FRAME");
-            CHECK_INTERFACE(ICameraRecordingProxy, data, reply);
-            sp<IMemory> mem = interface_cast<IMemory>(data.readStrongBinder());
-            releaseRecordingFrame(mem);
-            return NO_ERROR;
-        } break;
-
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }
@@ -106,4 +86,3 @@ status_t BnCameraRecordingProxy::onTransact(
 // ----------------------------------------------------------------------------
 
 }; // namespace android
-

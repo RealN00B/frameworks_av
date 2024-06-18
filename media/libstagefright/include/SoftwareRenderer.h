@@ -19,22 +19,28 @@
 #define SOFTWARE_RENDERER_H_
 
 #include <media/stagefright/ColorConverter.h>
+#include <media/stagefright/FrameRenderTracker.h>
 #include <utils/RefBase.h>
 #include <system/window.h>
+#include <media/hardware/VideoAPI.h>
+
+#include <list>
 
 namespace android {
 
-struct MetaData;
+struct AMessage;
 
 class SoftwareRenderer {
 public:
-    SoftwareRenderer(
-            const sp<ANativeWindow> &nativeWindow, const sp<MetaData> &meta);
+    explicit SoftwareRenderer(
+            const sp<ANativeWindow> &nativeWindow, int32_t rotation = 0);
 
     ~SoftwareRenderer();
 
-    void render(
-            const void *data, size_t size, void *platformPrivate);
+    std::list<FrameRenderTracker::Info> render(
+            const void *data, size_t size, int64_t mediaTimeUs, nsecs_t renderTimeNs,
+            size_t numOutputBuffers, const sp<AMessage> &format);
+    void clearTracker();
 
 private:
     enum YUVMode {
@@ -45,9 +51,16 @@ private:
     ColorConverter *mConverter;
     YUVMode mYUVMode;
     sp<ANativeWindow> mNativeWindow;
-    int32_t mWidth, mHeight;
+    int32_t mWidth, mHeight, mStride;
     int32_t mCropLeft, mCropTop, mCropRight, mCropBottom;
     int32_t mCropWidth, mCropHeight;
+    int32_t mRotationDegrees;
+    android_dataspace mDataSpace;
+    HDRStaticInfo mHDRStaticInfo;
+    FrameRenderTracker mRenderTracker;
+
+    void resetFormatIfChanged(
+            const sp<AMessage> &format, size_t numOutputBuffers);
 
     SoftwareRenderer(const SoftwareRenderer &);
     SoftwareRenderer &operator=(const SoftwareRenderer &);

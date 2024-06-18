@@ -23,6 +23,8 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/MediaDefs.h>
 
+#define MAX_CHANNEL_COUNT            6  /* maximum number of audio channels that can be decoded */
+
 namespace android {
 
 template<class T>
@@ -41,8 +43,9 @@ SoftG711::SoftG711(
         OMX_COMPONENTTYPE **component)
     : SimpleSoftOMXComponent(name, callbacks, appData, component),
       mIsMLaw(true),
+      mSignalledError(false),
       mNumChannels(1),
-      mSignalledError(false) {
+      mSamplingRate(8000) {
     if (!strcmp(name, "OMX.google.g711.alaw.decoder")) {
         mIsMLaw = false;
     } else {
@@ -104,10 +107,38 @@ void SoftG711::initPorts() {
 OMX_ERRORTYPE SoftG711::internalGetParameter(
         OMX_INDEXTYPE index, OMX_PTR params) {
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->nIndex > 0) {
+                return OMX_ErrorNoMore;
+            }
+
+            formatParams->eEncoding =
+                (formatParams->nPortIndex == 0)
+                    ? OMX_AUDIO_CodingG711 : OMX_AUDIO_CodingPCM;
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (pcmParams->nPortIndex > 1) {
                 return OMX_ErrorUndefined;
@@ -117,12 +148,19 @@ OMX_ERRORTYPE SoftG711::internalGetParameter(
             pcmParams->eEndian = OMX_EndianBig;
             pcmParams->bInterleaved = OMX_TRUE;
             pcmParams->nBitPerSample = 16;
-            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            if (pcmParams->nPortIndex == 0) {
+                // input port
+                pcmParams->ePCMMode = mIsMLaw ? OMX_AUDIO_PCMModeMULaw
+                                              : OMX_AUDIO_PCMModeALaw;
+            } else {
+                // output port
+                pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            }
             pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
             pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
 
             pcmParams->nChannels = mNumChannels;
-            pcmParams->nSamplingRate = 8000;
+            pcmParams->nSamplingRate = mSamplingRate;
 
             return OMX_ErrorNone;
         }
@@ -140,16 +178,45 @@ OMX_ERRORTYPE SoftG711::internalSetParameter(
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
 
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (pcmParams->nPortIndex != 0 && pcmParams->nPortIndex != 1) {
                 return OMX_ErrorUndefined;
             }
 
-            if (pcmParams->nChannels < 1 || pcmParams->nChannels > 2) {
+            if (pcmParams->nChannels < 1 || pcmParams->nChannels > MAX_CHANNEL_COUNT) {
                 return OMX_ErrorUndefined;
             }
 
             if(pcmParams->nPortIndex == 0) {
                 mNumChannels = pcmParams->nChannels;
+            }
+
+            mSamplingRate = pcmParams->nSamplingRate;
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioPortFormat:
+        {
+            const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if ((formatParams->nPortIndex == 0
+                        && formatParams->eEncoding != OMX_AUDIO_CodingG711)
+                || (formatParams->nPortIndex == 1
+                        && formatParams->eEncoding != OMX_AUDIO_CodingPCM)) {
+                return OMX_ErrorUndefined;
             }
 
             return OMX_ErrorNone;
@@ -159,6 +226,10 @@ OMX_ERRORTYPE SoftG711::internalSetParameter(
         {
             const OMX_PARAM_COMPONENTROLETYPE *roleParams =
                 (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (mIsMLaw) {
                 if (strncmp((const char *)roleParams->cRole,
@@ -182,7 +253,7 @@ OMX_ERRORTYPE SoftG711::internalSetParameter(
     }
 }
 
-void SoftG711::onQueueFilled(OMX_U32 portIndex) {
+void SoftG711::onQueueFilled(OMX_U32 /* portIndex */) {
     if (mSignalledError) {
         return;
     }
@@ -197,7 +268,7 @@ void SoftG711::onQueueFilled(OMX_U32 portIndex) {
         BufferInfo *outInfo = *outQueue.begin();
         OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
 
-        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+        if ((inHeader->nFlags & OMX_BUFFERFLAG_EOS) && inHeader->nFilledLen == 0) {
             inQueue.erase(inQueue.begin());
             inInfo->mOwnedByUs = false;
             notifyEmptyBufferDone(inHeader);
@@ -212,10 +283,19 @@ void SoftG711::onQueueFilled(OMX_U32 portIndex) {
         }
 
         if (inHeader->nFilledLen > kMaxNumSamplesPerFrame) {
-            ALOGE("input buffer too large (%ld).", inHeader->nFilledLen);
+            ALOGE("input buffer too large (%d).", inHeader->nFilledLen);
 
             notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
             mSignalledError = true;
+        }
+
+        if (inHeader->nFilledLen * sizeof(int16_t) > outHeader->nAllocLen) {
+            ALOGE("output buffer too small (%d).", outHeader->nAllocLen);
+            android_errorWriteLog(0x534e4554, "27793163");
+
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+            return;
         }
 
         const uint8_t *inputptr = inHeader->pBuffer + inHeader->nOffset;
@@ -235,11 +315,15 @@ void SoftG711::onQueueFilled(OMX_U32 portIndex) {
         outHeader->nFilledLen = inHeader->nFilledLen * sizeof(int16_t);
         outHeader->nFlags = 0;
 
-        inInfo->mOwnedByUs = false;
-        inQueue.erase(inQueue.begin());
-        inInfo = NULL;
-        notifyEmptyBufferDone(inHeader);
-        inHeader = NULL;
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inHeader->nFilledLen = 0;
+        } else {
+            inInfo->mOwnedByUs = false;
+            inQueue.erase(inQueue.begin());
+            inInfo = NULL;
+            notifyEmptyBufferDone(inHeader);
+            inHeader = NULL;
+        }
 
         outInfo->mOwnedByUs = false;
         outQueue.erase(outQueue.begin());
@@ -252,7 +336,8 @@ void SoftG711::onQueueFilled(OMX_U32 portIndex) {
 // static
 void SoftG711::DecodeALaw(
         int16_t *out, const uint8_t *in, size_t inSize) {
-    while (inSize-- > 0) {
+    while (inSize > 0) {
+        inSize--;
         int32_t x = *in++;
 
         int32_t ix = x ^ 0x55;
@@ -278,7 +363,8 @@ void SoftG711::DecodeALaw(
 // static
 void SoftG711::DecodeMLaw(
         int16_t *out, const uint8_t *in, size_t inSize) {
-    while (inSize-- > 0) {
+    while (inSize > 0) {
+        inSize--;
         int32_t x = *in++;
 
         int32_t mantissa = ~x;
@@ -288,7 +374,7 @@ void SoftG711::DecodeMLaw(
 
         int32_t step = 4 << segment;
 
-        int32_t abs = (0x80l << exponent) + step * mantissa + step / 2 - 4 * 33;
+        int32_t abs = (0x80L << exponent) + step * mantissa + step / 2 - 4 * 33;
 
         *out++ = (x < 0x80) ? -abs : abs;
     }
@@ -296,6 +382,7 @@ void SoftG711::DecodeMLaw(
 
 }  // namespace android
 
+__attribute__((cfi_canonical_jump_table))
 android::SoftOMXComponent *createSoftOMXComponent(
         const char *name, const OMX_CALLBACKTYPE *callbacks,
         OMX_PTR appData, OMX_COMPONENTTYPE **component) {

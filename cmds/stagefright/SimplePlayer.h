@@ -22,17 +22,18 @@ namespace android {
 
 struct ABuffer;
 struct ALooper;
-struct AudioTrack;
-struct ISurfaceTexture;
+class AudioTrack;
+class IGraphicBufferProducer;
 struct MediaCodec;
-struct NativeWindowWrapper;
+class MediaCodecBuffer;
 struct NuMediaExtractor;
+class Surface;
 
 struct SimplePlayer : public AHandler {
     SimplePlayer();
 
     status_t setDataSource(const char *path);
-    status_t setSurface(const sp<ISurfaceTexture> &surfaceTexture);
+    status_t setSurface(const sp<IGraphicBufferProducer> &bufferProducer);
     status_t prepare();
     status_t start();
     status_t stop();
@@ -73,7 +74,7 @@ private:
     {
         sp<MediaCodec> mCodec;
         Vector<sp<ABuffer> > mCSD;
-        Vector<sp<ABuffer> > mBuffers[2];
+        Vector<sp<MediaCodecBuffer> > mBuffers[2];
 
         List<size_t> mAvailInputBufferIndices;
         List<BufferInfo> mAvailOutputBufferInfos;
@@ -84,7 +85,7 @@ private:
 
     State mState;
     AString mPath;
-    sp<NativeWindowWrapper> mNativeWindow;
+    sp<Surface> mSurface;
 
     sp<NuMediaExtractor> mExtractor;
     sp<ALooper> mCodecLooper;
@@ -101,7 +102,7 @@ private:
     status_t onOutputFormatChanged(size_t trackIndex, CodecState *state);
 
     void renderAudio(
-            CodecState *state, BufferInfo *info, const sp<ABuffer> &buffer);
+            CodecState *state, BufferInfo *info, const sp<MediaCodecBuffer> &buffer);
 
     DISALLOW_EVIL_CONSTRUCTORS(SimplePlayer);
 };

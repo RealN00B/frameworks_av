@@ -17,15 +17,19 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "IMediaRecorder"
+
+#include <inttypes.h>
+#include <unistd.h>
+
 #include <utils/Log.h>
 #include <binder/Parcel.h>
-#include <camera/ICamera.h>
+#include <camera/android/hardware/ICamera.h>
+#include <camera/ICameraRecordingProxy.h>
 #include <media/IMediaRecorderClient.h>
 #include <media/IMediaRecorder.h>
 #include <gui/Surface.h>
-#include <gui/ISurfaceTexture.h>
-#include <unistd.h>
-
+#include <gui/IGraphicBufferProducer.h>
+#include <media/stagefright/PersistentSurface.h>
 
 namespace android {
 
@@ -33,6 +37,7 @@ enum {
     RELEASE = IBinder::FIRST_CALL_TRANSACTION,
     INIT,
     CLOSE,
+    SET_INPUT_SURFACE,
     QUERY_SURFACE_MEDIASOURCE,
     RESET,
     STOP,
@@ -44,36 +49,60 @@ enum {
     SET_OUTPUT_FORMAT,
     SET_VIDEO_ENCODER,
     SET_AUDIO_ENCODER,
-    SET_OUTPUT_FILE_PATH,
     SET_OUTPUT_FILE_FD,
+    SET_NEXT_OUTPUT_FILE_FD,
     SET_VIDEO_SIZE,
     SET_VIDEO_FRAMERATE,
     SET_PARAMETERS,
     SET_PREVIEW_SURFACE,
     SET_CAMERA,
-    SET_LISTENER
+    SET_LISTENER,
+    SET_CLIENT_NAME,
+    PAUSE,
+    RESUME,
+    GET_METRICS,
+    SET_INPUT_DEVICE,
+    GET_ROUTED_DEVICE_ID,
+    ENABLE_AUDIO_DEVICE_CALLBACK,
+    GET_ACTIVE_MICROPHONES,
+    GET_PORT_ID,
+    GET_RTP_DATA_USAGE,
+    SET_PREFERRED_MICROPHONE_DIRECTION,
+    SET_PREFERRED_MICROPHONE_FIELD_DIMENSION,
+    SET_PRIVACY_SENSITIVE,
+    GET_PRIVACY_SENSITIVE
 };
 
 class BpMediaRecorder: public BpInterface<IMediaRecorder>
 {
 public:
-    BpMediaRecorder(const sp<IBinder>& impl)
+    explicit BpMediaRecorder(const sp<IBinder>& impl)
     : BpInterface<IMediaRecorder>(impl)
     {
     }
 
-    status_t setCamera(const sp<ICamera>& camera, const sp<ICameraRecordingProxy>& proxy)
+    status_t setCamera(const sp<hardware::ICamera>& camera, const sp<ICameraRecordingProxy>& proxy)
     {
         ALOGV("setCamera(%p,%p)", camera.get(), proxy.get());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
-        data.writeStrongBinder(camera->asBinder());
-        data.writeStrongBinder(proxy->asBinder());
+        data.writeStrongBinder(IInterface::asBinder(camera));
+        data.writeStrongBinder(IInterface::asBinder(proxy));
         remote()->transact(SET_CAMERA, data, &reply);
         return reply.readInt32();
     }
 
-    sp<ISurfaceTexture> querySurfaceMediaSource()
+    status_t setInputSurface(const sp<PersistentSurface>& surface)
+    {
+        ALOGV("setInputSurface(%p)", surface.get());
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        surface->writeToParcel(&data);
+        remote()->transact(SET_INPUT_SURFACE, data, &reply);
+        return reply.readInt32();
+    }
+
+    sp<IGraphicBufferProducer> querySurfaceMediaSource()
     {
         ALOGV("Query SurfaceMediaSource");
         Parcel data, reply;
@@ -83,15 +112,15 @@ public:
         if (returnedNull) {
             return NULL;
         }
-        return interface_cast<ISurfaceTexture>(reply.readStrongBinder());
+        return interface_cast<IGraphicBufferProducer>(reply.readStrongBinder());
     }
 
-    status_t setPreviewSurface(const sp<Surface>& surface)
+    status_t setPreviewSurface(const sp<IGraphicBufferProducer>& surface)
     {
         ALOGV("setPreviewSurface(%p)", surface.get());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
-        Surface::writeToParcel(surface, &data);
+        data.writeStrongBinder(IInterface::asBinder(surface));
         remote()->transact(SET_PREVIEW_SURFACE, data, &reply);
         return reply.readInt32();
     }
@@ -125,6 +154,36 @@ public:
         return reply.readInt32();
     }
 
+    status_t setPrivacySensitive(bool privacySensitive)
+    {
+        ALOGV("%s(%s)", __func__, privacySensitive ? "true" : "false");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeInt32(privacySensitive ? 1 : 0);
+        status_t status = remote()->transact(SET_PRIVACY_SENSITIVE, data, &reply);
+        if (status != NO_ERROR) {
+            return status;
+        }
+        return reply.readInt32();
+    }
+
+    status_t isPrivacySensitive(bool *privacySensitive) const
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        *privacySensitive = false;
+        status_t status = remote()->transact(GET_PRIVACY_SENSITIVE, data, &reply);
+        if (status != NO_ERROR) {
+            return status;
+        }
+        status = reply.readInt32();
+        if (status == NO_ERROR) {
+            *privacySensitive = reply.readInt32() == 1;
+        }
+        ALOGV("%s status %d enabled: %s", __func__, status, *privacySensitive ? "true" : "false");
+        return status;
+    }
+
     status_t setOutputFormat(int of)
     {
         ALOGV("setOutputFormat(%d)", of);
@@ -155,24 +214,21 @@ public:
         return reply.readInt32();
     }
 
-    status_t setOutputFile(const char* path)
-    {
-        ALOGV("setOutputFile(%s)", path);
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
-        data.writeCString(path);
-        remote()->transact(SET_OUTPUT_FILE_PATH, data, &reply);
-        return reply.readInt32();
-    }
-
-    status_t setOutputFile(int fd, int64_t offset, int64_t length) {
-        ALOGV("setOutputFile(%d, %lld, %lld)", fd, offset, length);
+    status_t setOutputFile(int fd) {
+        ALOGV("setOutputFile(%d)", fd);
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         data.writeFileDescriptor(fd);
-        data.writeInt64(offset);
-        data.writeInt64(length);
         remote()->transact(SET_OUTPUT_FILE_FD, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t setNextOutputFile(int fd) {
+        ALOGV("setNextOutputFile(%d)", fd);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeFileDescriptor(fd);
+        remote()->transact(SET_NEXT_OUTPUT_FILE_FD, data, &reply);
         return reply.readInt32();
     }
 
@@ -199,7 +255,7 @@ public:
 
     status_t setParameters(const String8& params)
     {
-        ALOGV("setParameter(%s)", params.string());
+        ALOGV("setParameter(%s)", params.c_str());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         data.writeString8(params);
@@ -212,8 +268,18 @@ public:
         ALOGV("setListener(%p)", listener.get());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
-        data.writeStrongBinder(listener->asBinder());
+        data.writeStrongBinder(IInterface::asBinder(listener));
         remote()->transact(SET_LISTENER, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t setClientName(const String16& clientName)
+    {
+        ALOGV("setClientName(%s)", String8(clientName).c_str());
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeString16(clientName);
+        remote()->transact(SET_CLIENT_NAME, data, &reply);
         return reply.readInt32();
     }
 
@@ -234,6 +300,18 @@ public:
         remote()->transact(GET_MAX_AMPLITUDE, data, &reply);
         *max = reply.readInt32();
         return reply.readInt32();
+    }
+
+    status_t getMetrics(Parcel* reply)
+    {
+        ALOGV("getMetrics");
+        Parcel data;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        status_t ret = remote()->transact(GET_METRICS, data, reply);
+        if (ret == NO_ERROR) {
+            return OK;
+        }
+        return UNKNOWN_ERROR;
     }
 
     status_t start()
@@ -263,6 +341,24 @@ public:
         return reply.readInt32();
     }
 
+    status_t pause()
+    {
+        ALOGV("pause");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        remote()->transact(PAUSE, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t resume()
+    {
+        ALOGV("resume");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        remote()->transact(RESUME, data, &reply);
+        return reply.readInt32();
+    }
+
     status_t close()
     {
         ALOGV("close");
@@ -280,6 +376,124 @@ public:
         remote()->transact(RELEASE, data, &reply);
         return reply.readInt32();
     }
+
+    status_t setInputDevice(audio_port_handle_t deviceId)
+    {
+        ALOGV("setInputDevice");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeInt32(deviceId);
+
+        status_t status = remote()->transact(SET_INPUT_DEVICE, data, &reply);
+        if (status != OK) {
+            ALOGE("setInputDevice binder call failed: %d", status);
+            return status;
+        }
+        return reply.readInt32();;
+    }
+
+    audio_port_handle_t getRoutedDeviceId(audio_port_handle_t *deviceId)
+    {
+        ALOGV("getRoutedDeviceId");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+
+        status_t status = remote()->transact(GET_ROUTED_DEVICE_ID, data, &reply);
+        if (status != OK) {
+            ALOGE("getRoutedDeviceid binder call failed: %d", status);
+            *deviceId = AUDIO_PORT_HANDLE_NONE;
+            return status;
+        }
+
+        status = reply.readInt32();
+        if (status != NO_ERROR) {
+            *deviceId = AUDIO_PORT_HANDLE_NONE;
+        } else {
+            *deviceId = reply.readInt32();
+        }
+        return status;
+    }
+
+    status_t enableAudioDeviceCallback(bool enabled)
+    {
+        ALOGV("enableAudioDeviceCallback");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeBool(enabled);
+        status_t status = remote()->transact(ENABLE_AUDIO_DEVICE_CALLBACK, data, &reply);
+        if (status != OK) {
+            ALOGE("enableAudioDeviceCallback binder call failed: %d, %d", enabled, status);
+            return status;
+        }
+        return reply.readInt32();
+    }
+
+    status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones)
+    {
+        ALOGV("getActiveMicrophones");
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        status_t status = remote()->transact(GET_ACTIVE_MICROPHONES, data, &reply);
+        if (status != OK
+                || (status = (status_t)reply.readInt32()) != NO_ERROR) {
+            return status;
+        }
+        status = reply.readParcelableVector(activeMicrophones);
+        return status;
+    }
+
+    status_t setPreferredMicrophoneDirection(audio_microphone_direction_t direction) {
+        ALOGV("setPreferredMicrophoneDirection(%d)", direction);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeInt32(direction);
+        status_t status = remote()->transact(SET_PREFERRED_MICROPHONE_DIRECTION, data, &reply);
+        return status == NO_ERROR ? (status_t)reply.readInt32() : status;
+    }
+
+    status_t setPreferredMicrophoneFieldDimension(float zoom) {
+        ALOGV("setPreferredMicrophoneFieldDimension(%f)", zoom);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        data.writeFloat(zoom);
+        status_t status = remote()->transact(SET_PREFERRED_MICROPHONE_FIELD_DIMENSION, data, &reply);
+        return status == NO_ERROR ? (status_t)reply.readInt32() : status;
+    }
+
+    status_t getPortId(audio_port_handle_t *portId)
+    {
+        ALOGV("getPortId");
+        if (portId == nullptr) {
+            return BAD_VALUE;
+        }
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        status_t status = remote()->transact(GET_PORT_ID, data, &reply);
+        if (status != OK
+                || (status = (status_t)reply.readInt32()) != NO_ERROR) {
+            *portId = AUDIO_PORT_HANDLE_NONE;
+            return status;
+        }
+        *portId = (audio_port_handle_t)reply.readInt32();
+        return NO_ERROR;
+    }
+
+    status_t getRtpDataUsage(uint64_t *bytes)
+    {
+        ALOGV("getRtpDataUsage");
+        if (bytes == nullptr) {
+            return BAD_VALUE;
+        }
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
+        status_t status = remote()->transact(GET_RTP_DATA_USAGE, data, &reply);
+        if (status != OK
+                || (status = (status_t)reply.readInt32()) != NO_ERROR) {
+            *bytes = 0;
+            return status;
+        }
+        return reply.readUint64(bytes);
+    }
 };
 
 IMPLEMENT_META_INTERFACE(MediaRecorder, "android.media.IMediaRecorder");
@@ -287,7 +501,8 @@ IMPLEMENT_META_INTERFACE(MediaRecorder, "android.media.IMediaRecorder");
 // ----------------------------------------------------------------------
 
 status_t BnMediaRecorder::onTransact(
-                                     uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
+                                     uint32_t code, const Parcel& data, Parcel* reply,
+                                     uint32_t flags)
 {
     switch (code) {
         case RELEASE: {
@@ -326,6 +541,18 @@ status_t BnMediaRecorder::onTransact(
             reply->writeInt32(start());
             return NO_ERROR;
         } break;
+        case PAUSE: {
+            ALOGV("PAUSE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            reply->writeInt32(pause());
+            return NO_ERROR;
+        } break;
+        case RESUME: {
+            ALOGV("RESUME");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            reply->writeInt32(resume());
+            return NO_ERROR;
+        } break;
         case PREPARE: {
             ALOGV("PREPARE");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
@@ -341,6 +568,11 @@ status_t BnMediaRecorder::onTransact(
             reply->writeInt32(ret);
             return NO_ERROR;
         } break;
+        case GET_METRICS: {
+            ALOGV("GET_METRICS");
+            status_t ret = getMetrics(reply);
+            return ret;
+        } break;
         case SET_VIDEO_SOURCE: {
             ALOGV("SET_VIDEO_SOURCE");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
@@ -353,6 +585,24 @@ status_t BnMediaRecorder::onTransact(
             CHECK_INTERFACE(IMediaRecorder, data, reply);
             int as = data.readInt32();
             reply->writeInt32(setAudioSource(as));
+            return NO_ERROR;
+        } break;
+        case SET_PRIVACY_SENSITIVE: {
+            ALOGV("SET_PRIVACY_SENSITIVE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            bool privacySensitive = data.readInt32() == 1;
+            reply->writeInt32(setPrivacySensitive(privacySensitive));
+            return NO_ERROR;
+        } break;
+        case GET_PRIVACY_SENSITIVE: {
+            ALOGV("GET_PRIVACY_SENSITIVE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            bool privacySensitive = false;
+            status_t status = isPrivacySensitive(&privacySensitive);
+            reply->writeInt32(status);
+            if (status == NO_ERROR) {
+                reply->writeInt32(privacySensitive ? 1 : 0);
+            }
             return NO_ERROR;
         } break;
         case SET_OUTPUT_FORMAT: {
@@ -377,20 +627,19 @@ status_t BnMediaRecorder::onTransact(
             return NO_ERROR;
 
         } break;
-        case SET_OUTPUT_FILE_PATH: {
-            ALOGV("SET_OUTPUT_FILE_PATH");
-            CHECK_INTERFACE(IMediaRecorder, data, reply);
-            const char* path = data.readCString();
-            reply->writeInt32(setOutputFile(path));
-            return NO_ERROR;
-        } break;
         case SET_OUTPUT_FILE_FD: {
             ALOGV("SET_OUTPUT_FILE_FD");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
             int fd = dup(data.readFileDescriptor());
-            int64_t offset = data.readInt64();
-            int64_t length = data.readInt64();
-            reply->writeInt32(setOutputFile(fd, offset, length));
+            reply->writeInt32(setOutputFile(fd));
+            ::close(fd);
+            return NO_ERROR;
+        } break;
+        case SET_NEXT_OUTPUT_FILE_FD: {
+            ALOGV("SET_NEXT_OUTPUT_FILE_FD");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            int fd = dup(data.readFileDescriptor());
+            reply->writeInt32(setNextOutputFile(fd));
             ::close(fd);
             return NO_ERROR;
         } break;
@@ -423,20 +672,36 @@ status_t BnMediaRecorder::onTransact(
             reply->writeInt32(setListener(listener));
             return NO_ERROR;
         } break;
+        case SET_CLIENT_NAME: {
+            ALOGV("SET_CLIENT_NAME");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            reply->writeInt32(setClientName(data.readString16()));
+            return NO_ERROR;
+        }
         case SET_PREVIEW_SURFACE: {
             ALOGV("SET_PREVIEW_SURFACE");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
-            sp<Surface> surface = Surface::readFromParcel(data);
+            sp<IGraphicBufferProducer> surface = interface_cast<IGraphicBufferProducer>(
+                    data.readStrongBinder());
             reply->writeInt32(setPreviewSurface(surface));
             return NO_ERROR;
         } break;
         case SET_CAMERA: {
             ALOGV("SET_CAMERA");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
-            sp<ICamera> camera = interface_cast<ICamera>(data.readStrongBinder());
+            sp<hardware::ICamera> camera =
+                    interface_cast<hardware::ICamera>(data.readStrongBinder());
             sp<ICameraRecordingProxy> proxy =
-                interface_cast<ICameraRecordingProxy>(data.readStrongBinder());
+                    interface_cast<ICameraRecordingProxy>(data.readStrongBinder());
             reply->writeInt32(setCamera(camera, proxy));
+            return NO_ERROR;
+        } break;
+        case SET_INPUT_SURFACE: {
+            ALOGV("SET_INPUT_SURFACE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            sp<PersistentSurface> surface = new PersistentSurface();
+            surface->readFromParcel(&data);
+            reply->writeInt32(setInputSurface(surface));
             return NO_ERROR;
         } break;
         case QUERY_SURFACE_MEDIASOURCE: {
@@ -444,15 +709,102 @@ status_t BnMediaRecorder::onTransact(
             CHECK_INTERFACE(IMediaRecorder, data, reply);
             // call the mediaserver side to create
             // a surfacemediasource
-            sp<ISurfaceTexture> surfaceMediaSource = querySurfaceMediaSource();
+            sp<IGraphicBufferProducer> surfaceMediaSource = querySurfaceMediaSource();
             // The mediaserver might have failed to create a source
             int returnedNull= (surfaceMediaSource == NULL) ? 1 : 0 ;
             reply->writeInt32(returnedNull);
             if (!returnedNull) {
-                reply->writeStrongBinder(surfaceMediaSource->asBinder());
+                reply->writeStrongBinder(IInterface::asBinder(surfaceMediaSource));
             }
             return NO_ERROR;
         } break;
+        case SET_INPUT_DEVICE: {
+            ALOGV("SET_INPUT_DEVICE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            audio_port_handle_t deviceId;
+            status_t status = data.readInt32(&deviceId);
+            if (status == NO_ERROR) {
+                reply->writeInt32(setInputDevice(deviceId));
+            } else {
+                reply->writeInt32(BAD_VALUE);
+            }
+            return NO_ERROR;
+        } break;
+        case GET_ROUTED_DEVICE_ID: {
+            ALOGV("GET_ROUTED_DEVICE_ID");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            audio_port_handle_t deviceId;
+            status_t status = getRoutedDeviceId(&deviceId);
+            reply->writeInt32(status);
+            if (status == NO_ERROR) {
+                reply->writeInt32(deviceId);
+            }
+            return NO_ERROR;
+        } break;
+        case ENABLE_AUDIO_DEVICE_CALLBACK: {
+            ALOGV("ENABLE_AUDIO_DEVICE_CALLBACK");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            bool enabled;
+            status_t status = data.readBool(&enabled);
+            if (status == NO_ERROR) {
+                reply->writeInt32(enableAudioDeviceCallback(enabled));
+            } else {
+                reply->writeInt32(BAD_VALUE);
+            }
+            return NO_ERROR;
+        } break;
+        case GET_ACTIVE_MICROPHONES: {
+            ALOGV("GET_ACTIVE_MICROPHONES");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            std::vector<media::MicrophoneInfoFw> activeMicrophones;
+            status_t status = getActiveMicrophones(&activeMicrophones);
+            reply->writeInt32(status);
+            if (status != NO_ERROR) {
+                return NO_ERROR;
+            }
+            reply->writeParcelableVector(activeMicrophones);
+            return NO_ERROR;
+
+        }
+        case GET_PORT_ID: {
+            ALOGV("GET_PORT_ID");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            audio_port_handle_t portId;
+            status_t status = getPortId(&portId);
+            reply->writeInt32(status);
+            if (status == NO_ERROR) {
+                reply->writeInt32(portId);
+            }
+            return NO_ERROR;
+        }
+        case GET_RTP_DATA_USAGE: {
+            ALOGV("GET_RTP_DATA_USAGE");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            uint64_t bytes;
+            status_t status = getRtpDataUsage(&bytes);
+            reply->writeInt32(status);
+            if (status == NO_ERROR) {
+                reply->writeUint64(bytes);
+            }
+            return NO_ERROR;
+        }
+        case SET_PREFERRED_MICROPHONE_DIRECTION: {
+            ALOGV("SET_PREFERRED_MICROPHONE_DIRECTION");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            int direction = data.readInt32();
+            status_t status = setPreferredMicrophoneDirection(
+                    static_cast<audio_microphone_direction_t>(direction));
+            reply->writeInt32(status);
+            return NO_ERROR;
+        }
+        case SET_PREFERRED_MICROPHONE_FIELD_DIMENSION: {
+            ALOGV("SET_MICROPHONE_FIELD_DIMENSION");
+            CHECK_INTERFACE(IMediaRecorder, data, reply);
+            float zoom = data.readFloat();
+            status_t status = setPreferredMicrophoneFieldDimension(zoom);
+            reply->writeInt32(status);
+            return NO_ERROR;
+        }
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }
@@ -460,4 +812,4 @@ status_t BnMediaRecorder::onTransact(
 
 // ----------------------------------------------------------------------------
 
-}; // namespace android
+} // namespace android

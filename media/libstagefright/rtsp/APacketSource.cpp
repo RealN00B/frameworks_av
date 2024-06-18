@@ -18,12 +18,9 @@
 #define LOG_TAG "APacketSource"
 #include <utils/Log.h>
 
-#include "APacketSource.h"
-
-#include "ARawAudioAssembler.h"
-#include "ASessionDescription.h"
-
-#include "avc_utils.h"
+#include <media/stagefright/rtsp/APacketSource.h>
+#include <media/stagefright/rtsp/ARawAudioAssembler.h>
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <ctype.h>
 
@@ -32,6 +29,7 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/AString.h>
+#include <media/stagefright/foundation/avc_utils.h>
 #include <media/stagefright/foundation/base64.h>
 #include <media/stagefright/foundation/hexdump.h>
 #include <media/stagefright/MediaDefs.h>
@@ -110,13 +108,13 @@ static sp<ABuffer> MakeAVCCodecSpecificData(
     *height = 0;
 
     AString val;
-    if (!GetAttribute(params, "profile-level-id", &val)) {
-        return NULL;
+    sp<ABuffer> profileLevelID = NULL;
+    if (GetAttribute(params, "profile-level-id", &val)) {
+        profileLevelID = decodeHex(val);
+        if (profileLevelID != NULL && profileLevelID->size() != 3u) {
+            profileLevelID = NULL;
+        }
     }
-
-    sp<ABuffer> profileLevelID = decodeHex(val);
-    CHECK(profileLevelID != NULL);
-    CHECK_EQ(profileLevelID->size(), 3u);
 
     Vector<sp<ABuffer> > paramSets;
 
@@ -176,8 +174,15 @@ static sp<ABuffer> MakeAVCCodecSpecificData(
     uint8_t *out = csd->data();
 
     *out++ = 0x01;  // configurationVersion
-    memcpy(out, profileLevelID->data(), 3);
-    out += 3;
+    if (profileLevelID != NULL) {
+        memcpy(out, profileLevelID->data(), 3);
+        out += 3;
+    } else {
+        *out++ = 0x42; // Baseline profile
+        *out++ = 0xE0; // Common subset for all profiles
+        *out++ = 0x0A; // Level 1
+    }
+
     *out++ = (0x3f << 2) | 1;  // lengthSize == 2 bytes
     *out++ = 0xe0 | numSeqParameterSets;
 
@@ -215,7 +220,7 @@ static sp<ABuffer> MakeAVCCodecSpecificData(
     return csd;
 }
 
-sp<ABuffer> MakeAACCodecSpecificData(const char *params) {
+static sp<ABuffer> MakeAACCodecSpecificData(const char *params) {
     AString val;
     CHECK(GetAttribute(params, "config", &val));
 
@@ -253,7 +258,7 @@ sp<ABuffer> MakeAACCodecSpecificData(const char *params) {
 }
 
 // From mpeg4-generic configuration data.
-sp<ABuffer> MakeAACCodecSpecificData2(const char *params) {
+static sp<ABuffer> MakeAACCodecSpecificData2(const char *params) {
     AString val;
     unsigned long objectType;
     if (GetAttribute(params, "objectType", &val)) {
@@ -273,8 +278,6 @@ sp<ABuffer> MakeAACCodecSpecificData2(const char *params) {
     // Make sure size fits into a single byte and doesn't have to
     // be encoded.
     CHECK_LT(20 + config->size(), 128u);
-
-    const uint8_t *data = config->data();
 
     static const uint8_t kStaticESDS[] = {
         0x03, 22,
@@ -374,8 +377,8 @@ static sp<ABuffer> MakeMPEG4VideoCodecSpecificData(
     ALOGI("VOL dimensions = %dx%d", *width, *height);
 
     size_t len1 = config->size() + GetSizeWidth(config->size()) + 1;
-    size_t len2 = len1 + GetSizeWidth(len1) + 1 + 13;
-    size_t len3 = len2 + GetSizeWidth(len2) + 1 + 3;
+    size_t len2 = len1 + GetSizeWidth(len1 + 13) + 1 + 13;
+    size_t len3 = len2 + GetSizeWidth(len2 + 3) + 1 + 3;
 
     sp<ABuffer> csd = new ABuffer(len3);
     uint8_t *dst = csd->data();
@@ -415,7 +418,7 @@ APacketSource::APacketSource(
     if (sessionDesc->getDurationUs(&durationUs)) {
         mFormat->setInt64(kKeyDuration, durationUs);
     } else {
-        mFormat->setInt64(kKeyDuration, 60 * 60 * 1000000ll);
+        mFormat->setInt64(kKeyDuration, -1LL);
     }
 
     mInitCheck = OK;
@@ -446,6 +449,17 @@ APacketSource::APacketSource(
         } else if (width < 0) {
             mInitCheck = ERROR_UNSUPPORTED;
             return;
+        }
+
+        mFormat->setInt32(kKeyWidth, width);
+        mFormat->setInt32(kKeyHeight, height);
+    } else if (!strncmp(desc.c_str(), "H265/", 5)) {
+        mFormat->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_HEVC);
+
+        int32_t width, height;
+        if (!sessionDesc->getDimensions(index, PT, &width, &height)) {
+            width = -1;
+            height = -1;
         }
 
         mFormat->setInt32(kKeyWidth, width);
@@ -551,6 +565,7 @@ APacketSource::APacketSource(
 
         mFormat->setInt32(kKeySampleRate, sampleRate);
         mFormat->setInt32(kKeyChannelCount, numChannels);
+        mFormat->setInt32(kKeyIsADTS, true);
 
         sp<ABuffer> codecSpecificData =
             MakeAACCodecSpecificData2(params.c_str());
@@ -560,6 +575,8 @@ APacketSource::APacketSource(
                 codecSpecificData->data(), codecSpecificData->size());
     } else if (ARawAudioAssembler::Supports(desc.c_str())) {
         ARawAudioAssembler::MakeFormat(desc.c_str(), mFormat);
+    } else if (!strncasecmp("MP2T/", desc.c_str(), 5)) {
+        mFormat->setCString(kKeyMIMEType, MEDIA_MIMETYPE_CONTAINER_MPEG2TS);
     } else {
         mInitCheck = ERROR_UNSUPPORTED;
     }
@@ -574,6 +591,17 @@ status_t APacketSource::initCheck() const {
 
 sp<MetaData> APacketSource::getFormat() {
     return mFormat;
+}
+
+bool APacketSource::isVideo() {
+    bool isVideo = false;
+
+    const char *mime;
+    if (mFormat->findCString(kKeyMIMEType, &mime)) {
+        isVideo = !strncasecmp(mime, "video/", 6);
+    }
+
+    return isVideo;
 }
 
 }  // namespace android

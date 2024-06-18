@@ -27,22 +27,17 @@
 #ifndef __LVDBE_PRIVATE_H__
 #define __LVDBE_PRIVATE_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif /* __cplusplus */
-
-
 /****************************************************************************************/
 /*                                                                                      */
 /*    Includes                                                                          */
 /*                                                                                      */
 /****************************************************************************************/
 
-#include "LVDBE.h"                                /* Calling or Application layer definitions */
+#include <audio_utils/BiquadFilter.h>
+#include "LVDBE.h" /* Calling or Application layer definitions */
 #include "BIQUAD.h"
 #include "LVC_Mixer.h"
 #include "AGC.h"
-
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -51,24 +46,10 @@ extern "C" {
 /****************************************************************************************/
 
 /* General */
-#define    LVDBE_INVALID            0xFFFF        /* Invalid init parameter */
+#define LVDBE_INVALID 0xFFFF /* Invalid init parameter */
 
-/* Memory */
-#define LVDBE_MEMREGION_INSTANCE         0       /* Offset to the instance memory region */
-#define LVDBE_MEMREGION_PERSISTENT_DATA  1       /* Offset to persistent data memory region */
-#define LVDBE_MEMREGION_PERSISTENT_COEF  2       /* Offset to persistent coefficient region */
-#define LVDBE_MEMREGION_SCRATCH          3       /* Offset to data scratch memory region */
-
-#define LVDBE_INSTANCE_ALIGN             4       /* 32-bit alignment for structures */
-#define LVDBE_PERSISTENT_DATA_ALIGN      4       /* 32-bit alignment for data */
-#define LVDBE_PERSISTENT_COEF_ALIGN      4       /* 32-bit alignment for coef */
-#define LVDBE_SCRATCH_ALIGN              4       /* 32-bit alignment for long data */
-
-#define LVDBE_SCRATCHBUFFERS_INPLACE     6       /* Number of buffers required for inplace processing */
-
-#define LVDBE_MIXER_TC                   5       /* Mixer time  */
-#define LVDBE_BYPASS_MIXER_TC            100     /* Bypass mixer time */
-
+#define LVDBE_MIXER_TC 5          /* Mixer time  */
+#define LVDBE_BYPASS_MIXER_TC 100 /* Bypass mixer time */
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -77,41 +58,32 @@ extern "C" {
 /****************************************************************************************/
 
 /* Data structure */
-typedef struct
-{
+/* Data structure */
+typedef struct {
     /* AGC parameters */
-    AGC_MIX_VOL_2St1Mon_D32_t   AGCInstance;        /* AGC instance parameters */
+    AGC_MIX_VOL_2St1Mon_FLOAT_t AGCInstance; /* AGC instance parameters */
 
     /* Process variables */
-    Biquad_2I_Order2_Taps_t     HPFTaps;            /* High pass filter taps */
-    Biquad_1I_Order2_Taps_t     BPFTaps;            /* Band pass filter taps */
-    LVMixer3_1St_st             BypassVolume;       /* Bypass volume scaler */
-    LVMixer3_2St_st             BypassMixer;        /* Bypass Mixer for Click Removal */
+    LVMixer3_1St_FLOAT_st BypassVolume;    /* Bypass volume scaler */
+    LVMixer3_2St_FLOAT_st BypassMixer;     /* Bypass Mixer for Click Removal */
 
-} LVDBE_Data_t;
+} LVDBE_Data_FLOAT_t;
 
-/* Coefs structure */
-typedef struct
-{
-    /* Process variables */
-    Biquad_Instance_t           HPFInstance;        /* High pass filter instance */
-    Biquad_Instance_t           BPFInstance;        /* Band pass filter instance */
-
-} LVDBE_Coef_t;
 
 /* Instance structure */
-typedef struct
-{
+typedef struct {
     /* Public parameters */
-    LVDBE_MemTab_t                MemoryTable;        /* Instance memory allocation table */
-    LVDBE_Params_t                Params;             /* Instance parameters */
-    LVDBE_Capabilities_t        Capabilities;         /* Instance capabilities */
+    LVDBE_Params_t Params;             /* Instance parameters */
+    LVDBE_Capabilities_t Capabilities; /* Instance capabilities */
 
     /* Data and coefficient pointers */
-    LVDBE_Data_t                *pData;                /* Instance data */
-    LVDBE_Coef_t                *pCoef;                /* Instance coefficients */
+    LVDBE_Data_FLOAT_t* pData; /* Instance data */
+    void* pScratch;            /* scratch pointer */
+    std::unique_ptr<android::audio_utils::BiquadFilter<LVM_FLOAT>>
+            pHPFBiquad; /* Biquad filter instance for HPF */
+    std::unique_ptr<android::audio_utils::BiquadFilter<LVM_FLOAT>>
+            pBPFBiquad; /* Biquad filter instance for BPF */
 } LVDBE_Instance_t;
-
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -119,22 +91,10 @@ typedef struct
 /*                                                                                      */
 /****************************************************************************************/
 
-void    LVDBE_SetAGC(LVDBE_Instance_t       *pInstance,
-                     LVDBE_Params_t         *pParams);
+void LVDBE_SetAGC(LVDBE_Instance_t* pInstance, LVDBE_Params_t* pParams);
 
+void LVDBE_SetVolume(LVDBE_Instance_t* pInstance, LVDBE_Params_t* pParams);
 
-void    LVDBE_SetVolume(LVDBE_Instance_t    *pInstance,
-                        LVDBE_Params_t      *pParams);
+void LVDBE_SetFilters(LVDBE_Instance_t* pInstance, LVDBE_Params_t* pParams);
 
-
-void    LVDBE_SetFilters(LVDBE_Instance_t   *pInstance,
-                         LVDBE_Params_t     *pParams);
-
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-
-#endif      /* __LVDBE_PRIVATE_H__ */
-
-
+#endif /* __LVDBE_PRIVATE_H__ */

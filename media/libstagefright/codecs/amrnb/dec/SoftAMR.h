@@ -18,7 +18,9 @@
 
 #define SOFT_AMR_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
+#include "gsmamr_dec.h"
+#include "pvamrwbdecoder.h"
 
 namespace android {
 
@@ -40,6 +42,7 @@ protected:
     virtual void onQueueFilled(OMX_U32 portIndex);
     virtual void onPortFlushCompleted(OMX_U32 portIndex);
     virtual void onPortEnableCompleted(OMX_U32 portIndex, bool enabled);
+    virtual void onReset();
 
 private:
     enum {
@@ -59,6 +62,7 @@ private:
     void *mState;
     void *mDecoderBuf;
     int16_t *mDecoderCookie;
+    RX_State_wb mRxState{};
 
     size_t mInputBufferCount;
     int64_t mAnchorTimeUs;

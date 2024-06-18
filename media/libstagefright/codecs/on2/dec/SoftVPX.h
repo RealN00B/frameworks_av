@@ -18,12 +18,20 @@
 
 #define SOFT_VPX_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
+
+#include "vpx/vpx_decoder.h"
+#include "vpx/vpx_codec.h"
+#include "vpx/vp8dx.h"
 
 namespace android {
 
-struct SoftVPX : public SimpleSoftOMXComponent {
+struct ABuffer;
+
+struct SoftVPX : public SoftVideoDecoderOMXComponent {
     SoftVPX(const char *name,
+            const char *componentRole,
+            OMX_VIDEO_CODINGTYPE codingType,
             const OMX_CALLBACKTYPE *callbacks,
             OMX_PTR appData,
             OMX_COMPONENTTYPE **component);
@@ -31,36 +39,42 @@ struct SoftVPX : public SimpleSoftOMXComponent {
 protected:
     virtual ~SoftVPX();
 
-    virtual OMX_ERRORTYPE internalGetParameter(
-            OMX_INDEXTYPE index, OMX_PTR params);
-
-    virtual OMX_ERRORTYPE internalSetParameter(
-            OMX_INDEXTYPE index, const OMX_PTR params);
-
     virtual void onQueueFilled(OMX_U32 portIndex);
     virtual void onPortFlushCompleted(OMX_U32 portIndex);
-    virtual void onPortEnableCompleted(OMX_U32 portIndex, bool enabled);
+    virtual void onReset();
+    virtual bool supportDescribeHdrStaticInfo();
+    virtual bool supportDescribeHdr10PlusInfo();
 
 private:
     enum {
-        kNumBuffers = 4
+        kNumBuffers = 10
     };
 
-    void *mCtx;
-
-    int32_t mWidth;
-    int32_t mHeight;
+    enum {
+        MODE_VP8,
+        MODE_VP9
+    } mMode;
 
     enum {
-        NONE,
-        AWAITING_DISABLED,
-        AWAITING_ENABLED
-    } mOutputPortSettingsChange;
+        INPUT_DATA_AVAILABLE,  // VPX component is ready to decode data.
+        INPUT_EOS_SEEN,        // VPX component saw EOS and is flushing On2 decoder.
+        OUTPUT_FRAMES_FLUSHED  // VPX component finished flushing On2 decoder.
+    } mEOSStatus;
 
-    void initPorts();
+    void *mCtx;
+    bool mFrameParallelMode;  // Frame parallel is only supported by VP9 decoder.
+    struct PrivInfo {
+        OMX_TICKS mTimeStamp;
+        sp<ABuffer> mHdr10PlusInfo;
+    };
+    PrivInfo mPrivInfo[kNumBuffers];
+    uint8_t mTimeStampIdx;
+    vpx_image_t *mImg;
+
     status_t initDecoder();
-
-    void updatePortDefinitions();
+    status_t destroyDecoder();
+    bool outputBuffers(bool flushDecoder, bool display, bool eos, bool *portWillReset);
+    bool outputBufferSafe(OMX_BUFFERHEADERTYPE *outHeader);
 
     DISALLOW_EVIL_CONSTRUCTORS(SoftVPX);
 };

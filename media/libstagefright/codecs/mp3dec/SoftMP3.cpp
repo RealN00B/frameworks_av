@@ -23,7 +23,7 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/MediaDefs.h>
 
-#include "include/pvmp3decoder_api.h"
+#include <pvmp3decoder_api.h>
 
 namespace android {
 
@@ -49,6 +49,8 @@ SoftMP3::SoftMP3(
       mNumChannels(2),
       mSamplingRate(44100),
       mSignalledError(false),
+      mSawInputEos(false),
+      mSignalledOutputEos(false),
       mOutputPortSettingsChange(NONE) {
     initPorts();
     initDecoder();
@@ -112,19 +114,58 @@ void SoftMP3::initDecoder() {
     mConfig->crcEnabled = false;
 
     uint32_t memRequirements = pvmp3_decoderMemRequirements();
-    mDecoderBuf = malloc(memRequirements);
+    mDecoderBuf = calloc(1, memRequirements);
 
     pvmp3_InitDecoder(mConfig, mDecoderBuf);
     mIsFirst = true;
 }
 
+void *SoftMP3::memsetSafe(OMX_BUFFERHEADERTYPE *outHeader, int c, size_t len) {
+    if (len > outHeader->nAllocLen) {
+        ALOGE("memset buffer too small: got %u, expected %zu", outHeader->nAllocLen, len);
+        android_errorWriteLog(0x534e4554, "29422022");
+        notify(OMX_EventError, OMX_ErrorUndefined, OUTPUT_BUFFER_TOO_SMALL, NULL);
+        mSignalledError = true;
+        return NULL;
+    }
+    return memset(outHeader->pBuffer, c, len);
+}
+
 OMX_ERRORTYPE SoftMP3::internalGetParameter(
         OMX_INDEXTYPE index, OMX_PTR params) {
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->nIndex > 0) {
+                return OMX_ErrorNoMore;
+            }
+
+            formatParams->eEncoding =
+                (formatParams->nPortIndex == 0)
+                    ? OMX_AUDIO_CodingMP3 : OMX_AUDIO_CodingPCM;
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
                 (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
 
             if (pcmParams->nPortIndex > 1) {
                 return OMX_ErrorUndefined;
@@ -144,6 +185,27 @@ OMX_ERRORTYPE SoftMP3::internalGetParameter(
             return OMX_ErrorNone;
         }
 
+        case OMX_IndexParamAudioMp3:
+        {
+            OMX_AUDIO_PARAM_MP3TYPE *mp3Params =
+                (OMX_AUDIO_PARAM_MP3TYPE *)params;
+
+            if (!isValidOMXParam(mp3Params)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (mp3Params->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            mp3Params->nChannels = mNumChannels;
+            mp3Params->nBitRate = 0 /* unknown */;
+            mp3Params->nSampleRate = mSamplingRate;
+            // other fields are encoder-only
+
+            return OMX_ErrorNone;
+        }
+
         default:
             return SimpleSoftOMXComponent::internalGetParameter(index, params);
     }
@@ -157,6 +219,10 @@ OMX_ERRORTYPE SoftMP3::internalSetParameter(
             const OMX_PARAM_COMPONENTROLETYPE *roleParams =
                 (const OMX_PARAM_COMPONENTROLETYPE *)params;
 
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
             if (strncmp((const char *)roleParams->cRole,
                         "audio_decoder.mp3",
                         OMX_MAX_STRINGNAME_SIZE - 1)) {
@@ -166,12 +232,54 @@ OMX_ERRORTYPE SoftMP3::internalSetParameter(
             return OMX_ErrorNone;
         }
 
+        case OMX_IndexParamAudioPortFormat:
+        {
+            const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if ((formatParams->nPortIndex == 0
+                        && formatParams->eEncoding != OMX_AUDIO_CodingMP3)
+                || (formatParams->nPortIndex == 1
+                        && formatParams->eEncoding != OMX_AUDIO_CodingPCM)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioPcm:
+        {
+            const OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (const OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            mNumChannels = pcmParams->nChannels;
+            mSamplingRate = pcmParams->nSamplingRate;
+
+            return OMX_ErrorNone;
+        }
+
         default:
             return SimpleSoftOMXComponent::internalSetParameter(index, params);
     }
 }
 
-void SoftMP3::onQueueFilled(OMX_U32 portIndex) {
+void SoftMP3::onQueueFilled(OMX_U32 /* portIndex */) {
     if (mSignalledError || mOutputPortSettingsChange != NONE) {
         return;
     }
@@ -179,43 +287,62 @@ void SoftMP3::onQueueFilled(OMX_U32 portIndex) {
     List<BufferInfo *> &inQueue = getPortQueue(0);
     List<BufferInfo *> &outQueue = getPortQueue(1);
 
-    while (!inQueue.empty() && !outQueue.empty()) {
-        BufferInfo *inInfo = *inQueue.begin();
-        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+    while ((!inQueue.empty() || (mSawInputEos && !mSignalledOutputEos)) && !outQueue.empty()) {
+        BufferInfo *inInfo = NULL;
+        OMX_BUFFERHEADERTYPE *inHeader = NULL;
+        if (!inQueue.empty()) {
+            inInfo = *inQueue.begin();
+            inHeader = inInfo->mHeader;
+        }
 
         BufferInfo *outInfo = *outQueue.begin();
         OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+        outHeader->nFlags = 0;
 
-        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
-            inQueue.erase(inQueue.begin());
-            inInfo->mOwnedByUs = false;
-            notifyEmptyBufferDone(inHeader);
+        if (inHeader) {
+            if (inHeader->nOffset == 0 && inHeader->nFilledLen) {
+                mAnchorTimeUs = inHeader->nTimeStamp;
+                mNumFramesOutput = 0;
+            }
 
-            // pad the end of the stream with 529 samples, since that many samples
-            // were trimmed off the beginning when decoding started
-            outHeader->nFilledLen = kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
-            memset(outHeader->pBuffer, 0, outHeader->nFilledLen);
-            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+            if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+                mSawInputEos = true;
+                if (mIsFirst && !inHeader->nFilledLen) {
+                     ALOGV("empty first EOS");
+                     outHeader->nFilledLen = 0;
+                     outHeader->nTimeStamp = inHeader->nTimeStamp;
+                     outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+                     mSignalledOutputEos = true;
+                     outInfo->mOwnedByUs = false;
+                     outQueue.erase(outQueue.begin());
+                     notifyFillBufferDone(outHeader);
+                     inInfo->mOwnedByUs = false;
+                     inQueue.erase(inQueue.begin());
+                     notifyEmptyBufferDone(inHeader);
+                     return;
+                }
+            }
 
-            outQueue.erase(outQueue.begin());
-            outInfo->mOwnedByUs = false;
-            notifyFillBufferDone(outHeader);
-            return;
+            mConfig->pInputBuffer =
+                inHeader->pBuffer + inHeader->nOffset;
+
+            mConfig->inputBufferCurrentLength = inHeader->nFilledLen;
+        } else {
+            mConfig->pInputBuffer = NULL;
+            mConfig->inputBufferCurrentLength = 0;
         }
-
-        if (inHeader->nOffset == 0) {
-            mAnchorTimeUs = inHeader->nTimeStamp;
-            mNumFramesOutput = 0;
-        }
-
-        mConfig->pInputBuffer =
-            inHeader->pBuffer + inHeader->nOffset;
-
-        mConfig->inputBufferCurrentLength = inHeader->nFilledLen;
         mConfig->inputBufferMaxLength = 0;
         mConfig->inputBufferUsedLength = 0;
 
         mConfig->outputFrameSize = kOutputBufferSize / sizeof(int16_t);
+        if ((int32_t)outHeader->nAllocLen < mConfig->outputFrameSize) {
+            ALOGE("input buffer too small: got %u, expected %u",
+                outHeader->nAllocLen, mConfig->outputFrameSize);
+            android_errorWriteLog(0x534e4554, "27793371");
+            notify(OMX_EventError, OMX_ErrorUndefined, OUTPUT_BUFFER_TOO_SMALL, NULL);
+            mSignalledError = true;
+            return;
+        }
 
         mConfig->pOutputBuffer =
             reinterpret_cast<int16_t *>(outHeader->pBuffer);
@@ -225,26 +352,49 @@ void SoftMP3::onQueueFilled(OMX_U32 portIndex) {
                 != NO_DECODING_ERROR) {
             ALOGV("mp3 decoder returned error %d", decoderErr);
 
-            if (decoderErr != NO_ENOUGH_MAIN_DATA_ERROR ||
-                    mConfig->outputFrameSize == 0) {
+            if (decoderErr != NO_ENOUGH_MAIN_DATA_ERROR
+                        && decoderErr != SIDE_INFO_ERROR) {
                 ALOGE("mp3 decoder returned error %d", decoderErr);
-
-                if (mConfig->outputFrameSize == 0) {
-                    ALOGE("Output frame size is 0");
-                }
 
                 notify(OMX_EventError, OMX_ErrorUndefined, decoderErr, NULL);
                 mSignalledError = true;
                 return;
             }
 
-            // This is recoverable, just ignore the current frame and
-            // play silence instead.
-            memset(outHeader->pBuffer,
-                   0,
-                   mConfig->outputFrameSize * sizeof(int16_t));
+            if (mConfig->outputFrameSize == 0) {
+                mConfig->outputFrameSize = kOutputBufferSize / sizeof(int16_t);
+            }
 
-            mConfig->inputBufferUsedLength = inHeader->nFilledLen;
+            if (decoderErr == NO_ENOUGH_MAIN_DATA_ERROR && mSawInputEos) {
+                if (!mIsFirst) {
+                    // pad the end of the stream with 529 samples, since that many samples
+                    // were trimmed off the beginning when decoding started
+                    outHeader->nOffset = 0;
+                    outHeader->nFilledLen = kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
+
+                    if (!memsetSafe(outHeader, 0, outHeader->nFilledLen)) {
+                        return;
+                    }
+
+                }
+                outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+                mSignalledOutputEos = true;
+            } else {
+                // This is recoverable, just ignore the current frame and
+                // play silence instead.
+
+                // TODO: should we skip silence (and consume input data)
+                // if mIsFirst is true as we may not have a valid
+                // mConfig->samplingRate and mConfig->num_channels?
+                ALOGV_IF(mIsFirst, "insufficient data for first frame, sending silence");
+                if (!memsetSafe(outHeader, 0, mConfig->outputFrameSize * sizeof(int16_t))) {
+                    return;
+                }
+
+                if (inHeader) {
+                    mConfig->inputBufferUsedLength = inHeader->nFilledLen;
+                }
+            }
         } else if (mConfig->samplingRate != mSamplingRate
                 || mConfig->num_channels != mNumChannels) {
             mSamplingRate = mConfig->samplingRate;
@@ -260,33 +410,36 @@ void SoftMP3::onQueueFilled(OMX_U32 portIndex) {
             // The decoder delay is 529 samples, so trim that many samples off
             // the start of the first output buffer. This essentially makes this
             // decoder have zero delay, which the rest of the pipeline assumes.
-            outHeader->nOffset = kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
-            outHeader->nFilledLen = mConfig->outputFrameSize * sizeof(int16_t) - outHeader->nOffset;
-        } else {
+            outHeader->nOffset =
+                kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
+
+            outHeader->nFilledLen =
+                mConfig->outputFrameSize * sizeof(int16_t) - outHeader->nOffset;
+        } else if (!mSignalledOutputEos) {
             outHeader->nOffset = 0;
             outHeader->nFilledLen = mConfig->outputFrameSize * sizeof(int16_t);
         }
 
         outHeader->nTimeStamp =
-            mAnchorTimeUs
-                + (mNumFramesOutput * 1000000ll) / mConfig->samplingRate;
+            mAnchorTimeUs + (mNumFramesOutput * 1000000LL) / mSamplingRate;
 
-        outHeader->nFlags = 0;
+        if (inHeader) {
+            CHECK_GE((int32_t)inHeader->nFilledLen, mConfig->inputBufferUsedLength);
 
-        CHECK_GE(inHeader->nFilledLen, mConfig->inputBufferUsedLength);
+            inHeader->nOffset += mConfig->inputBufferUsedLength;
+            inHeader->nFilledLen -= mConfig->inputBufferUsedLength;
 
-        inHeader->nOffset += mConfig->inputBufferUsedLength;
-        inHeader->nFilledLen -= mConfig->inputBufferUsedLength;
+
+            if (inHeader->nFilledLen == 0) {
+                inInfo->mOwnedByUs = false;
+                inQueue.erase(inQueue.begin());
+                inInfo = NULL;
+                notifyEmptyBufferDone(inHeader);
+                inHeader = NULL;
+            }
+        }
 
         mNumFramesOutput += mConfig->outputFrameSize / mNumChannels;
-
-        if (inHeader->nFilledLen == 0) {
-            inInfo->mOwnedByUs = false;
-            inQueue.erase(inQueue.begin());
-            inInfo = NULL;
-            notifyEmptyBufferDone(inHeader);
-            inHeader = NULL;
-        }
 
         outInfo->mOwnedByUs = false;
         outQueue.erase(outQueue.begin());
@@ -302,6 +455,9 @@ void SoftMP3::onPortFlushCompleted(OMX_U32 portIndex) {
         // depend on fragments from the last one decoded.
         pvmp3_InitDecoder(mConfig, mDecoderBuf);
         mIsFirst = true;
+        mSignalledError = false;
+        mSawInputEos = false;
+        mSignalledOutputEos = false;
     }
 }
 
@@ -331,8 +487,18 @@ void SoftMP3::onPortEnableCompleted(OMX_U32 portIndex, bool enabled) {
     }
 }
 
+void SoftMP3::onReset() {
+    pvmp3_InitDecoder(mConfig, mDecoderBuf);
+    mIsFirst = true;
+    mSignalledError = false;
+    mSawInputEos = false;
+    mSignalledOutputEos = false;
+    mOutputPortSettingsChange = NONE;
+}
+
 }  // namespace android
 
+__attribute__((cfi_canonical_jump_table))
 android::SoftOMXComponent *createSoftOMXComponent(
         const char *name, const OMX_CALLBACKTYPE *callbacks,
         OMX_PTR appData, OMX_COMPONENTTYPE **component) {

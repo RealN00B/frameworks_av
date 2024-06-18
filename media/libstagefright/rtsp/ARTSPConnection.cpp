@@ -18,15 +18,17 @@
 #define LOG_TAG "ARTSPConnection"
 #include <utils/Log.h>
 
-#include "ARTSPConnection.h"
+#include <media/stagefright/rtsp/ARTSPConnection.h>
+#include <media/stagefright/rtsp/NetworkUtils.h>
 
-#include <cutils/properties.h>
-
+#include <datasource/HTTPBase.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/base64.h>
 #include <media/stagefright/MediaErrors.h>
+#include <media/stagefright/Utils.h>
+#include <media/stagefright/FoundationUtils.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -34,12 +36,15 @@
 #include <openssl/md5.h>
 #include <sys/socket.h>
 
-#include "HTTPBase.h"
 
 namespace android {
 
 // static
-const int64_t ARTSPConnection::kSelectTimeoutUs = 1000ll;
+const int64_t ARTSPConnection::kSelectTimeoutUs = 1000LL;
+
+// static
+const AString ARTSPConnection::sUserAgent =
+    AStringPrintf("User-Agent: %s\r\n", MakeUserAgent().c_str());
 
 ARTSPConnection::ARTSPConnection(bool uidValid, uid_t uid)
     : mUIDValid(uidValid),
@@ -50,14 +55,14 @@ ARTSPConnection::ARTSPConnection(bool uidValid, uid_t uid)
       mConnectionID(0),
       mNextCSeq(0),
       mReceiveResponseEventPending(false) {
-    MakeUserAgent(&mUserAgent);
 }
 
 ARTSPConnection::~ARTSPConnection() {
     if (mSocket >= 0) {
         ALOGE("Connection is still open, closing the socket.");
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -65,28 +70,28 @@ ARTSPConnection::~ARTSPConnection() {
 }
 
 void ARTSPConnection::connect(const char *url, const sp<AMessage> &reply) {
-    sp<AMessage> msg = new AMessage(kWhatConnect, id());
+    sp<AMessage> msg = new AMessage(kWhatConnect, this);
     msg->setString("url", url);
     msg->setMessage("reply", reply);
     msg->post();
 }
 
 void ARTSPConnection::disconnect(const sp<AMessage> &reply) {
-    sp<AMessage> msg = new AMessage(kWhatDisconnect, id());
+    sp<AMessage> msg = new AMessage(kWhatDisconnect, this);
     msg->setMessage("reply", reply);
     msg->post();
 }
 
 void ARTSPConnection::sendRequest(
         const char *request, const sp<AMessage> &reply) {
-    sp<AMessage> msg = new AMessage(kWhatSendRequest, id());
+    sp<AMessage> msg = new AMessage(kWhatSendRequest, this);
     msg->setString("request", request);
     msg->setMessage("reply", reply);
     msg->post();
 }
 
 void ARTSPConnection::observeBinaryData(const sp<AMessage> &reply) {
-    sp<AMessage> msg = new AMessage(kWhatObserveBinaryData, id());
+    sp<AMessage> msg = new AMessage(kWhatObserveBinaryData, this);
     msg->setMessage("reply", reply);
     msg->post();
 }
@@ -211,7 +216,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
     if (mState != DISCONNECTED) {
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -235,7 +241,7 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
         // right here, since we currently have no way of asking the user
         // for this information.
 
-        ALOGE("Malformed rtsp url %s", url.c_str());
+        ALOGE("Malformed rtsp url %s", uriDebugString(url).c_str());
 
         reply->setInt32("result", ERROR_MALFORMED);
         reply->post();
@@ -250,7 +256,7 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
     struct hostent *ent = gethostbyname(host.c_str());
     if (ent == NULL) {
-        ALOGE("Unknown host %s", host.c_str());
+        ALOGE("Unknown host %s", uriDebugString(host).c_str());
 
         reply->setInt32("result", -ENOENT);
         reply->post();
@@ -262,8 +268,9 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
     mSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (mUIDValid) {
-        HTTPBase::RegisterSocketUserTag(mSocket, mUID,
+        NetworkUtils::RegisterSocketUserTag(mSocket, mUID,
                                         (uint32_t)*(uint32_t*) "RTSP");
+        NetworkUtils::RegisterSocketUserMark(mSocket, mUID);
     }
 
     MakeSocketBlocking(mSocket, false);
@@ -281,7 +288,7 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
     if (err < 0) {
         if (errno == EINPROGRESS) {
-            sp<AMessage> msg = new AMessage(kWhatCompleteConnection, id());
+            sp<AMessage> msg = new AMessage(kWhatCompleteConnection, this);
             msg->setMessage("reply", reply);
             msg->setInt32("connection-id", mConnectionID);
             msg->post();
@@ -292,7 +299,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
         mState = DISCONNECTED;
 
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -309,7 +317,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
 void ARTSPConnection::performDisconnect() {
     if (mUIDValid) {
-        HTTPBase::UnRegisterSocketUserTag(mSocket);
+        NetworkUtils::UnRegisterSocketUserTag(mSocket);
+        NetworkUtils::UnRegisterSocketUserMark(mSocket);
     }
     close(mSocket);
     mSocket = -1;
@@ -320,6 +329,7 @@ void ARTSPConnection::performDisconnect() {
     mPass.clear();
     mAuthType = NONE;
     mNonce.clear();
+    mRealm.clear();
 
     mState = DISCONNECTED;
 }
@@ -382,7 +392,8 @@ void ARTSPConnection::onCompleteConnection(const sp<AMessage> &msg) {
 
         mState = DISCONNECTED;
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -481,7 +492,6 @@ void ARTSPConnection::onReceiveResponse() {
     FD_SET(mSocket, &rs);
 
     int res = select(mSocket + 1, &rs, NULL, NULL, &tv);
-    CHECK_GE(res, 0);
 
     if (res == 1) {
         MakeSocketBlocking(mSocket, true);
@@ -516,7 +526,7 @@ void ARTSPConnection::postReceiveReponseEvent() {
         return;
     }
 
-    sp<AMessage> msg = new AMessage(kWhatReceiveResponse, id());
+    sp<AMessage> msg = new AMessage(kWhatReceiveResponse, this);
     msg->post();
 
     mReceiveResponseEventPending = true;
@@ -562,6 +572,9 @@ bool ARTSPConnection::receiveLine(AString *line) {
 
         if (sawCR && c == '\n') {
             line->erase(line->size() - 1, 1);
+            return true;
+        } else if (c == '\n') {
+            // some reponse line ended with '\n', instead of '\r\n'.
             return true;
         }
 
@@ -736,7 +749,7 @@ bool ARTSPConnection::receiveRTSPReponse() {
             AString request;
             CHECK(reply->findString("original-request", &request));
 
-            sp<AMessage> msg = new AMessage(kWhatSendRequest, id());
+            sp<AMessage> msg = new AMessage(kWhatSendRequest, this);
             msg->setMessage("reply", reply);
             msg->setString("request", request.c_str(), request.size());
 
@@ -830,6 +843,7 @@ status_t ARTSPConnection::findPendingRequest(
 
     if (i < 0) {
         // This is an unsolicited server->client message.
+        *index = -1;
         return OK;
     }
 
@@ -887,11 +901,6 @@ bool ARTSPConnection::parseAuthMethod(const sp<ARTSPResponse> &response) {
     if (!strncmp(value.c_str(), "Basic", 5)) {
         mAuthType = BASIC;
     } else {
-#if !defined(HAVE_ANDROID_OS)
-        // We don't have access to the MD5 implementation on the simulator,
-        // so we won't support digest authentication.
-        return false;
-#endif
 
         CHECK(!strncmp(value.c_str(), "Digest", 6));
         mAuthType = DIGEST;
@@ -903,12 +912,19 @@ bool ARTSPConnection::parseAuthMethod(const sp<ARTSPResponse> &response) {
         CHECK_GE(j, 0);
 
         mNonce.setTo(value, i + 7, j - i - 7);
+
+        i = value.find("realm=");
+        CHECK_GE(i, 0);
+        CHECK_EQ(value.c_str()[i + 6], '\"');
+        j = value.find("\"", i + 7);
+        CHECK_GE(j, 0);
+
+        mRealm.setTo(value, i + 7, j - i - 7);
     }
 
     return true;
 }
 
-#if defined(HAVE_ANDROID_OS)
 static void H(const AString &s, AString *out) {
     out->clear();
 
@@ -937,7 +953,6 @@ static void H(const AString &s, AString *out) {
         out->append(&nibble, 1);
     }
 }
-#endif
 
 static void GetMethodAndURL(
         const AString &request, AString *method, AString *url) {
@@ -948,7 +963,7 @@ static void GetMethodAndURL(
     CHECK_GE(space2, 0);
 
     method->setTo(request, 0, space1);
-    url->setTo(request, space1 + 1, space2 - space1);
+    url->setTo(request, space1 + 1, space2 - space1 - 1);
 }
 
 void ARTSPConnection::addAuthentication(AString *request) {
@@ -979,7 +994,6 @@ void ARTSPConnection::addAuthentication(AString *request) {
         return;
     }
 
-#if defined(HAVE_ANDROID_OS)
     CHECK_EQ((int)mAuthType, (int)DIGEST);
 
     AString method, url;
@@ -988,7 +1002,7 @@ void ARTSPConnection::addAuthentication(AString *request) {
     AString A1;
     A1.append(mUser);
     A1.append(":");
-    A1.append("Streaming Server");
+    A1.append(mRealm);
     A1.append(":");
     A1.append(mPass);
 
@@ -1024,26 +1038,13 @@ void ARTSPConnection::addAuthentication(AString *request) {
     fragment.append("\", ");
     fragment.append("response=\"");
     fragment.append(digest);
+    fragment.append("\", ");
+    fragment.append("realm=\"");
+    fragment.append(mRealm);
     fragment.append("\"");
     fragment.append("\r\n");
 
     request->insert(fragment, i + 2);
-#endif
-}
-
-// static
-void ARTSPConnection::MakeUserAgent(AString *userAgent) {
-    userAgent->clear();
-    userAgent->setTo("User-Agent: stagefright/1.1 (Linux;Android ");
-
-#if (PROPERTY_VALUE_MAX < 8)
-#error "PROPERTY_VALUE_MAX must be at least 8"
-#endif
-
-    char value[PROPERTY_VALUE_MAX];
-    property_get("ro.build.version.release", value, "Unknown");
-    userAgent->append(value);
-    userAgent->append(")\r\n");
 }
 
 void ARTSPConnection::addUserAgent(AString *request) const {
@@ -1051,7 +1052,7 @@ void ARTSPConnection::addUserAgent(AString *request) const {
     ssize_t i = request->find("\r\n\r\n");
     CHECK_GE(i, 0);
 
-    request->insert(mUserAgent, i + 2);
+    request->insert(sUserAgent, i + 2);
 }
 
 }  // namespace android

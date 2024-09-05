@@ -24,6 +24,7 @@
 #include <android/hardware/CameraIdRemapping.h>
 #include <android/hardware/camera2/BnCameraInjectionSession.h>
 #include <android/hardware/camera2/ICameraInjectionCallback.h>
+#include <android/permission/PermissionChecker.h>
 
 #include <cutils/multiuser.h>
 #include <utils/Vector.h>
@@ -34,6 +35,7 @@
 #include <binder/IServiceManager.h>
 #include <binder/IActivityManager.h>
 #include <binder/IAppOpsCallback.h>
+#include <binder/IPermissionController.h>
 #include <binder/IUidObserver.h>
 #include <hardware/camera.h>
 #include <sensorprivacy/SensorPrivacyManager.h>
@@ -313,8 +315,6 @@ public:
     /////////////////////////////////////////////////////////////////////
     // Shared utilities
     static binder::Status filterGetInfoErrorCode(status_t err);
-
-    static std::string getCurrPackageName();
 
     /////////////////////////////////////////////////////////////////////
     // CameraClient functionality
@@ -667,6 +667,25 @@ private:
         }();
         return activityManager;
     }
+    
+    static const sp<IPermissionController>& getPermissionController() {
+        static const char* kPermissionControllerService = "permission";
+        static thread_local sp<IPermissionController> sPermissionController = nullptr;
+
+        if (sPermissionController == nullptr ||
+                !IInterface::asBinder(sPermissionController)->isBinderAlive()) {
+            sp<IServiceManager> sm = defaultServiceManager();
+            sp<IBinder> binder = sm->checkService(toString16(kPermissionControllerService));
+            if (binder == nullptr) {
+                ALOGE("%s: Could not get permission service", __FUNCTION__);
+                sPermissionController = nullptr;
+            } else {
+                sPermissionController = interface_cast<IPermissionController>(binder);
+            }
+        }
+
+        return sPermissionController;
+    }
 
     /**
      * Pre-grants the permission if the attribution source uid is for an automotive
@@ -691,7 +710,7 @@ private:
 
     bool hasPermissionsForCameraPrivacyAllowlist(int callingPid, int callingUid) const;
 
-   /**
+    /**
      * Typesafe version of device status, containing both the HAL-layer and the service interface-
      * layer values.
      */
@@ -1551,6 +1570,10 @@ private:
 
     // Current zoom override value
     int32_t mZoomOverrideValue = -1;
+
+    // Utility instance over IPermissionChecker.
+    std::unique_ptr<permission::PermissionChecker> mPermissionChecker =
+            std::make_unique<permission::PermissionChecker>();
 
     /**
      * A listener class that implements the IBinder::DeathRecipient interface

@@ -81,11 +81,12 @@
 #include "CameraService.h"
 #include "api1/Camera2Client.h"
 #include "api2/CameraDeviceClient.h"
-#include "utils/CameraTraces.h"
-#include "utils/TagMonitor.h"
-#include "utils/CameraThreadState.h"
 #include "utils/CameraServiceProxyWrapper.h"
+#include "utils/CameraThreadState.h"
+#include "utils/CameraTraces.h"
 #include "utils/SessionConfigurationUtils.h"
+#include "utils/TagMonitor.h"
+#include "utils/Utils.h"
 
 #ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
 #include <vendor/oneplus/hardware/camera/1.0/IOnePlusCameraProvider.h>
@@ -820,10 +821,9 @@ bool CameraService::checkPermission(const std::string& cameraId, const std::stri
         return isAutomotiveExteriorSystemCamera(cameraId);
     }
 
-    permission::PermissionChecker permissionChecker;
-    return permissionChecker.checkPermissionForPreflight(toString16(permission), attributionSource,
-            toString16(message), attributedOpCode)
-            != permission::PermissionChecker::PERMISSION_HARD_DENIED;
+    return mPermissionChecker->checkPermissionForPreflight(
+            toString16(permission), attributionSource, toString16(message),
+            attributedOpCode) != permission::PermissionChecker::PERMISSION_HARD_DENIED;
 }
 
 bool CameraService::hasPermissionsForSystemCamera(const std::string& cameraId, int callingPid,
@@ -831,9 +831,11 @@ bool CameraService::hasPermissionsForSystemCamera(const std::string& cameraId, i
     AttributionSourceState attributionSource{};
     attributionSource.pid = callingPid;
     attributionSource.uid = callingUid;
+    bool checkPermissionForSystemCamera = checkPermission(cameraId,
+            sSystemCameraPermission, attributionSource, std::string(), AppOpsManager::OP_NONE);
     bool checkPermissionForCamera = checkPermission(cameraId,
             sCameraPermission, attributionSource, std::string(), AppOpsManager::OP_NONE);
-    return checkPermissionForCamera;
+    return checkPermissionForSystemCamera && checkPermissionForCamera;
 }
 
 bool CameraService::hasPermissionsForCameraHeadlessSystemUser(const std::string& cameraId,
@@ -2348,6 +2350,7 @@ Status CameraService::connectDevice(
         sp<hardware::camera2::ICameraDeviceUser>* device) {
 
     ATRACE_CALL();
+    RunThreadWithRealtimePriority priorityBump;
     Status ret = Status::ok();
     sp<CameraDeviceClient> client = nullptr;
     std::string clientPackageNameAdj = clientPackageName;
@@ -2474,16 +2477,15 @@ bool CameraService::isCameraPrivacyEnabled(const String16& packageName, const st
 std::string CameraService::getPackageNameFromUid(int clientUid) {
     std::string packageName("");
 
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(toString16(kPermissionServiceName));
-    if (binder == 0) {
-        ALOGE("Cannot get permission service");
+    sp<IPermissionController> permCtrl;
+    permCtrl = getPermissionController();
+
+    if (permCtrl == nullptr) {
         // Return empty package name and the further interaction
         // with camera will likely fail
         return packageName;
     }
 
-    sp<IPermissionController> permCtrl = interface_cast<IPermissionController>(binder);
     Vector<String16> packages;
 
     permCtrl->getPackagesForUid(clientUid, packages);

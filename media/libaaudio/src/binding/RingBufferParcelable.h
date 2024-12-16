@@ -17,8 +17,10 @@
 #ifndef ANDROID_AAUDIO_RINGBUFFER_PARCELABLE_H
 #define ANDROID_AAUDIO_RINGBUFFER_PARCELABLE_H
 
+#include <map>
 #include <stdint.h>
 
+#include <aaudio/RingBuffer.h>
 #include <binder/Parcelable.h>
 
 #include "binding/AAudioServiceDefinitions.h"
@@ -26,10 +28,12 @@
 
 namespace aaudio {
 
-class RingBufferParcelable : public Parcelable {
+class RingBufferParcelable  {
 public:
-    RingBufferParcelable();
-    virtual ~RingBufferParcelable();
+    RingBufferParcelable() = default;
+
+    // Construct based on a parcelable representation.
+    explicit RingBufferParcelable(const RingBuffer& parcelable);
 
     // TODO This assumes that all three use the same SharedMemoryParcelable
     void setupMemory(int32_t sharedMemoryIndex,
@@ -43,35 +47,64 @@ public:
                      int32_t dataMemoryOffset,
                      int32_t dataSizeInBytes);
 
-    int32_t getBytesPerFrame();
+    /**
+     * Set up memory for the RingBufferParcelable.
+     *
+     * This function will take three MemoryInfoTuple as parameters to set up memory. The
+     * MemoryInfoTuple contains the shared memory index, offset in the shared memory and size
+     * of the object. This will allow setting up the read counter, write counter and data memory
+     * that are located in different shared memory blocks.
+     *
+     * @param dataMemoryInfo
+     * @param readCounterInfo
+     * @param writeCounterInfo
+     */
+    void setupMemory(const SharedRegionParcelable::MemoryInfoTuple& dataMemoryInfo,
+                     const SharedRegionParcelable::MemoryInfoTuple& readCounterInfo,
+                     const SharedRegionParcelable::MemoryInfoTuple& writeCounterInfo);
+
+    int32_t getBytesPerFrame() const;
 
     void setBytesPerFrame(int32_t bytesPerFrame);
 
-    int32_t getFramesPerBurst();
+    int32_t getFramesPerBurst() const;
 
     void setFramesPerBurst(int32_t framesPerBurst);
 
-    int32_t getCapacityInFrames();
+    int32_t getCapacityInFrames() const;
 
     void setCapacityInFrames(int32_t capacityInFrames);
 
     bool isFileDescriptorSafe(SharedMemoryParcelable *memoryParcels);
 
-    /**
-     * The read and write must be symmetric.
-     */
-    virtual status_t writeToParcel(Parcel* parcel) const override;
-
-    virtual status_t readFromParcel(const Parcel* parcel) override;
-
     aaudio_result_t resolve(SharedMemoryParcelable *memoryParcels, RingBufferDescriptor *descriptor);
+
+    /**
+     * Update this ring buffer with the given ring buffer.
+     *
+     * @param parcelable the ring buffer to be used to update this ring buffer.
+     * @param memoryIndexMap a map from the shared memory indexes used by the given ring buffer
+     *                       to the shared memory indexes used by this ring buffer.
+     */
+    void updateMemory(const RingBufferParcelable& parcelable,
+                      const std::map<int32_t, int32_t>& memoryIndexMap);
+
+    int32_t getReadCounterSharedMemoryIndex() const {
+        return mReadCounterParcelable.getSharedMemoryIndex();
+    }
+    int32_t getWriteCounterSharedMemoryIndex() const {
+        return mWriteCounterParcelable.getSharedMemoryIndex();
+    }
+    int32_t getDataSharedMemoryIndex() const {
+        return mDataParcelable.getSharedMemoryIndex();
+    }
 
     void dump();
 
+    // Extract a parcelable representation of this object.
+    RingBuffer parcelable() const;
+
 private:
-
-    aaudio_result_t validate() const;
-
     SharedRegionParcelable  mReadCounterParcelable;
     SharedRegionParcelable  mWriteCounterParcelable;
     SharedRegionParcelable  mDataParcelable;
@@ -79,6 +112,8 @@ private:
     int32_t                 mFramesPerBurst = 0;    // for ISOCHRONOUS queues
     int32_t                 mCapacityInFrames = 0;  // zero if unused
     RingbufferFlags         mFlags = RingbufferFlags::NONE;
+
+    aaudio_result_t validate() const;
 };
 
 } /* namespace aaudio */

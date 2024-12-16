@@ -16,7 +16,8 @@
 #include <hardware/camera.h>
 
 #include <hidl/AidlCameraDeviceCallbacks.h>
-#include <hidl/Convert.h>
+#include <hidl/Utils.h>
+#include <aidl/AidlUtils.h>
 
 namespace android {
 namespace frameworks {
@@ -34,7 +35,7 @@ const char *H2BCameraDeviceCallbacks::kResultKey = "CaptureResult";
 
 H2BCameraDeviceCallbacks::H2BCameraDeviceCallbacks(const sp<HalInterface>& base) : CBase(base) { }
 
-bool H2BCameraDeviceCallbacks::initializeLooper() {
+bool H2BCameraDeviceCallbacks::initializeLooper(int vndkVersion) {
     mCbLooper = new ALooper;
     mCbLooper->setName("cs-looper");
     status_t err = mCbLooper->start(/*runOnCallingThread*/ false, /*canCallJava*/ false,
@@ -43,7 +44,7 @@ bool H2BCameraDeviceCallbacks::initializeLooper() {
         ALOGE("Unable to start camera device callback looper");
         return false;
     }
-    mHandler = new CallbackHandler(this);
+    mHandler = new CallbackHandler(this, vndkVersion);
     mCbLooper->registerHandler(mHandler);
     return true;
 }
@@ -144,6 +145,12 @@ void H2BCameraDeviceCallbacks::CallbackHandler::processResultMessage(
 
     // Convert Metadata into HCameraMetadata;
     FmqSizeOrMetadata hResult;
+    using hardware::cameraservice::utils::conversion::aidl::filterVndkKeys;
+    if (filterVndkKeys(mVndkVersion, result, /*isStatic*/false) != OK) {
+        ALOGE("%s: filtering vndk keys from result failed, not sending onResultReceived callback",
+                __FUNCTION__);
+        return;
+    }
     const camera_metadata_t *rawMetadata = result.getAndLock();
     converter->convertResultMetadataToHidl(rawMetadata, &hResult);
     result.unlock(rawMetadata);

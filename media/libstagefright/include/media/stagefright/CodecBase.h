@@ -41,7 +41,7 @@ class BufferChannelBase;
 struct BufferProducerWrapper;
 class MediaCodecBuffer;
 struct PersistentSurface;
-struct RenderedFrameInfo;
+class RenderedFrameInfo;
 class Surface;
 struct ICrypto;
 class IMemory;
@@ -60,6 +60,36 @@ struct SharedBuffer;
 }
 
 using hardware::cas::native::V1_0::IDescrambler;
+
+struct AccessUnitInfo {
+    uint32_t mFlags;
+    uint32_t mSize;
+    int64_t mTimestamp;
+    AccessUnitInfo(uint32_t flags, uint32_t size, int64_t ptsUs)
+            :mFlags(flags), mSize(size), mTimestamp(ptsUs) {
+    }
+    ~AccessUnitInfo() {}
+};
+
+struct CodecCryptoInfo {
+    size_t mNumSubSamples{0};
+    CryptoPlugin::SubSample *mSubSamples{nullptr};
+    uint8_t *mIv{nullptr};
+    uint8_t *mKey{nullptr};
+    enum CryptoPlugin::Mode mMode;
+    CryptoPlugin::Pattern mPattern;
+
+    virtual ~CodecCryptoInfo() {}
+protected:
+    CodecCryptoInfo():
+            mNumSubSamples(0),
+            mSubSamples(nullptr),
+            mIv(nullptr),
+            mKey(nullptr),
+            mMode{CryptoPlugin::kMode_Unencrypted},
+            mPattern{0, 0} {
+    }
+};
 
 struct CodecParameterDescriptor {
     std::string name;
@@ -182,6 +212,12 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
          * Notify MediaCodec that the first tunnel frame is ready.
          */
         virtual void onFirstTunnelFrameReady() = 0;
+        /**
+         * Notify MediaCodec that there are metrics to be updated.
+         *
+         * @param updatedMetrics metrics need to be updated.
+         */
+        virtual void onMetricsUpdated(const sp<AMessage> &updatedMetrics) = 0;
     };
 
     /**
@@ -233,7 +269,9 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
     // require an explicit message handler
     virtual void onMessageReceived(const sp<AMessage> &msg) = 0;
 
-    virtual status_t setSurface(const sp<Surface>& /*surface*/) { return INVALID_OPERATION; }
+    virtual status_t setSurface(const sp<Surface>& /*surface*/, uint32_t /*generation*/) {
+        return INVALID_OPERATION;
+    }
 
     virtual void signalFlush() = 0;
     virtual void signalResume() = 0;
@@ -252,9 +290,7 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
      *         INVALID_OPERATION if already released;
      *         ERROR_UNSUPPORTED if not supported.
      */
-    virtual status_t querySupportedParameters([[maybe_unused]] std::vector<std::string> *names) {
-        return ERROR_UNSUPPORTED;
-    }
+    virtual status_t querySupportedParameters(std::vector<std::string> *names);
     /**
      * Fill |desc| with description of the parameter with |name|.
      *
@@ -267,10 +303,8 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
      *         ERROR_UNSUPPORTED if not supported.
      */
     virtual status_t describeParameter(
-            [[maybe_unused]] const std::string &name,
-            [[maybe_unused]] CodecParameterDescriptor *desc) {
-        return ERROR_UNSUPPORTED;
-    }
+            const std::string &name,
+            CodecParameterDescriptor *desc);
     /**
      * Subscribe to parameters in |names| and get output format change event
      * when they change.
@@ -281,10 +315,7 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
      *         INVALID_OPERATION if already released;
      *         ERROR_UNSUPPORTED if not supported.
      */
-    virtual status_t subscribeToParameters(
-            [[maybe_unused]] const std::vector<std::string> &names) {
-        return ERROR_UNSUPPORTED;
-    }
+    virtual status_t subscribeToParameters(const std::vector<std::string> &names);
     /**
      * Unsubscribe from parameters in |names| and no longer get
      * output format change event when they change.
@@ -295,10 +326,7 @@ struct CodecBase : public AHandler, /* static */ ColorUtils {
      *         INVALID_OPERATION if already released;
      *         ERROR_UNSUPPORTED if not supported.
      */
-    virtual status_t unsubscribeFromParameters(
-            [[maybe_unused]] const std::vector<std::string> &names) {
-        return ERROR_UNSUPPORTED;
-    }
+    virtual status_t unsubscribeFromParameters(const std::vector<std::string> &names);
 
     typedef CodecBase *(*CreateCodecFunc)(void);
     typedef PersistentSurface *(*CreateInputSurfaceFunc)(void);
@@ -364,6 +392,30 @@ public:
             const CryptoPlugin::SubSample *subSamples,
             size_t numSubSamples,
             AString *errorDetailMsg) = 0;
+
+    /**
+     * Queue a secure input buffer with multiple access units into the buffer channel.
+     *
+     * @param buffer The buffer to queue. The access unit delimiters and crypto
+     *               subsample information is included in the buffer metadata.
+     * @param secure Whether the buffer is secure.
+     * @param errorDetailMsg The error message to be set in case of error.
+     * @return OK if successful;
+     *         -ENOENT of the buffer is not known
+     *         -ENOSYS if mCrypto is not set so that decryption is not
+     *         possible;
+     *         other errors if decryption failed.
+     */
+     virtual status_t queueSecureInputBuffers(
+            const sp<MediaCodecBuffer> &buffer,
+            bool secure,
+            AString *errorDetailMsg) {
+        (void)buffer;
+        (void)secure;
+        (void)errorDetailMsg;
+        return -ENOSYS;
+     }
+
     /**
      * Attach a Codec 2.0 buffer to MediaCodecBuffer.
      *
@@ -395,7 +447,8 @@ public:
             size_t offset,
             const CryptoPlugin::SubSample *subSamples,
             size_t numSubSamples,
-            const sp<MediaCodecBuffer> &buffer) {
+            const sp<MediaCodecBuffer> &buffer,
+            AString* errorDetailMsg) {
         (void)memory;
         (void)secure;
         (void)key;
@@ -406,6 +459,35 @@ public:
         (void)subSamples;
         (void)numSubSamples;
         (void)buffer;
+        (void)errorDetailMsg;
+        return -ENOSYS;
+    }
+
+    /**
+     * Attach an encrypted HidlMemory buffer containing multiple access units to an index
+     *
+     * @param memory The memory to attach.
+     * @param offset index???
+     * @param buffer The MediaCodecBuffer to attach the memory to. The access
+     *               unit delimiters and crypto subsample information is included
+     *               in the buffer metadata.
+     * @param secure Whether the buffer is secure.
+     * @param errorDetailMsg The error message to be set if an error occurs.
+     * @return    OK if successful;
+     *            -ENOENT if index is not recognized
+     *            -ENOSYS if attaching buffer is not possible or not supported
+     */
+    virtual status_t attachEncryptedBuffers(
+            const sp<hardware::HidlMemory> &memory,
+            size_t offset,
+            const sp<MediaCodecBuffer> &buffer,
+            bool secure,
+            AString* errorDetailMsg) {
+        (void)memory;
+        (void)offset;
+        (void)buffer;
+        (void)secure;
+        (void)errorDetailMsg;
         return -ENOSYS;
     }
     /**
@@ -417,6 +499,32 @@ public:
      */
     virtual status_t renderOutputBuffer(
             const sp<MediaCodecBuffer> &buffer, int64_t timestampNs) = 0;
+
+    /**
+     * Poll for updates about rendered buffers.
+     *
+     * Triggers callbacks to CodecCallback::onOutputFramesRendered.
+     */
+    virtual void pollForRenderedBuffers() = 0;
+
+    /**
+     * Notify a buffer is released from output surface.
+     *
+     * @param     generation    MediaCodec's surface specifier
+     */
+    virtual void onBufferReleasedFromOutputSurface(uint32_t /*generation*/) {
+        // default: no-op
+    };
+
+    /**
+     * Notify a buffer is attached to output surface.
+     *
+     * @param     generation    MediaCodec's surface specifier
+     */
+    virtual void onBufferAttachedToOutputSurface(uint32_t /*generation*/) {
+        // default: no-op
+    };
+
     /**
      * Discard a buffer to the underlying CodecBase object.
      *

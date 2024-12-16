@@ -30,15 +30,13 @@
 #include <PolicyAudioPort.h>
 #include <IOProfile.h>
 #include <AudioIODescriptorInterface.h>
+#include <com_android_media_audioserver.h>
 #include <policy.h>
 #include <media/AudioContainers.h>
 #include <utils/String8.h>
 #include <utils/Log.h>
 
-namespace android
-{
-namespace audio_policy
-{
+namespace android::audio_policy {
 
 struct legacy_strategy_map { const char *name; legacy_strategy id; };
 static const std::vector<legacy_strategy_map>& getLegacyStrategy() {
@@ -53,15 +51,24 @@ static const std::vector<legacy_strategy_map>& getLegacyStrategy() {
         { "STRATEGY_TRANSMITTED_THROUGH_SPEAKER", STRATEGY_TRANSMITTED_THROUGH_SPEAKER },
         { "STRATEGY_ACCESSIBILITY", STRATEGY_ACCESSIBILITY },
         { "STRATEGY_REROUTING", STRATEGY_REROUTING },
-        { "STRATEGY_PATCH", STRATEGY_REROUTING }, // boiler to manage stream patch volume
+        { "STRATEGY_PATCH", STRATEGY_PATCH }, // boiler to manage stream patch volume
         { "STRATEGY_CALL_ASSISTANT", STRATEGY_CALL_ASSISTANT },
     };
     return legacyStrategy;
 }
 
-Engine::Engine()
-{
-    auto result = EngineBase::loadAudioPolicyEngineConfig();
+status_t Engine::loadFromHalConfigWithFallback(
+        const media::audio::common::AudioHalEngineConfig& aidlConfig) {
+    return loadWithFallback(aidlConfig);
+}
+
+status_t Engine::loadFromXmlConfigWithFallback(const std::string& xmlFilePath) {
+    return loadWithFallback(xmlFilePath);
+}
+
+template<typename T>
+status_t Engine::loadWithFallback(const T& configSource) {
+    auto result = EngineBase::loadAudioPolicyEngineConfig(configSource);
     ALOGE_IF(result.nbSkippedElement != 0,
              "Policy Engine configuration is partially invalid, skipped %zu elements",
              result.nbSkippedElement);
@@ -70,7 +77,10 @@ Engine::Engine()
     for (const auto &strategy : legacyStrategy) {
         mLegacyStrategyMap[getProductStrategyByName(strategy.name)] = strategy.id;
     }
+
+    return OK;
 }
+
 
 status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced_cfg_t config)
 {
@@ -78,7 +88,7 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
     case AUDIO_POLICY_FORCE_FOR_COMMUNICATION:
         if (config != AUDIO_POLICY_FORCE_SPEAKER && config != AUDIO_POLICY_FORCE_BT_SCO &&
             config != AUDIO_POLICY_FORCE_NONE) {
-            ALOGW("setForceUse() invalid config %d for FOR_COMMUNICATION", config);
+            ALOGW("setForceUse() invalid config %d for COMMUNICATION", config);
             return BAD_VALUE;
         }
         break;
@@ -88,14 +98,14 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
             config != AUDIO_POLICY_FORCE_ANALOG_DOCK &&
             config != AUDIO_POLICY_FORCE_DIGITAL_DOCK && config != AUDIO_POLICY_FORCE_NONE &&
             config != AUDIO_POLICY_FORCE_NO_BT_A2DP && config != AUDIO_POLICY_FORCE_SPEAKER ) {
-            ALOGW("setForceUse() invalid config %d for FOR_MEDIA", config);
+            ALOGW("setForceUse() invalid config %d for MEDIA", config);
             return BAD_VALUE;
         }
         break;
     case AUDIO_POLICY_FORCE_FOR_RECORD:
         if (config != AUDIO_POLICY_FORCE_BT_SCO && config != AUDIO_POLICY_FORCE_WIRED_ACCESSORY &&
             config != AUDIO_POLICY_FORCE_NONE) {
-            ALOGW("setForceUse() invalid config %d for FOR_RECORD", config);
+            ALOGW("setForceUse() invalid config %d for RECORD", config);
             return BAD_VALUE;
         }
         break;
@@ -105,19 +115,22 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
             config != AUDIO_POLICY_FORCE_WIRED_ACCESSORY &&
             config != AUDIO_POLICY_FORCE_ANALOG_DOCK &&
             config != AUDIO_POLICY_FORCE_DIGITAL_DOCK) {
-            ALOGW("setForceUse() invalid config %d for FOR_DOCK", config);
+            ALOGW("setForceUse() invalid config %d for DOCK", config);
+            return BAD_VALUE;
         }
         break;
     case AUDIO_POLICY_FORCE_FOR_SYSTEM:
         if (config != AUDIO_POLICY_FORCE_NONE &&
             config != AUDIO_POLICY_FORCE_SYSTEM_ENFORCED) {
-            ALOGW("setForceUse() invalid config %d for FOR_SYSTEM", config);
+            ALOGW("setForceUse() invalid config %d for SYSTEM", config);
+            return BAD_VALUE;
         }
         break;
     case AUDIO_POLICY_FORCE_FOR_HDMI_SYSTEM_AUDIO:
         if (config != AUDIO_POLICY_FORCE_NONE &&
             config != AUDIO_POLICY_FORCE_HDMI_SYSTEM_AUDIO_ENFORCED) {
             ALOGW("setForceUse() invalid config %d for HDMI_SYSTEM_AUDIO", config);
+            return BAD_VALUE;
         }
         break;
     case AUDIO_POLICY_FORCE_FOR_ENCODED_SURROUND:
@@ -130,21 +143,192 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
         }
         break;
     case AUDIO_POLICY_FORCE_FOR_VIBRATE_RINGING:
-        if (config != AUDIO_POLICY_FORCE_BT_SCO && config != AUDIO_POLICY_FORCE_NONE) {
-            ALOGW("setForceUse() invalid config %d for FOR_VIBRATE_RINGING", config);
+        if (config != AUDIO_POLICY_FORCE_BT_SCO && config != AUDIO_POLICY_FORCE_BT_BLE
+                && config != AUDIO_POLICY_FORCE_NONE) {
+            ALOGW("setForceUse() invalid config %d for VIBRATE_RINGING", config);
             return BAD_VALUE;
         }
         break;
     default:
         ALOGW("setForceUse() invalid usage %d", usage);
-        break; // TODO return BAD_VALUE?
+        return BAD_VALUE;
     }
     return EngineBase::setForceUse(usage, config);
 }
 
+bool Engine::isBtScoActive(DeviceVector& availableOutputDevices,
+                           const SwAudioOutputCollection &outputs) const {
+    if (availableOutputDevices.getDevicesFromTypes(getAudioDeviceOutAllScoSet()).isEmpty()) {
+        return false;
+    }
+    // SCO is active if:
+    // 1) we are in a call and SCO is the preferred device for PHONE strategy
+    if (isInCall() && audio_is_bluetooth_out_sco_device(
+            getPreferredDeviceTypeForLegacyStrategy(availableOutputDevices, STRATEGY_PHONE))) {
+        return true;
+    }
+
+    // 2) A strategy for which the preferred device is SCO is active
+    for (const auto &ps : getOrderedProductStrategies()) {
+        if (outputs.isStrategyActive(ps) &&
+            !getPreferredAvailableDevicesForProductStrategy(availableOutputDevices, ps)
+                .getDevicesFromTypes(getAudioDeviceOutAllScoSet()).isEmpty()) {
+            return true;
+        }
+    }
+    // 3) a ringtone is active and SCO is used for ringing
+    if (outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_RING))
+          && (getForceUse(AUDIO_POLICY_FORCE_FOR_VIBRATE_RINGING)
+                    == AUDIO_POLICY_FORCE_BT_SCO)) {
+        return true;
+    }
+    // 4) an active input is routed from SCO
+    DeviceVector availableInputDevices = getApmObserver()->getAvailableInputDevices();
+    const auto &inputs = getApmObserver()->getInputs();
+    if (inputs.activeInputsCountOnDevices(availableInputDevices.getDevicesFromType(
+            AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET)) > 0) {
+        return true;
+    }
+    return false;
+}
+
+void Engine::filterOutputDevicesForStrategy(legacy_strategy strategy,
+                                            DeviceVector& availableOutputDevices,
+                                            const SwAudioOutputCollection &outputs) const
+{
+    DeviceVector availableInputDevices = getApmObserver()->getAvailableInputDevices();
+
+    if (com::android::media::audioserver::use_bt_sco_for_media()) {
+        // remove A2DP and LE Audio devices whenever BT SCO is in use
+        if (isBtScoActive(availableOutputDevices, outputs)) {
+            availableOutputDevices.remove(
+                availableOutputDevices.getDevicesFromTypes(getAudioDeviceOutAllA2dpSet()));
+            availableOutputDevices.remove(
+                availableOutputDevices.getDevicesFromTypes(getAudioDeviceOutAllBleSet()));
+        }
+    }
+
+    switch (strategy) {
+    case STRATEGY_SONIFICATION_RESPECTFUL: {
+        if (!(isInCall() || outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL)))) {
+            // routing is same as media without the "remote" device
+            availableOutputDevices.remove(availableOutputDevices.getDevicesFromType(
+                    AUDIO_DEVICE_OUT_REMOTE_SUBMIX));
+        }
+        } break;
+    case STRATEGY_DTMF:
+    case STRATEGY_PHONE: {
+        // Force use of only devices on primary output if:
+        // - in call AND
+        //   - cannot route from voice call RX OR
+        //   - audio HAL version is < 3.0 and TX device is on the primary HW module
+        if (getPhoneState() == AUDIO_MODE_IN_CALL) {
+            sp<AudioOutputDescriptor> primaryOutput = outputs.getPrimaryOutput();
+            if (primaryOutput != nullptr) {
+                audio_devices_t txDevice = AUDIO_DEVICE_NONE;
+                sp<DeviceDescriptor> txDeviceDesc =
+                        getDeviceForInputSource(AUDIO_SOURCE_VOICE_COMMUNICATION);
+                if (txDeviceDesc != nullptr) {
+                    txDevice = txDeviceDesc->type();
+                }
+                DeviceVector availPrimaryInputDevices =
+                        availableInputDevices.getDevicesFromHwModule(
+                            primaryOutput->getModuleHandle());
+
+                // TODO: getPrimaryOutput return only devices from first module in
+                // audio_policy_configuration.xml, hearing aid is not there, but it's
+                // a primary device
+                // FIXME: this is not the right way of solving this problem
+                DeviceVector availPrimaryOutputDevices = availableOutputDevices.getDevicesFromTypes(
+                        primaryOutput->supportedDevices().types());
+                availPrimaryOutputDevices.add(
+                        availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_HEARING_AID));
+
+                if ((availableInputDevices.getDevice(AUDIO_DEVICE_IN_TELEPHONY_RX,
+                                                     String8(""), AUDIO_FORMAT_DEFAULT) == nullptr)
+                    || ((availPrimaryInputDevices.getDevice(
+                            txDevice, String8(""), AUDIO_FORMAT_DEFAULT) != nullptr) &&
+                     (primaryOutput->getPolicyAudioPort()->getModuleVersionMajor() < 3))) {
+                    availableOutputDevices = availPrimaryOutputDevices;
+                }
+            } else {
+                ALOGE("%s, STRATEGY_PHONE: Primary output not found", __func__);
+            }
+        }
+        // Do not use A2DP devices when in call but use them when not in call
+        // (e.g for voice mail playback)
+        if (isInCall()) {
+            availableOutputDevices.remove(availableOutputDevices.getDevicesFromTypes({
+                    AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES,
+                    AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER, }));
+        }
+        // If connected to a dock, never use the device speaker for calls
+        if (!availableOutputDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET})
+                .isEmpty()) {
+            availableOutputDevices.remove(
+                    availableOutputDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_SPEAKER}));
+        }
+        } break;
+    case STRATEGY_ACCESSIBILITY: {
+        // do not route accessibility prompts to a digital output currently configured with a
+        // compressed format as they would likely not be mixed and dropped.
+        for (size_t i = 0; i < outputs.size(); i++) {
+            sp<AudioOutputDescriptor> desc = outputs.valueAt(i);
+            if (desc->isActive() && !audio_is_linear_pcm(desc->getFormat())) {
+                availableOutputDevices.remove(desc->devices().getDevicesFromTypes({
+                        AUDIO_DEVICE_OUT_HDMI, AUDIO_DEVICE_OUT_SPDIF,
+                        AUDIO_DEVICE_OUT_HDMI_ARC, AUDIO_DEVICE_OUT_HDMI_EARC}));
+            }
+        }
+        } break;
+    default:
+        break;
+    }
+}
+
+product_strategy_t Engine::remapStrategyFromContext(product_strategy_t strategy,
+                                                 const SwAudioOutputCollection &outputs) const {
+    auto legacyStrategy = mLegacyStrategyMap.find(strategy) != end(mLegacyStrategyMap) ?
+                          mLegacyStrategyMap.at(strategy) : STRATEGY_NONE;
+
+    if (isInCall()) {
+        switch (legacyStrategy) {
+        case STRATEGY_ACCESSIBILITY:
+        case STRATEGY_DTMF:
+        case STRATEGY_MEDIA:
+        case STRATEGY_SONIFICATION:
+        case STRATEGY_SONIFICATION_RESPECTFUL:
+            legacyStrategy = STRATEGY_PHONE;
+            break;
+
+        default:
+            return strategy;
+        }
+    } else {
+        switch (legacyStrategy) {
+        case STRATEGY_SONIFICATION_RESPECTFUL:
+        case STRATEGY_SONIFICATION:
+            if (outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL))) {
+                legacyStrategy = STRATEGY_PHONE;
+            }
+            break;
+
+        case STRATEGY_ACCESSIBILITY:
+            if (outputs.isActive(toVolumeSource(AUDIO_STREAM_RING)) ||
+                    outputs.isActive(toVolumeSource(AUDIO_STREAM_ALARM))) {
+                legacyStrategy = STRATEGY_SONIFICATION;
+            }
+            break;
+
+        default:
+            return strategy;
+        }
+    }
+    return getProductStrategyFromLegacy(legacyStrategy);
+}
+
 DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
                                               DeviceVector availableOutputDevices,
-                                              DeviceVector availableInputDevices,
                                               const SwAudioOutputCollection &outputs) const
 {
     DeviceVector devices;
@@ -155,88 +339,24 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
         devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_SPEAKER);
         break;
 
-    case STRATEGY_SONIFICATION_RESPECTFUL:
-        if (isInCall() || outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL))) {
-            devices = getDevicesForStrategyInt(
-                    STRATEGY_SONIFICATION, availableOutputDevices, availableInputDevices, outputs);
-        } else {
-            bool media_active_locally =
-                    outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_MUSIC),
-                                            SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY)
-                    || outputs.isActiveLocally(
-                        toVolumeSource(AUDIO_STREAM_ACCESSIBILITY),
-                        SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY);
-            // routing is same as media without the "remote" device
-            availableOutputDevices.remove(availableOutputDevices.getDevicesFromType(
-                    AUDIO_DEVICE_OUT_REMOTE_SUBMIX));
-            devices = getDevicesForStrategyInt(STRATEGY_MEDIA,
-                    availableOutputDevices,
-                    availableInputDevices, outputs);
-            // if no media is playing on the device, check for mandatory use of "safe" speaker
-            // when media would have played on speaker, and the safe speaker path is available
-            if (!media_active_locally) {
-                devices.replaceDevicesByType(
-                        AUDIO_DEVICE_OUT_SPEAKER,
-                        availableOutputDevices.getDevicesFromType(
-                                AUDIO_DEVICE_OUT_SPEAKER_SAFE));
-            }
-        }
-        break;
-
-    case STRATEGY_DTMF:
     case STRATEGY_PHONE: {
-        // Force use of only devices on primary output if:
-        // - in call AND
-        //   - cannot route from voice call RX OR
-        //   - audio HAL version is < 3.0 and TX device is on the primary HW module
-        if (getPhoneState() == AUDIO_MODE_IN_CALL) {
-            audio_devices_t txDevice = getDeviceForInputSource(
-                    AUDIO_SOURCE_VOICE_COMMUNICATION)->type();
-            sp<AudioOutputDescriptor> primaryOutput = outputs.getPrimaryOutput();
-            LOG_ALWAYS_FATAL_IF(primaryOutput == nullptr, "Primary output not found");
-            DeviceVector availPrimaryInputDevices =
-                    availableInputDevices.getDevicesFromHwModule(primaryOutput->getModuleHandle());
-
-            // TODO: getPrimaryOutput return only devices from first module in
-            // audio_policy_configuration.xml, hearing aid is not there, but it's
-            // a primary device
-            // FIXME: this is not the right way of solving this problem
-            DeviceVector availPrimaryOutputDevices = availableOutputDevices.getDevicesFromTypes(
-                    primaryOutput->supportedDevices().types());
-            availPrimaryOutputDevices.add(
-                    availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_HEARING_AID));
-
-            if ((availableInputDevices.getDevice(AUDIO_DEVICE_IN_TELEPHONY_RX,
-                                                 String8(""), AUDIO_FORMAT_DEFAULT) == nullptr) ||
-                ((availPrimaryInputDevices.getDevice(
-                        txDevice, String8(""), AUDIO_FORMAT_DEFAULT) != nullptr) &&
-                 (primaryOutput->getPolicyAudioPort()->getModuleVersionMajor() < 3))) {
-                availableOutputDevices = availPrimaryOutputDevices;
-            }
-        }
-        devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_HEARING_AID);
+        // TODO(b/243670205): remove this logic that gives preference to last removable devices
+        // once a UX decision has been made
+        devices = availableOutputDevices.getFirstDevicesFromTypes(
+                        getLastRemovableMediaDevices(GROUP_NONE, {
+                            // excluding HEARING_AID and BLE_HEADSET because Dialer uses
+                            // setCommunicationDevice to select them explicitly
+                            AUDIO_DEVICE_OUT_HEARING_AID,
+                            AUDIO_DEVICE_OUT_BLE_HEADSET,
+                            AUDIO_DEVICE_OUT_AUX_DIGITAL
+                            }));
         if (!devices.isEmpty()) break;
         devices = availableOutputDevices.getFirstDevicesFromTypes({
-                                                                  AUDIO_DEVICE_OUT_WIRED_HEADPHONE,
-                                                                  AUDIO_DEVICE_OUT_WIRED_HEADSET,
-                                                                  AUDIO_DEVICE_OUT_LINE,
-                                                                  AUDIO_DEVICE_OUT_USB_HEADSET,
-                                                                  AUDIO_DEVICE_OUT_USB_DEVICE});
-        if (!devices.isEmpty()) break;
-        devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_EARPIECE);
+                AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET, AUDIO_DEVICE_OUT_EARPIECE,
+                AUDIO_DEVICE_OUT_SPEAKER});
     } break;
 
     case STRATEGY_SONIFICATION:
-
-        // If incall, just select the STRATEGY_PHONE device
-        if (isInCall() ||
-                outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL))) {
-            devices = getDevicesForStrategyInt(
-                    STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs);
-            break;
-        }
-        FALLTHROUGH_INTENDED;
-
     case STRATEGY_ENFORCED_AUDIBLE:
         // strategy STRATEGY_ENFORCED_AUDIBLE uses same routing policy as STRATEGY_SONIFICATION
         // except:
@@ -245,7 +365,9 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
 
         if ((strategy == STRATEGY_SONIFICATION) ||
                 (getForceUse(AUDIO_POLICY_FORCE_FOR_SYSTEM) == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED)) {
-            devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_SPEAKER);
+            // favor dock over speaker when available
+            devices = availableOutputDevices.getFirstDevicesFromTypes({
+                    AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET, AUDIO_DEVICE_OUT_SPEAKER});
         }
 
         // if SCO headset is connected and we are told to use it, play ringtone over
@@ -281,35 +403,46 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
                 }
             }
         }
+
+        // if LEA headset is connected and we are told to use it, play ringtone over
+        // speaker and BT LEA
+        if (!availableOutputDevices.getDevicesFromTypes(getAudioDeviceOutAllBleSet()).isEmpty()) {
+            DeviceVector devices2;
+            devices2 = availableOutputDevices.getFirstDevicesFromTypes({
+                    AUDIO_DEVICE_OUT_BLE_HEADSET, AUDIO_DEVICE_OUT_BLE_SPEAKER});
+            // Use ONLY Bluetooth LEA output when ringing in vibration mode
+            if (!((getForceUse(AUDIO_POLICY_FORCE_FOR_SYSTEM) == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED)
+                    && (strategy == STRATEGY_ENFORCED_AUDIBLE))) {
+                if (getForceUse(AUDIO_POLICY_FORCE_FOR_VIBRATE_RINGING)
+                        == AUDIO_POLICY_FORCE_BT_BLE) {
+                    if (!devices2.isEmpty()) {
+                        devices = devices2;
+                        break;
+                    }
+                }
+            }
+            // Use both Bluetooth LEA and phone default output when ringing in normal mode
+            if (audio_is_ble_out_device(getPreferredDeviceTypeForLegacyStrategy(
+                    availableOutputDevices, STRATEGY_PHONE))) {
+                if (strategy == STRATEGY_SONIFICATION) {
+                    devices.replaceDevicesByType(
+                            AUDIO_DEVICE_OUT_SPEAKER,
+                            availableOutputDevices.getDevicesFromType(
+                                    AUDIO_DEVICE_OUT_SPEAKER_SAFE));
+                }
+                if (!devices2.isEmpty()) {
+                    devices.add(devices2);
+                    break;
+                }
+            }
+        }
+
         // The second device used for sonification is the same as the device used by media strategy
         FALLTHROUGH_INTENDED;
 
+    case STRATEGY_DTMF:
     case STRATEGY_ACCESSIBILITY:
-        if (strategy == STRATEGY_ACCESSIBILITY) {
-            // do not route accessibility prompts to a digital output currently configured with a
-            // compressed format as they would likely not be mixed and dropped.
-            for (size_t i = 0; i < outputs.size(); i++) {
-                sp<AudioOutputDescriptor> desc = outputs.valueAt(i);
-                if (desc->isActive() && !audio_is_linear_pcm(desc->getFormat())) {
-                    availableOutputDevices.remove(desc->devices().getDevicesFromTypes({
-                            AUDIO_DEVICE_OUT_HDMI, AUDIO_DEVICE_OUT_SPDIF,
-                            AUDIO_DEVICE_OUT_HDMI_ARC}));
-                }
-            }
-            if (outputs.isActive(toVolumeSource(AUDIO_STREAM_RING)) ||
-                    outputs.isActive(toVolumeSource(AUDIO_STREAM_ALARM))) {
-                return getDevicesForStrategyInt(
-                    STRATEGY_SONIFICATION, availableOutputDevices, availableInputDevices, outputs);
-            }
-            if (isInCall()) {
-                return getDevicesForStrategyInt(
-                        STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs);
-            }
-        }
-        // For other cases, STRATEGY_ACCESSIBILITY behaves like STRATEGY_MEDIA
-        FALLTHROUGH_INTENDED;
-
-    // FIXME: STRATEGY_REROUTING follow STRATEGY_MEDIA for now
+    case STRATEGY_SONIFICATION_RESPECTFUL:
     case STRATEGY_REROUTING:
     case STRATEGY_MEDIA: {
         DeviceVector devices2;
@@ -322,44 +455,82 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
                 devices2.add(remoteSubmix);
             }
         }
-        if (isInCall() && (strategy == STRATEGY_MEDIA)) {
-            devices = getDevicesForStrategyInt(
-                    STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs);
-            break;
-        }
 
         if ((devices2.isEmpty()) &&
             (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) == AUDIO_POLICY_FORCE_SPEAKER)) {
             devices2 = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_SPEAKER);
         }
+
+        // LE audio broadcast device is only used if:
+        // - No call is active
+        // - the highest priority active strategy is not PHONE or TRANSMITTED_THROUGH_SPEAKER
+        // OR the LE audio unicast device is not active
+        if (devices2.isEmpty() && !isInCall()
+                // also skipping routing queries from PHONE and TRANSMITTED_THROUGH_SPEAKER here
+                // so this code is not dependent on breaks for other strategies above
+                && (strategy != STRATEGY_PHONE)
+                && (strategy != STRATEGY_TRANSMITTED_THROUGH_SPEAKER)) {
+            legacy_strategy topActiveStrategy = STRATEGY_NONE;
+            for (const auto &ps : getOrderedProductStrategies()) {
+                if (outputs.isStrategyActive(ps)) {
+                    topActiveStrategy =  mLegacyStrategyMap.find(ps) != end(mLegacyStrategyMap) ?
+                            mLegacyStrategyMap.at(ps) : STRATEGY_NONE;
+                    break;
+                }
+            }
+
+            if ((topActiveStrategy != STRATEGY_PHONE
+                        && topActiveStrategy != STRATEGY_TRANSMITTED_THROUGH_SPEAKER)
+                    || !outputs.isAnyDeviceTypeActive(getAudioDeviceOutLeAudioUnicastSet())) {
+                devices2 =
+                        availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_BLE_BROADCAST);
+            }
+        }
+
         if (devices2.isEmpty() && (getLastRemovableMediaDevices().size() > 0)) {
+            std::vector<audio_devices_t> excludedDevices;
+            // no sonification on aux digital (e.g. HDMI)
+            if (strategy == STRATEGY_SONIFICATION) {
+                excludedDevices.push_back(AUDIO_DEVICE_OUT_AUX_DIGITAL);
+            }
             if ((getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) != AUDIO_POLICY_FORCE_NO_BT_A2DP)) {
                 // Get the last connected device of wired and bluetooth a2dp
                 devices2 = availableOutputDevices.getFirstDevicesFromTypes(
-                        getLastRemovableMediaDevices());
+                        getLastRemovableMediaDevices(GROUP_NONE, excludedDevices));
             } else {
                 // Get the last connected device of wired except bluetooth a2dp
                 devices2 = availableOutputDevices.getFirstDevicesFromTypes(
-                        getLastRemovableMediaDevices(GROUP_WIRED));
+                        getLastRemovableMediaDevices(GROUP_WIRED, excludedDevices));
             }
         }
-        if ((devices2.isEmpty()) && (strategy != STRATEGY_SONIFICATION)) {
-            // no sonification on aux digital (e.g. HDMI)
-            devices2 = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_AUX_DIGITAL);
+
+        if (com::android::media::audioserver::use_bt_sco_for_media()) {
+            if (devices2.isEmpty() && isBtScoActive(availableOutputDevices, outputs)) {
+                devices2 = availableOutputDevices.getFirstDevicesFromTypes(
+                        { AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT,
+                          AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET,
+                          AUDIO_DEVICE_OUT_BLUETOOTH_SCO});
+            }
         }
+
         if ((devices2.isEmpty()) &&
                 (getForceUse(AUDIO_POLICY_FORCE_FOR_DOCK) == AUDIO_POLICY_FORCE_ANALOG_DOCK)) {
             devices2 = availableOutputDevices.getDevicesFromType(
                     AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET);
         }
+
         if (devices2.isEmpty()) {
-            devices2 = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_SPEAKER);
+            devices2 = availableOutputDevices.getFirstDevicesFromTypes({
+                        AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET, AUDIO_DEVICE_OUT_SPEAKER});
         }
+
         DeviceVector devices3;
         if (strategy == STRATEGY_MEDIA) {
             // ARC, SPDIF and AUX_LINE can co-exist with others.
             devices3 = availableOutputDevices.getDevicesFromTypes({
-                    AUDIO_DEVICE_OUT_HDMI_ARC, AUDIO_DEVICE_OUT_SPDIF, AUDIO_DEVICE_OUT_AUX_LINE});
+                    AUDIO_DEVICE_OUT_HDMI_ARC, AUDIO_DEVICE_OUT_HDMI_EARC,
+                    AUDIO_DEVICE_OUT_SPDIF, AUDIO_DEVICE_OUT_AUX_LINE,
+                    });
         }
 
         devices2.add(devices3);
@@ -374,9 +545,21 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
             devices.remove(devices.getDevicesFromType(AUDIO_DEVICE_OUT_SPEAKER));
         }
 
-        // for STRATEGY_SONIFICATION:
+        bool mediaActiveLocally =
+                outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_MUSIC),
+                                        SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY)
+                || outputs.isActiveLocally(
+                    toVolumeSource(AUDIO_STREAM_ACCESSIBILITY),
+                    SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY);
+
+        bool ringActiveLocally = outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_RING), 0);
+        // - for STRATEGY_SONIFICATION and ringtone active:
         // if SPEAKER was selected, and SPEAKER_SAFE is available, use SPEAKER_SAFE instead
-        if (strategy == STRATEGY_SONIFICATION) {
+        // - for STRATEGY_SONIFICATION_RESPECTFUL:
+        // if no media is playing on the device, check for mandatory use of "safe" speaker
+        // when media would have played on speaker, and the safe speaker path is available
+        if (strategy == STRATEGY_SONIFICATION || ringActiveLocally
+            || (strategy == STRATEGY_SONIFICATION_RESPECTFUL && !mediaActiveLocally)) {
             devices.replaceDevicesByType(
                     AUDIO_DEVICE_OUT_SPEAKER,
                     availableOutputDevices.getDevicesFromType(
@@ -388,26 +571,61 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
         devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_TELEPHONY_TX);
         break;
 
+    case STRATEGY_NONE:
+        // Happens when internal strategies are processed ("rerouting", "patch"...)
+        break;
+
     default:
-        ALOGW("getDevicesForStrategy() unknown strategy: %d", strategy);
+        ALOGW("%s unknown strategy: %d", __func__, strategy);
         break;
     }
 
     if (devices.isEmpty()) {
-        ALOGV("getDevicesForStrategy() no device found for strategy %d", strategy);
+        ALOGI("%s no device found for strategy %d", __func__, strategy);
         sp<DeviceDescriptor> defaultOutputDevice = getApmObserver()->getDefaultOutputDevice();
         if (defaultOutputDevice != nullptr) {
             devices.add(defaultOutputDevice);
         }
         ALOGE_IF(devices.isEmpty(),
-                 "getDevicesForStrategy() no default device defined");
+                 "%s no default device defined", __func__);
     }
 
-    ALOGVV("getDevices ForStrategy() strategy %d, device %s",
+    ALOGVV("%s strategy %d, device %s", __func__,
            strategy, dumpDeviceTypes(devices.types()).c_str());
     return devices;
 }
 
+DeviceVector Engine::getPreferredAvailableDevicesForInputSource(
+            const DeviceVector& availableInputDevices, audio_source_t inputSource) const {
+    DeviceVector preferredAvailableDevVec = {};
+    AudioDeviceTypeAddrVector preferredDevices;
+    const status_t status = getDevicesForRoleAndCapturePreset(
+            inputSource, DEVICE_ROLE_PREFERRED, preferredDevices);
+    if (status == NO_ERROR) {
+        // Only use preferred devices when they are all available.
+        preferredAvailableDevVec =
+                availableInputDevices.getDevicesFromDeviceTypeAddrVec(preferredDevices);
+        if (preferredAvailableDevVec.size() == preferredDevices.size()) {
+            ALOGVV("%s using pref device %s for source %u",
+                   __func__, preferredAvailableDevVec.toString().c_str(), inputSource);
+            return preferredAvailableDevVec;
+        }
+    }
+    return preferredAvailableDevVec;
+}
+
+DeviceVector Engine::getDisabledDevicesForInputSource(
+            const DeviceVector& availableInputDevices, audio_source_t inputSource) const {
+    DeviceVector disabledDevices = {};
+    AudioDeviceTypeAddrVector disabledDevicesTypeAddr;
+    const status_t status = getDevicesForRoleAndCapturePreset(
+            inputSource, DEVICE_ROLE_DISABLED, disabledDevicesTypeAddr);
+    if (status == NO_ERROR) {
+        disabledDevices =
+                availableInputDevices.getDevicesFromDeviceTypeAddrVec(disabledDevicesTypeAddr);
+    }
+    return disabledDevices;
+}
 
 sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource) const
 {
@@ -431,12 +649,27 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
         case AUDIO_SOURCE_HOTWORD:
         case AUDIO_SOURCE_CAMCORDER:
         case AUDIO_SOURCE_VOICE_PERFORMANCE:
+        case AUDIO_SOURCE_ULTRASOUND:
             inputSource = AUDIO_SOURCE_VOICE_COMMUNICATION;
             break;
         default:
             break;
         }
     }
+
+    // Use the preferred device for the input source if it is available.
+    DeviceVector preferredInputDevices = getPreferredAvailableDevicesForInputSource(
+            availableDevices, inputSource);
+    if (!preferredInputDevices.isEmpty()) {
+        // Currently, only support single device for input. The public JAVA API also only
+        // support setting single device as preferred device. In that case, returning the
+        // first device is OK here.
+        return preferredInputDevices[0];
+    }
+    // Remove the disabled device for the input source from the available input device list.
+    DeviceVector disabledInputDevices = getDisabledDevicesForInputSource(
+            availableDevices, inputSource);
+    availableDevices.remove(disabledInputDevices);
 
     audio_devices_t commDeviceType =
         getPreferredDeviceTypeForLegacyStrategy(availableOutputDevices, STRATEGY_PHONE);
@@ -453,7 +686,7 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
             if (device != nullptr) break;
         }
         device = availableDevices.getFirstExistingDevice({
-                AUDIO_DEVICE_IN_BLE_HEADSET, AUDIO_DEVICE_IN_WIRED_HEADSET,
+                AUDIO_DEVICE_IN_WIRED_HEADSET,
                 AUDIO_DEVICE_IN_USB_HEADSET, AUDIO_DEVICE_IN_USB_DEVICE,
                 AUDIO_DEVICE_IN_BLUETOOTH_BLE, AUDIO_DEVICE_IN_BUILTIN_MIC});
         break;
@@ -464,8 +697,11 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
         if ((getPhoneState() == AUDIO_MODE_IN_CALL) &&
                 (availableOutputDevices.getDevice(AUDIO_DEVICE_OUT_TELEPHONY_TX,
                         String8(""), AUDIO_FORMAT_DEFAULT)) == nullptr) {
-            LOG_ALWAYS_FATAL_IF(availablePrimaryDevices.isEmpty(), "Primary devices not found");
-            availableDevices = availablePrimaryDevices;
+            if (!availablePrimaryDevices.isEmpty()) {
+                availableDevices = availablePrimaryDevices;
+            } else {
+                ALOGE("%s, AUDIO_SOURCE_VOICE_COMMUNICATION: Primary devices not found", __func__);
+            }
         }
 
         if (audio_is_bluetooth_out_sco_device(commDeviceType)) {
@@ -477,21 +713,26 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
             }
         }
         switch (commDeviceType) {
+        case AUDIO_DEVICE_OUT_SPEAKER:
+            device = availableDevices.getFirstExistingDevice({
+                    AUDIO_DEVICE_IN_BACK_MIC, AUDIO_DEVICE_IN_BUILTIN_MIC,
+                    AUDIO_DEVICE_IN_USB_DEVICE, AUDIO_DEVICE_IN_USB_HEADSET});
+            break;
         case AUDIO_DEVICE_OUT_BLE_HEADSET:
             device = availableDevices.getDevice(
                     AUDIO_DEVICE_IN_BLE_HEADSET, String8(""), AUDIO_FORMAT_DEFAULT);
-            break;
-        case AUDIO_DEVICE_OUT_SPEAKER:
-            device = availableDevices.getFirstExistingDevice({
-                    AUDIO_DEVICE_IN_BACK_MIC, AUDIO_DEVICE_IN_BUILTIN_MIC});
-            break;
+            if (device != nullptr) {
+                break;
+            }
+            ALOGE("%s LE Audio selected for communication but input device not available",
+                    __func__);
+            FALLTHROUGH_INTENDED;
         default:    // FORCE_NONE
             device = availableDevices.getFirstExistingDevice({
                     AUDIO_DEVICE_IN_WIRED_HEADSET, AUDIO_DEVICE_IN_USB_HEADSET,
                     AUDIO_DEVICE_IN_USB_DEVICE, AUDIO_DEVICE_IN_BLUETOOTH_BLE,
                     AUDIO_DEVICE_IN_BUILTIN_MIC});
             break;
-
         }
         break;
 
@@ -506,7 +747,7 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
         // because sometimes user want to do voice search by bt remote
         // even if BUILDIN_MIC is available.
         device = availableDevices.getFirstExistingDevice({
-                AUDIO_DEVICE_IN_BLE_HEADSET, AUDIO_DEVICE_IN_WIRED_HEADSET,
+                AUDIO_DEVICE_IN_WIRED_HEADSET,
                 AUDIO_DEVICE_IN_USB_HEADSET, AUDIO_DEVICE_IN_USB_DEVICE,
                 AUDIO_DEVICE_IN_BLUETOOTH_BLE, AUDIO_DEVICE_IN_BUILTIN_MIC});
 
@@ -514,15 +755,18 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
     case AUDIO_SOURCE_HOTWORD:
         // We should not use primary output criteria for Hotword but rather limit
         // to devices attached to the same HW module as the build in mic
-        LOG_ALWAYS_FATAL_IF(availablePrimaryDevices.isEmpty(), "Primary devices not found");
-        availableDevices = availablePrimaryDevices;
+        if (!availablePrimaryDevices.isEmpty()) {
+            availableDevices = availablePrimaryDevices;
+        } else {
+            ALOGE("%s, AUDIO_SOURCE_HOTWORD: Primary devices not found", __func__);
+        }
         if (audio_is_bluetooth_out_sco_device(commDeviceType)) {
             device = availableDevices.getDevice(
                     AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET, String8(""), AUDIO_FORMAT_DEFAULT);
             if (device != nullptr) break;
         }
         device = availableDevices.getFirstExistingDevice({
-                AUDIO_DEVICE_IN_BLE_HEADSET, AUDIO_DEVICE_IN_WIRED_HEADSET,
+                AUDIO_DEVICE_IN_WIRED_HEADSET,
                 AUDIO_DEVICE_IN_USB_HEADSET, AUDIO_DEVICE_IN_USB_DEVICE,
                 AUDIO_DEVICE_IN_BUILTIN_MIC});
         break;
@@ -556,6 +800,10 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
         device = availableDevices.getDevice(
                 AUDIO_DEVICE_IN_ECHO_REFERENCE, String8(""), AUDIO_FORMAT_DEFAULT);
         break;
+    case AUDIO_SOURCE_ULTRASOUND:
+        device = availableDevices.getFirstExistingDevice({
+                AUDIO_DEVICE_IN_BUILTIN_MIC, AUDIO_DEVICE_IN_BACK_MIC});
+        break;
     default:
         ALOGW("getDeviceForInputSource() invalid input source %d", inputSource);
         break;
@@ -574,15 +822,9 @@ sp<DeviceDescriptor> Engine::getDeviceForInputSource(audio_source_t inputSource)
     return device;
 }
 
-void Engine::updateDeviceSelectionCache()
-{
-    for (const auto &iter : getProductStrategies()) {
-        const auto& strategy = iter.second;
-        auto devices = getDevicesForProductStrategy(strategy->getId());
-        mDevicesForStrategies[strategy->getId()] = devices;
-        strategy->setDeviceTypes(devices.types());
-        strategy->setDeviceAddress(devices.getFirstValidAddress().c_str());
-    }
+void Engine::setStrategyDevices(const sp<ProductStrategy>& strategy, const DeviceVector &devices) {
+    strategy->setDeviceTypes(devices.types());
+    strategy->setDeviceAddress(devices.getFirstValidAddress().c_str());
 }
 
 product_strategy_t Engine::getProductStrategyFromLegacy(legacy_strategy legacyStrategy) const {
@@ -605,35 +847,20 @@ audio_devices_t Engine::getPreferredDeviceTypeForLegacyStrategy(
     return AUDIO_DEVICE_NONE;
 }
 
-DeviceVector Engine::getPreferredAvailableDevicesForProductStrategy(
-        const DeviceVector& availableOutputDevices, product_strategy_t strategy) const {
-    DeviceVector preferredAvailableDevVec = {};
-    AudioDeviceTypeAddrVector preferredStrategyDevices;
-    const status_t status = getDevicesForRoleAndStrategy(
-            strategy, DEVICE_ROLE_PREFERRED, preferredStrategyDevices);
-    if (status == NO_ERROR) {
-        // there is a preferred device, is it available?
-        preferredAvailableDevVec =
-                availableOutputDevices.getDevicesFromDeviceTypeAddrVec(preferredStrategyDevices);
-        if (preferredAvailableDevVec.size() == preferredAvailableDevVec.size()) {
-            ALOGVV("%s using pref device %s for strategy %u",
-                   __func__, preferredAvailableDevVec.toString().c_str(), strategy);
-            return preferredAvailableDevVec;
-        }
-    }
-    return preferredAvailableDevVec;
-}
-
 DeviceVector Engine::getDevicesForProductStrategy(product_strategy_t strategy) const {
-    DeviceVector availableOutputDevices = getApmObserver()->getAvailableOutputDevices();
+    const SwAudioOutputCollection& outputs = getApmObserver()->getOutputs();
+
+    // Take context into account to remap product strategy before
+    // checking preferred device for strategy and applying default routing rules
+    strategy = remapStrategyFromContext(strategy, outputs);
+
     auto legacyStrategy = mLegacyStrategyMap.find(strategy) != end(mLegacyStrategyMap) ?
                           mLegacyStrategyMap.at(strategy) : STRATEGY_NONE;
 
-    // When not in call, STRATEGY_PHONE and STRATEGY_DTMF follow STRATEGY_MEDIA
-    if (!isInCall() && (legacyStrategy == STRATEGY_PHONE || legacyStrategy == STRATEGY_DTMF)) {
-        legacyStrategy = STRATEGY_MEDIA;
-        strategy = getProductStrategyFromLegacy(STRATEGY_MEDIA);
-    }
+    DeviceVector availableOutputDevices = getApmObserver()->getAvailableOutputDevices();
+
+    filterOutputDevicesForStrategy(legacyStrategy, availableOutputDevices, outputs);
+
     // check if this strategy has a preferred device that is available,
     // if yes, give priority to it.
     DeviceVector preferredAvailableDevVec =
@@ -642,12 +869,14 @@ DeviceVector Engine::getDevicesForProductStrategy(product_strategy_t strategy) c
         return preferredAvailableDevVec;
     }
 
-    DeviceVector availableInputDevices = getApmObserver()->getAvailableInputDevices();
-    const SwAudioOutputCollection& outputs = getApmObserver()->getOutputs();
+    // Remove all disabled devices from the available device list.
+    DeviceVector disabledDevVec =
+            getDisabledDevicesForProductStrategy(availableOutputDevices, strategy);
+    availableOutputDevices.remove(disabledDevVec);
 
     return getDevicesForStrategyInt(legacyStrategy,
                                     availableOutputDevices,
-                                    availableInputDevices, outputs);
+                                    outputs);
 }
 
 DeviceVector Engine::getOutputDevicesForAttributes(const audio_attributes_t &attributes,
@@ -683,6 +912,8 @@ DeviceVector Engine::getOutputDevicesForStream(audio_stream_type_t stream, bool 
 }
 
 sp<DeviceDescriptor> Engine::getInputDeviceForAttributes(const audio_attributes_t &attr,
+                                                         uid_t uid,
+                                                         audio_session_t session,
                                                          sp<AudioPolicyMix> *mix) const
 {
     const auto &policyMixes = getApmObserver()->getAudioPolicyMixCollection();
@@ -702,7 +933,11 @@ sp<DeviceDescriptor> Engine::getInputDeviceForAttributes(const audio_attributes_
         return device;
     }
 
-    device = policyMixes.getDeviceAndMixForInputSource(attr.source, availableInputDevices, mix);
+    device = policyMixes.getDeviceAndMixForInputSource(attr,
+                                                       availableInputDevices,
+                                                       uid,
+                                                       session,
+                                                       mix);
     if (device != nullptr) {
         return device;
     }
@@ -725,7 +960,4 @@ sp<DeviceDescriptor> Engine::getInputDeviceForAttributes(const audio_attributes_
                                            AUDIO_FORMAT_DEFAULT);
 }
 
-} // namespace audio_policy
-} // namespace android
-
-
+} // namespace android::audio_policy

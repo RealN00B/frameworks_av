@@ -18,8 +18,16 @@
 #define ANDROID_SERVERS_CAMERA3_SHARED_OUTPUT_STREAM_H
 
 #include <array>
-#include "Camera3StreamSplitter.h"
+
+#include "Flags.h"
+
 #include "Camera3OutputStream.h"
+
+#if USE_NEW_STREAM_SPLITTER
+#include "Camera3StreamSplitter.h"
+#else
+#include "deprecated/DeprecatedCamera3StreamSplitter.h"
+#endif  // USE_NEW_STREAM_SPLITTER
 
 namespace android {
 
@@ -36,12 +44,22 @@ public:
     Camera3SharedOutputStream(int id, const std::vector<sp<Surface>>& surfaces,
             uint32_t width, uint32_t height, int format,
             uint64_t consumerUsage, android_dataspace dataSpace,
-            camera3_stream_rotation_t rotation, nsecs_t timestampOffset,
-            const String8& physicalCameraId,
+            camera_stream_rotation_t rotation, nsecs_t timestampOffset,
+            const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed, IPCTransport transport,
             int setId = CAMERA3_STREAM_SET_ID_INVALID,
-            bool useHalBufManager = false);
+            bool useHalBufManager = false,
+            int64_t dynamicProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            bool deviceTimeBaseIsRealtime = false,
+            int timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            int mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO,
+            int32_t colorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            bool useReadoutTimestamp = false);
 
     virtual ~Camera3SharedOutputStream();
+
+    void setHalBufferManager(bool enabled) override;
 
     virtual status_t notifyBufferReleased(ANativeWindowBuffer *buffer);
 
@@ -77,7 +95,7 @@ private:
 
     // Whether HAL is in control for buffer management. Surface sharing behavior
     // depends on this flag.
-    const bool mUseHalBufManager;
+    bool mUseHalBufManager;
 
     // Pair of an output Surface and its unique ID
     typedef std::pair<sp<Surface>, size_t> SurfaceUniqueId;
@@ -96,8 +114,11 @@ private:
      * The Camera3StreamSplitter object this stream uses for stream
      * sharing.
      */
+#if USE_NEW_STREAM_SPLITTER
     sp<Camera3StreamSplitter> mStreamSplitter;
-
+#else
+    sp<DeprecatedCamera3StreamSplitter> mStreamSplitter;
+#endif  // USE_NEW_STREAM_SPLITTER
     /**
      * Initialize stream splitter.
      */
@@ -116,7 +137,7 @@ private:
     /**
      * Internal Camera3Stream interface
      */
-    virtual status_t getBufferLocked(camera3_stream_buffer *buffer,
+    virtual status_t getBufferLocked(camera_stream_buffer *buffer,
             const std::vector<size_t>& surface_ids);
 
     virtual status_t queueBufferToConsumer(sp<ANativeWindow>& consumer,
@@ -127,7 +148,7 @@ private:
 
     virtual status_t disconnectLocked();
 
-    virtual status_t getEndpointUsage(uint64_t *usage) const;
+    virtual status_t getEndpointUsage(uint64_t *usage);
 
 }; // class Camera3SharedOutputStream
 

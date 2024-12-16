@@ -27,6 +27,7 @@ package {
 
 cc_test {
     name: "HEVCUtilsUnitTest",
+    test_suites: ["device-tests"],
     gtest: true,
 
     srcs: [
@@ -41,10 +42,6 @@ cc_test {
     static_libs: [
         "libstagefright",
         "libstagefright_foundation",
-    ],
-
-    include_dirs: [
-        "frameworks/av/media/libstagefright",
     ],
 
     cflags: [

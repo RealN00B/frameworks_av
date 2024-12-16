@@ -19,10 +19,12 @@
 #include <utils/Log.h>
 
 #include <atomic>
+#include <inttypes.h>
 #include <iomanip>
 #include <iostream>
 #include <stdint.h>
 
+#include <com_android_media_aaudio.h>
 #include <utils/String16.h>
 #include <media/nbaio/AudioStreamOutSink.h>
 #include <media/MmapStreamInterface.h>
@@ -82,11 +84,12 @@ aaudio_result_t AAudioServiceStreamMMAP::open(const aaudio::AAudioStreamRequest 
 }
 
 // Start the flow of data.
-aaudio_result_t AAudioServiceStreamMMAP::startDevice() {
-    aaudio_result_t result = AAudioServiceStreamBase::startDevice();
+aaudio_result_t AAudioServiceStreamMMAP::startDevice_l() {
+    aaudio_result_t result = AAudioServiceStreamBase::startDevice_l();
     if (!mInService && result == AAUDIO_OK) {
         // Note that this can sometimes take 200 to 300 msec for a cold start!
-        result = startClient(mMmapClient, nullptr /*const audio_attributes_t* */, &mClientHandle);
+        result = startClient_l(
+                mMmapClient, nullptr /*const audio_attributes_t* */, &mClientHandle);
     }
     return result;
 }
@@ -99,7 +102,7 @@ aaudio_result_t AAudioServiceStreamMMAP::pause_l() {
     aaudio_result_t result = AAudioServiceStreamBase::pause_l();
     // TODO put before base::pause()?
     if (!mInService) {
-        (void) stopClient(mClientHandle);
+        (void) stopClient_l(mClientHandle);
     }
     return result;
 }
@@ -111,14 +114,76 @@ aaudio_result_t AAudioServiceStreamMMAP::stop_l() {
     aaudio_result_t result = AAudioServiceStreamBase::stop_l();
     // TODO put before base::stop()?
     if (!mInService) {
-        (void) stopClient(mClientHandle);
+        (void) stopClient_l(mClientHandle);
+    }
+    return result;
+}
+
+aaudio_result_t AAudioServiceStreamMMAP::standby_l() {
+    sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+    if (endpoint == nullptr) {
+        ALOGE("%s() has no endpoint", __func__);
+        return AAUDIO_ERROR_INVALID_STATE;
+    }
+    aaudio_result_t result = endpoint->standby();
+    if (result == AAUDIO_OK) {
+        setStandby_l(true);
+    }
+    return result;
+}
+
+aaudio_result_t AAudioServiceStreamMMAP::exitStandby_l(AudioEndpointParcelable* parcelable) {
+    sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+    if (endpoint == nullptr) {
+        ALOGE("%s() has no endpoint", __func__);
+        return AAUDIO_ERROR_INVALID_STATE;
+    }
+    aaudio_result_t result = endpoint->exitStandby(parcelable);
+    if (result == AAUDIO_OK) {
+        setStandby_l(false);
+    } else {
+        ALOGE("%s failed, result %d, disconnecting stream.", __func__, result);
+        disconnect_l();
     }
     return result;
 }
 
 aaudio_result_t AAudioServiceStreamMMAP::startClient(const android::AudioClient& client,
                                                      const audio_attributes_t *attr,
-                                                     audio_port_handle_t *clientHandle) {
+                                                     audio_port_handle_t *portHandlePtr) {
+    if (com::android::media::aaudio::start_stop_client_from_command_thread()) {
+        return sendStartClientCommand(client, attr, portHandlePtr);
+    } else {
+        sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+        if (endpoint == nullptr) {
+            ALOGE("%s() has no endpoint", __func__);
+            return AAUDIO_ERROR_INVALID_STATE;
+        }
+        // Start the client on behalf of the application. Generate a new porthandle.
+        aaudio_result_t result = endpoint->startClient(client, attr, portHandlePtr);
+        ALOGD("%s() flag off, got port %d", __func__,
+              ((portHandlePtr == nullptr) ? -1 : *portHandlePtr));
+        return result;
+    }
+}
+
+aaudio_result_t AAudioServiceStreamMMAP::stopClient(audio_port_handle_t clientHandle) {
+    if (com::android::media::aaudio::start_stop_client_from_command_thread()) {
+        return sendStopClientCommand(clientHandle);
+    } else {
+        sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+        if (endpoint == nullptr) {
+            ALOGE("%s() has no endpoint", __func__);
+            return AAUDIO_ERROR_INVALID_STATE;
+        }
+        aaudio_result_t result = endpoint->stopClient(clientHandle);
+        return result;
+    }
+}
+
+aaudio_result_t AAudioServiceStreamMMAP::startClient_l(const android::AudioClient& client,
+                                                       const audio_attributes_t *attr,
+                                                       audio_port_handle_t *clientHandle) {
     sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
     if (endpoint == nullptr) {
         ALOGE("%s() has no endpoint", __func__);
@@ -129,7 +194,7 @@ aaudio_result_t AAudioServiceStreamMMAP::startClient(const android::AudioClient&
     return result;
 }
 
-aaudio_result_t AAudioServiceStreamMMAP::stopClient(audio_port_handle_t clientHandle) {
+aaudio_result_t AAudioServiceStreamMMAP::stopClient_l(audio_port_handle_t clientHandle) {
     sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
     if (endpoint == nullptr) {
         ALOGE("%s() has no endpoint", __func__);
@@ -140,7 +205,7 @@ aaudio_result_t AAudioServiceStreamMMAP::stopClient(audio_port_handle_t clientHa
 }
 
 // Get free-running DSP or DMA hardware position from the HAL.
-aaudio_result_t AAudioServiceStreamMMAP::getFreeRunningPosition(int64_t *positionFrames,
+aaudio_result_t AAudioServiceStreamMMAP::getFreeRunningPosition_l(int64_t *positionFrames,
                                                                   int64_t *timeNanos) {
     sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
     if (endpoint == nullptr) {
@@ -157,15 +222,15 @@ aaudio_result_t AAudioServiceStreamMMAP::getFreeRunningPosition(int64_t *positio
         *positionFrames = timestamp.getPosition();
         *timeNanos = timestamp.getNanoseconds();
     } else if (result != AAUDIO_ERROR_UNAVAILABLE) {
-        disconnect();
+        disconnect_l();
     }
     return result;
 }
 
-// Get timestamp that was written by getFreeRunningPosition()
-aaudio_result_t AAudioServiceStreamMMAP::getHardwareTimestamp(int64_t *positionFrames,
+// Get timestamp from presentation position.
+// If it fails, get timestamp that was written by getFreeRunningPosition()
+aaudio_result_t AAudioServiceStreamMMAP::getHardwareTimestamp_l(int64_t *positionFrames,
                                                                 int64_t *timeNanos) {
-
     sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
     if (endpoint == nullptr) {
         ALOGE("%s() has no endpoint", __func__);
@@ -174,7 +239,17 @@ aaudio_result_t AAudioServiceStreamMMAP::getHardwareTimestamp(int64_t *positionF
     sp<AAudioServiceEndpointMMAP> serviceEndpointMMAP =
             static_cast<AAudioServiceEndpointMMAP *>(endpoint.get());
 
-    // TODO Get presentation timestamp from the HAL
+    uint64_t position;
+    aaudio_result_t result = serviceEndpointMMAP->getExternalPosition(&position, timeNanos);
+    if (result == AAUDIO_OK) {
+        ALOGV("%s() getExternalPosition() says pos = %" PRIi64 ", time = %" PRIi64,
+                __func__, position, *timeNanos);
+        *positionFrames = (int64_t) position;
+        return AAUDIO_OK;
+    } else {
+        ALOGV("%s() getExternalPosition() returns error %d", __func__, result);
+    }
+
     if (mAtomicStreamTimestamp.isValid()) {
         Timestamp timestamp = mAtomicStreamTimestamp.read();
         *positionFrames = timestamp.getPosition();
@@ -186,8 +261,8 @@ aaudio_result_t AAudioServiceStreamMMAP::getHardwareTimestamp(int64_t *positionF
 }
 
 // Get an immutable description of the data queue from the HAL.
-aaudio_result_t AAudioServiceStreamMMAP::getAudioDataDescription(
-        AudioEndpointParcelable &parcelable)
+aaudio_result_t AAudioServiceStreamMMAP::getAudioDataDescription_l(
+        AudioEndpointParcelable* parcelable)
 {
     sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
     if (endpoint == nullptr) {
@@ -197,4 +272,26 @@ aaudio_result_t AAudioServiceStreamMMAP::getAudioDataDescription(
     sp<AAudioServiceEndpointMMAP> serviceEndpointMMAP =
             static_cast<AAudioServiceEndpointMMAP *>(endpoint.get());
     return serviceEndpointMMAP->getDownDataDescription(parcelable);
+}
+
+int64_t AAudioServiceStreamMMAP::nextDataReportTime_l() {
+    sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+    if (endpoint == nullptr) {
+        ALOGE("%s() has no endpoint", __func__);
+        return std::numeric_limits<int64_t>::max();
+    }
+    sp<AAudioServiceEndpointMMAP> serviceEndpointMMAP =
+            static_cast<AAudioServiceEndpointMMAP *>(endpoint.get());
+    return serviceEndpointMMAP->nextDataReportTime();
+}
+
+void AAudioServiceStreamMMAP::reportData_l() {
+    sp<AAudioServiceEndpoint> endpoint = mServiceEndpointWeak.promote();
+    if (endpoint == nullptr) {
+        ALOGE("%s() has no endpoint", __func__);
+        return;
+    }
+    sp<AAudioServiceEndpointMMAP> serviceEndpointMMAP =
+            static_cast<AAudioServiceEndpointMMAP *>(endpoint.get());
+    return serviceEndpointMMAP->reportData();
 }

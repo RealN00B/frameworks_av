@@ -20,10 +20,15 @@
 #include <unistd.h>
 
 #include <android/content/pm/IPackageManagerNative.h>
+#include <android-base/thread_annotations.h>
 #include <binder/IMemory.h>
 #include <binder/PermissionController.h>
 #include <cutils/multiuser.h>
 #include <private/android_filesystem_config.h>
+#include <system/audio-hal-enums.h>
+#include <android/content/AttributionSourceState.h>
+#include <binder/PermissionController.h>
+#include <android/permission/PermissionChecker.h>
 
 #include <map>
 #include <optional>
@@ -32,6 +37,8 @@
 #include <vector>
 
 namespace android {
+
+using content::AttributionSourceState;
 
 // Audio permission utilities
 
@@ -55,6 +62,7 @@ static inline bool isAudioServerOrRootUid(uid_t uid) {
 
 // Used for calls that should come from system server or internal.
 // Note: system server is multiprocess for multiple users.  audioserver is not.
+// Note: if this method is modified, also update the same method in SensorService.h.
 static inline bool isAudioServerOrSystemServerUid(uid_t uid) {
     return multiuser_get_app_id(uid) == AID_SYSTEM || uid == AID_AUDIOSERVER;
 }
@@ -78,21 +86,37 @@ static inline bool isAudioServerOrMediaServerUid(uid_t uid) {
     }
 }
 
-bool recordingAllowed(const String16& opPackageName, pid_t pid, uid_t uid);
-bool startRecording(const String16& opPackageName, pid_t pid, uid_t uid, bool isHotwordSource);
-void finishRecording(const String16& opPackageName, uid_t uid, bool isHotwordSource);
-bool captureAudioOutputAllowed(pid_t pid, uid_t uid);
-bool captureMediaOutputAllowed(pid_t pid, uid_t uid);
-bool captureVoiceCommunicationOutputAllowed(pid_t pid, uid_t uid);
-bool captureHotwordAllowed(const String16& opPackageName, pid_t pid, uid_t uid);
+bool recordingAllowed(const AttributionSourceState& attributionSource,
+        audio_source_t source = AUDIO_SOURCE_DEFAULT);
+
+bool recordingAllowed(const AttributionSourceState &attributionSource,
+                      uint32_t virtualDeviceId,
+                      audio_source_t source);
+int startRecording(const AttributionSourceState& attributionSource, uint32_t virtualDeviceId,
+                    const String16& msg, audio_source_t source);
+void finishRecording(const AttributionSourceState& attributionSource, uint32_t virtualDeviceId,
+                     audio_source_t source);
+std::optional<AttributionSourceState> resolveAttributionSource(
+    const AttributionSourceState& callerAttributionSource, uint32_t virtualDeviceId);
+bool captureAudioOutputAllowed(const AttributionSourceState& attributionSource);
+bool captureMediaOutputAllowed(const AttributionSourceState& attributionSource);
+bool captureTunerAudioInputAllowed(const AttributionSourceState& attributionSource);
+bool captureVoiceCommunicationOutputAllowed(const AttributionSourceState& attributionSource);
+bool accessUltrasoundAllowed(const AttributionSourceState& attributionSource);
+bool captureHotwordAllowed(const AttributionSourceState& attributionSource);
 bool settingsAllowed();
 bool modifyAudioRoutingAllowed();
-bool modifyAudioRoutingAllowed(pid_t pid, uid_t uid);
+bool modifyAudioRoutingAllowed(const AttributionSourceState& attributionSource);
 bool modifyDefaultAudioEffectsAllowed();
-bool modifyDefaultAudioEffectsAllowed(pid_t pid, uid_t uid);
+bool modifyDefaultAudioEffectsAllowed(const AttributionSourceState& attributionSource);
 bool dumpAllowed();
-bool modifyPhoneStateAllowed(pid_t pid, uid_t uid);
-bool bypassInterruptionPolicyAllowed(pid_t pid, uid_t uid);
+bool modifyPhoneStateAllowed(const AttributionSourceState& attributionSource);
+bool bypassInterruptionPolicyAllowed(const AttributionSourceState& attributionSource);
+bool callAudioInterceptionAllowed(const AttributionSourceState& attributionSource);
+void purgePermissionCache();
+int32_t getOpForSource(audio_source_t source);
+
+AttributionSourceState getCallingAttributionSource();
 
 status_t checkIMemory(const sp<IMemory>& iMemory);
 
@@ -112,7 +136,7 @@ private:
     std::optional<bool> doIsAllowed(uid_t uid);
     sp<content::pm::IPackageManagerNative> retrievePackageManager();
     sp<content::pm::IPackageManagerNative> mPackageManager; // To check apps manifest
-    uint_t mPackageManagerErrors = 0;
+    unsigned int mPackageManagerErrors = 0;
     struct Package {
         std::string name;
         bool playbackCaptureAllowed = false;
@@ -144,12 +168,18 @@ public:
      *
      * \param uid is the uid of the app or service.
      */
-    Info getInfo(uid_t uid);
+    std::shared_ptr<const Info> getCachedInfo(uid_t uid);
+
+    /* return a singleton */
+    static UidInfo& getUidInfo();
+
+    /* returns a non-null pointer to a const Info struct */
+    static std::shared_ptr<const Info> getInfo(uid_t uid);
 
 private:
     std::mutex mLock;
     // TODO: use concurrent hashmap with striped lock.
-    std::unordered_map<uid_t, Info> mInfoMap; // GUARDED_BY(mLock)
+    std::unordered_map<uid_t, std::shared_ptr<const Info>> mInfoMap GUARDED_BY(mLock);
 };
 
 } // namespace mediautils

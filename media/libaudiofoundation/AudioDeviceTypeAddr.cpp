@@ -15,14 +15,18 @@
  */
 
 #include <media/AudioDeviceTypeAddr.h>
-
 #include <arpa/inet.h>
 #include <iostream>
 #include <regex>
 #include <set>
 #include <sstream>
 
+#include <media/AidlConversion.h>
+
 namespace android {
+
+using media::audio::common::AudioDevice;
+using media::audio::common::AudioDeviceAddress;
 
 namespace {
 
@@ -96,10 +100,13 @@ void AudioDeviceTypeAddr::reset() {
 
 std::string AudioDeviceTypeAddr::toString(bool includeSensitiveInfo) const {
     std::stringstream sstream;
-    sstream << "type:0x" << std::hex << mType;
+    sstream << audio_device_to_string(mType);
+    if (sstream.str().empty()) {
+        sstream << "unknown type:0x" << std::hex << mType;
+    }
     // IP and MAC address are sensitive information. The sensitive information will be suppressed
     // is `includeSensitiveInfo` is false.
-    sstream << ",@:"
+    sstream << ", @:"
             << (!includeSensitiveInfo && mIsAddressSensitive ? SUPPRESSED : mAddress);
     return sstream.str();
 }
@@ -143,6 +150,20 @@ AudioDeviceTypeAddrVector excludeDeviceTypeAddrsFrom(
     return remainedDevices;
 }
 
+AudioDeviceTypeAddrVector joinDeviceTypeAddrs(
+        const AudioDeviceTypeAddrVector& devices,
+        const AudioDeviceTypeAddrVector& devicesToJoin) {
+    std::set<AudioDeviceTypeAddr> devicesSet(devices.begin(), devices.end());
+    std::set<AudioDeviceTypeAddr> devicesToJoinSet(devicesToJoin.begin(), devicesToJoin.end());
+    AudioDeviceTypeAddrVector joinedDevices;
+
+    std::set_union(devicesSet.begin(), devicesSet.end(),
+                   devicesToJoinSet.begin(), devicesToJoinSet.end(),
+                   std::back_inserter(joinedDevices));
+
+    return joinedDevices;
+}
+
 std::string dumpAudioDeviceTypeAddrVector(const AudioDeviceTypeAddrVector& deviceTypeAddrs,
                                           bool includeSensitiveInfo) {
     std::stringstream stream;
@@ -153,6 +174,19 @@ std::string dumpAudioDeviceTypeAddrVector(const AudioDeviceTypeAddrVector& devic
         stream << it->toString(includeSensitiveInfo);
     }
     return stream.str();
+}
+
+ConversionResult<AudioDeviceTypeAddr>
+aidl2legacy_AudioDeviceTypeAddress(const AudioDevice& aidl) {
+    audio_devices_t type;
+    std::string address;
+    RETURN_IF_ERROR(aidl2legacy_AudioDevice_audio_device(aidl, &type, &address));
+    return AudioDeviceTypeAddr(type, address);
+}
+
+ConversionResult<AudioDevice>
+legacy2aidl_AudioDeviceTypeAddress(const AudioDeviceTypeAddr& legacy) {
+    return legacy2aidl_audio_device_AudioDevice(legacy.mType, legacy.getAddress());
 }
 
 } // namespace android

@@ -14,7 +14,7 @@
      limitations under the License.
 -->
 
-<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+<audioPolicyConfiguration version="7.0" xmlns:xi="http://www.w3.org/2001/XInclude">
     <globalConfiguration speaker_drc_enabled="true"/>
 
     <modules>
@@ -30,7 +30,7 @@
                     <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
                              samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
                 </mixPort>
-                <mixPort name="primary input" role="sink">
+                <mixPort name="primary input" role="sink"  maxActiveCount="1" maxOpenCount="1">
                     <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
                              samplingRates="48000"
                              channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
@@ -41,16 +41,39 @@
                 </mixPort>
                 <mixPort name="mixport_bt_hfp_input" role="sink">
                     <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
-                             samplingRates="8000,11025,16000,44100,48000"
-                             channelMasks="AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_MONO"/>
+                             samplingRates="8000 11025 16000 44100 48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO AUDIO_CHANNEL_IN_MONO"/>
                 </mixPort>
+                <mixPort name="voip_tx" role="sink"
+                         flags="AUDIO_INPUT_FLAG_VOIP_TX">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000 16000 32000 48000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </mixPort>
+                <mixPort name="voip_rx" role="source"
+                         flags="AUDIO_OUTPUT_FLAG_VOIP_RX">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                           samplingRates="8000 16000 32000 48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="hifi_output" role="source" flags="AUDIO_OUTPUT_FLAG_BIT_PERFECT"/>
+                <mixPort name="mmap_no_irq_out" role="source"
+                         flags="AUDIO_OUTPUT_FLAG_DIRECT AUDIO_OUTPUT_FLAG_MMAP_NOIRQ">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus_input" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                        samplingRates="48000"
+                        channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+                <mixPort name="hifi_input" role="sink" />
             </mixPorts>
             <devicePorts>
                 <devicePort tagName="Speaker" type="AUDIO_DEVICE_OUT_SPEAKER" role="sink">
                 </devicePort>
                 <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source">
                 </devicePort>
-                <devicePort tagName="Hdmi" type="AUDIO_DEVICE_OUT_HDMI" role="sink">
+                <devicePort tagName="Hdmi" type="AUDIO_DEVICE_OUT_HDMI" role="sink"
+                            encodedFormats="AUDIO_FORMAT_AC3">
                 </devicePort>
                 <devicePort tagName="Hdmi-In Mic" type="AUDIO_DEVICE_IN_HDMI" role="source">
                 </devicePort>
@@ -60,18 +83,37 @@
                 <devicePort tagName="BT SCO Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET"
                             role="source" address="hfp_client_in">
                 </devicePort>
+                <devicePort tagName="BT A2DP Out" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP" role="sink"
+                            encodedFormats="AUDIO_FORMAT_LDAC AUDIO_FORMAT_APTX AUDIO_FORMAT_APTX_HD AUDIO_FORMAT_AAC AUDIO_FORMAT_SBC">
+                </devicePort>
+                <devicePort tagName="USB Device Out" type="AUDIO_DEVICE_OUT_USB_DEVICE" role="sink">
+                </devicePort>
+                <devicePort tagName="USB Device In" type="AUDIO_DEVICE_IN_USB_DEVICE" role="source">
+                </devicePort>
+                <devicePort tagName="BUS Device In" type="AUDIO_DEVICE_IN_BUS" role="source" address="BUS00_MIC">
+                </devicePort>
             </devicePorts>
             <routes>
                 <route type="mix" sink="Speaker"
-                       sources="primary output"/>
+                       sources="primary output,voip_rx"/>
                 <route type="mix" sink="primary input"
-                       sources="Built-In Mic,Hdmi-In Mic"/>
+                       sources="Built-In Mic,Hdmi-In Mic,USB Device In"/>
+                <route type="mix" sink="voip_tx"
+                       sources="Built-In Mic,USB Device In"/>
                 <route type="mix" sink="Hdmi"
                        sources="primary output"/>
                 <route type="mix" sink="BT SCO"
-                       sources="mixport_bt_hfp_output"/>
+                       sources="mixport_bt_hfp_output,voip_rx"/>
                 <route type="mix" sink="mixport_bt_hfp_input"
                        sources="BT SCO Headset Mic"/>
+                <route type="mix" sink="BT A2DP Out"
+                       sources="primary output,hifi_output"/>
+                <route type="mix" sink="USB Device Out"
+                       sources="primary output,hifi_output,mmap_no_irq_out"/>
+                <route type="mix" sink="mixport_bus_input"
+                    sources="BUS Device In"/>
+                <route type="mix" sink="hifi_input"
+                        sources="USB Device In" />
             </routes>
         </module>
 

@@ -32,11 +32,6 @@ cc_test {
         "liblog",
     ],
 
-    include_dirs: [
-        "frameworks/av/media/libstagefright",
-        "frameworks/av/media/libstagefright/include",
-    ],
-
     cflags: [
         "-Werror",
         "-Wall",
@@ -59,4 +54,21 @@ cc_test {
         "-Werror",
         "-Wall",
     ],
+}
+
+cc_test {
+    name: "VideoRenderQualityTracker_test",
+    srcs: ["VideoRenderQualityTracker_test.cpp"],
+
+    shared_libs: [
+        "libbase",
+        "liblog",
+        "libstagefright",
+    ],
+
+    cflags: [
+        "-Werror",
+        "-Wall",
+    ],
+
 }

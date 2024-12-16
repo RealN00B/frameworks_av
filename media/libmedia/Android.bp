@@ -19,15 +19,21 @@ cc_library_headers {
     name: "libmedia_headers",
     vendor_available: true,
     min_sdk_version: "29",
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media.swcodec",
+    ],
 
     export_include_dirs: ["include"],
     header_libs: [
+        "av-headers",
         "libbase_headers",
         "libgui_headers",
         "libstagefright_headers",
         "media_plugin_headers",
     ],
     export_header_lib_headers: [
+        "av-headers",
         "libgui_headers",
         "libstagefright_headers",
         "media_plugin_headers",
@@ -72,34 +78,9 @@ filegroup {
     path: "aidl",
 }
 
-filegroup {
-    name: "resourcemanager_aidl",
-    srcs: [
-        "aidl/android/media/IResourceManagerClient.aidl",
-        "aidl/android/media/IResourceManagerService.aidl",
-        "aidl/android/media/MediaResourceType.aidl",
-        "aidl/android/media/MediaResourceSubType.aidl",
-        "aidl/android/media/MediaResourceParcel.aidl",
-        "aidl/android/media/MediaResourcePolicyParcel.aidl",
-    ],
-    path: "aidl",
-}
-
-aidl_interface {
-    name: "resourcemanager_aidl_interface",
-    unstable: true,
-    local_include_dir: "aidl",
-    srcs: [
-        ":resourcemanager_aidl",
-    ],
-}
-
 cc_library_shared {
     name: "libmedia_omx",
     vendor_available: true,
-    vndk: {
-        enabled: true,
-    },
     double_loadable: true,
 
     srcs: [
@@ -234,6 +215,10 @@ cc_library_static {
     name: "libmedia_midiiowrapper",
 
     min_sdk_version: "29",
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media",
+    ],
 
     srcs: ["MidiIoWrapper.cpp"],
 
@@ -270,6 +255,45 @@ cc_library_static {
 }
 
 cc_library_shared {
+    name: "libmedia_codeclist_capabilities",
+
+    srcs: [
+        "AudioCapabilities.cpp",
+        "CodecCapabilities.cpp",
+        "CodecCapabilitiesUtils.cpp",
+    ],
+
+    local_include_dirs: [
+        "include",
+    ],
+
+    shared_libs: [
+        "libbinder",
+        "liblog",
+        "libstagefright_foundation",
+        "libutils",
+    ],
+
+    export_include_dirs: [
+        "include",
+    ],
+
+    cflags: [
+        "-Werror",
+        "-Wno-error=deprecated-declarations",
+        "-Wall",
+    ],
+
+    sanitize: {
+        misc_undefined: [
+            "unsigned-integer-overflow",
+            "signed-integer-overflow",
+        ],
+        cfi: true,
+    },
+}
+
+cc_library_shared {
     name: "libmedia_codeclist",
 
     srcs: [
@@ -285,12 +309,13 @@ cc_library_shared {
         "android.hardware.media.omx@1.0",
         "libbinder",
         "liblog",
+        "libmedia_codeclist_capabilities",
         "libstagefright_foundation",
         "libutils",
     ],
 
-    include_dirs: [
-        "system/libhidl/transport/token/1.0/utils/include",
+    static_libs: [
+        "android.media.codec-aconfig-cc",
     ],
 
     export_include_dirs: [
@@ -314,6 +339,10 @@ cc_library_shared {
 
 cc_library {
     name: "libmedia",
+
+    defaults: [
+        "latest_android_media_audio_common_types_cpp_shared",
+    ],
 
     srcs: [
         ":mediaextractorservice_aidl",
@@ -367,9 +396,10 @@ cc_library {
 
     shared_libs: [
         "android.hidl.token@1.0-utils",
+        "audioclient-types-aidl-cpp",
+        "av-types-aidl-cpp",
         "liblog",
         "libcutils",
-        "libprocessgroup",
         "libutils",
         "libbinder",
         "libbinder_ndk",
@@ -383,22 +413,25 @@ cc_library {
         "libaudioclient",
         "libmedia_codeclist",
         "libmedia_omx",
+        "framework-permission-aidl-cpp",
     ],
 
     export_shared_lib_headers: [
         "libaudioclient",
         "libbinder",
-        "libandroidicu",
         //"libsonivox",
         "libmedia_omx",
+        "framework-permission-aidl-cpp",
     ],
 
     static_libs: [
-        "resourcemanager_aidl_interface-ndk_platform",
+        "resourcemanager_aidl_interface-ndk",
+        "framework-permission-aidl-cpp",
     ],
 
     export_static_lib_headers: [
-        "resourcemanager_aidl_interface-ndk_platform",
+        "resourcemanager_aidl_interface-ndk",
+        "framework-permission-aidl-cpp",
     ],
 
     export_include_dirs: [
@@ -452,5 +485,8 @@ cc_library_static {
         },
     },
 
-    apex_available: ["com.android.media"],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media",
+    ],
 }

@@ -17,6 +17,8 @@
 #ifndef ANDROID_HARDWARE_CAMERA2_OUTPUTCONFIGURATION_H
 #define ANDROID_HARDWARE_CAMERA2_OUTPUTCONFIGURATION_H
 
+#include <string>
+
 #include <gui/IGraphicBufferProducer.h>
 #include <binder/Parcelable.h>
 
@@ -33,20 +35,52 @@ public:
 
     static const int INVALID_ROTATION;
     static const int INVALID_SET_ID;
-    enum SurfaceType{
+    enum SurfaceType {
         SURFACE_TYPE_UNKNOWN = -1,
         SURFACE_TYPE_SURFACE_VIEW = 0,
-        SURFACE_TYPE_SURFACE_TEXTURE = 1
+        SURFACE_TYPE_SURFACE_TEXTURE = 1,
+        SURFACE_TYPE_MEDIA_RECORDER = 2,
+        SURFACE_TYPE_MEDIA_CODEC = 3,
+        SURFACE_TYPE_IMAGE_READER = 4
     };
+    enum TimestampBaseType {
+        TIMESTAMP_BASE_DEFAULT = 0,
+        TIMESTAMP_BASE_SENSOR = 1,
+        TIMESTAMP_BASE_MONOTONIC = 2,
+        TIMESTAMP_BASE_REALTIME = 3,
+        TIMESTAMP_BASE_CHOREOGRAPHER_SYNCED = 4,
+        TIMESTAMP_BASE_MAX = TIMESTAMP_BASE_CHOREOGRAPHER_SYNCED,
+    };
+    enum MirrorModeType {
+        MIRROR_MODE_AUTO = 0,
+        MIRROR_MODE_NONE = 1,
+        MIRROR_MODE_H = 2,
+        MIRROR_MODE_V = 3,
+    };
+
     const std::vector<sp<IGraphicBufferProducer>>& getGraphicBufferProducers() const;
     int                        getRotation() const;
     int                        getSurfaceSetID() const;
     int                        getSurfaceType() const;
     int                        getWidth() const;
     int                        getHeight() const;
+    int64_t                    getDynamicRangeProfile() const;
+    int32_t                    getColorSpace() const;
     bool                       isDeferred() const;
     bool                       isShared() const;
-    String16                   getPhysicalCameraId() const;
+    std::string                getPhysicalCameraId() const;
+    bool                       isMultiResolution() const;
+    int64_t                    getStreamUseCase() const;
+    int                        getTimestampBase() const;
+    int                        getMirrorMode() const;
+    bool                       useReadoutTimestamp() const;
+    int                        getFormat() const;
+    int                        getDataspace() const;
+    int64_t                    getUsage() const;
+    bool                       isComplete() const;
+
+    // set of sensor pixel mode resolutions allowed {MAX_RESOLUTION, DEFAULT_MODE};
+    const std::vector<int32_t>&            getSensorPixelModesUsed() const;
     /**
      * Keep impl up-to-date with OutputConfiguration.java in frameworks/base
      */
@@ -65,13 +99,13 @@ public:
     OutputConfiguration(const android::Parcel& parcel);
 
     OutputConfiguration(sp<IGraphicBufferProducer>& gbp, int rotation,
-            const String16& physicalCameraId,
+            const std::string& physicalCameraId,
             int surfaceSetID = INVALID_SET_ID, bool isShared = false);
 
     OutputConfiguration(const std::vector<sp<IGraphicBufferProducer>>& gbps,
-                        int rotation, const String16& physicalCameraId,
+                        int rotation, const std::string& physicalCameraId,
                         int surfaceSetID = INVALID_SET_ID,
-                        int surfaceType = OutputConfiguration::SURFACE_TYPE_UNKNOWN, int width = 0,
+                        int surfaceType = SURFACE_TYPE_UNKNOWN, int width = 0,
                         int height = 0, bool isShared = false);
 
     bool operator == (const OutputConfiguration& other) const {
@@ -83,7 +117,18 @@ public:
                 mIsDeferred == other.mIsDeferred &&
                 mIsShared == other.mIsShared &&
                 gbpsEqual(other) &&
-                mPhysicalCameraId == other.mPhysicalCameraId );
+                mPhysicalCameraId == other.mPhysicalCameraId &&
+                mIsMultiResolution == other.mIsMultiResolution &&
+                sensorPixelModesUsedEqual(other) &&
+                mDynamicRangeProfile == other.mDynamicRangeProfile &&
+                mColorSpace == other.mColorSpace &&
+                mStreamUseCase == other.mStreamUseCase &&
+                mTimestampBase == other.mTimestampBase &&
+                mMirrorMode == other.mMirrorMode &&
+                mUseReadoutTimestamp == other.mUseReadoutTimestamp &&
+                mFormat == other.mFormat &&
+                mDataspace == other.mDataspace &&
+                mUsage == other.mUsage);
     }
     bool operator != (const OutputConfiguration& other) const {
         return !(*this == other);
@@ -114,13 +159,49 @@ public:
         if (mPhysicalCameraId != other.mPhysicalCameraId) {
             return mPhysicalCameraId < other.mPhysicalCameraId;
         }
+        if (mIsMultiResolution != other.mIsMultiResolution) {
+            return mIsMultiResolution < other.mIsMultiResolution;
+        }
+        if (!sensorPixelModesUsedEqual(other)) {
+            return sensorPixelModesUsedLessThan(other);
+        }
+        if (mDynamicRangeProfile != other.mDynamicRangeProfile) {
+            return mDynamicRangeProfile < other.mDynamicRangeProfile;
+        }
+        if (mColorSpace != other.mColorSpace) {
+            return mColorSpace < other.mColorSpace;
+        }
+        if (mStreamUseCase != other.mStreamUseCase) {
+            return mStreamUseCase < other.mStreamUseCase;
+        }
+        if (mTimestampBase != other.mTimestampBase) {
+            return mTimestampBase < other.mTimestampBase;
+        }
+        if (mMirrorMode != other.mMirrorMode) {
+            return mMirrorMode < other.mMirrorMode;
+        }
+        if (mUseReadoutTimestamp != other.mUseReadoutTimestamp) {
+            return mUseReadoutTimestamp < other.mUseReadoutTimestamp;
+        }
+        if (mFormat != other.mFormat) {
+            return mFormat < other.mFormat;
+        }
+        if (mDataspace != other.mDataspace) {
+            return mDataspace < other.mDataspace;
+        }
+        if (mUsage != other.mUsage) {
+            return mUsage < other.mUsage;
+        }
         return gbpsLessThan(other);
     }
+
     bool operator > (const OutputConfiguration& other) const {
         return (*this != other && !(*this < other));
     }
 
     bool gbpsEqual(const OutputConfiguration& other) const;
+    bool sensorPixelModesUsedEqual(const OutputConfiguration& other) const;
+    bool sensorPixelModesUsedLessThan(const OutputConfiguration& other) const;
     bool gbpsLessThan(const OutputConfiguration& other) const;
     void addGraphicProducer(sp<IGraphicBufferProducer> gbp) {mGbps.push_back(gbp);}
 private:
@@ -132,7 +213,18 @@ private:
     int                        mHeight;
     bool                       mIsDeferred;
     bool                       mIsShared;
-    String16                   mPhysicalCameraId;
+    std::string                mPhysicalCameraId;
+    bool                       mIsMultiResolution;
+    std::vector<int32_t>       mSensorPixelModesUsed;
+    int64_t                    mDynamicRangeProfile;
+    int32_t                    mColorSpace;
+    int64_t                    mStreamUseCase;
+    int                        mTimestampBase;
+    int                        mMirrorMode;
+    bool                       mUseReadoutTimestamp;
+    int                        mFormat;
+    int                        mDataspace;
+    int64_t                    mUsage;
 };
 } // namespace params
 } // namespace camera2

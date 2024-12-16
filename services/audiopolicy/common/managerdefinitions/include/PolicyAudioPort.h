@@ -36,7 +36,7 @@ class AudioRoute;
 class PolicyAudioPort : public virtual RefBase, private HandleGenerator<audio_port_handle_t>
 {
 public:
-    PolicyAudioPort() : mFlags(AUDIO_OUTPUT_FLAG_NONE) {}
+    PolicyAudioPort() = default;
 
     virtual ~PolicyAudioPort() = default;
 
@@ -44,23 +44,10 @@ public:
 
     bool equals(const sp<PolicyAudioPort> &right) const
     {
-        return getTagName() == right->getTagName();
+        return right != 0 && getTagName() == right->getTagName();
     }
 
     virtual sp<AudioPort> asAudioPort() const = 0;
-
-    virtual void setFlags(uint32_t flags)
-    {
-        //force direct flag if offload flag is set: offloading implies a direct output stream
-        // and all common behaviors are driven by checking only the direct flag
-        // this should normally be set appropriately in the policy configuration file
-        if (asAudioPort()->getRole() == AUDIO_PORT_ROLE_SOURCE &&
-                (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) != 0) {
-            flags |= AUDIO_OUTPUT_FLAG_DIRECT;
-        }
-        mFlags = flags;
-    }
-    uint32_t getFlags() const { return mFlags; }
 
     virtual void attach(const sp<HwModule>& module);
     virtual void detach();
@@ -69,8 +56,13 @@ public:
     // Audio port IDs are in a different namespace than AudioFlinger unique IDs
     static audio_port_handle_t getNextUniqueId();
 
-    // searches for an exact match
+    // searches for an exact match, note that this method use `audio_formats_match` from policy.h,
+    // which will consider PCM formats match if their bytes per sample are greater than 2.
     virtual status_t checkExactAudioProfile(const struct audio_port_config *config) const;
+
+    // searches for an identical match, unlike `checkExactAudioProfile` above, this will also
+    // require the formats to be exactly the same.
+    virtual status_t checkIdenticalAudioProfile(const struct audio_port_config *config) const;
 
     // searches for a compatible match, currently implemented for input
     // parameters are input|output, returned value is the best match.
@@ -105,22 +97,6 @@ public:
     const char *getModuleName() const;
     sp<HwModule> getModule() const { return mModule; }
 
-    inline bool isDirectOutput() const
-    {
-        return (asAudioPort()->getType() == AUDIO_PORT_TYPE_MIX) &&
-                (asAudioPort()->getRole() == AUDIO_PORT_ROLE_SOURCE) &&
-                (mFlags & (AUDIO_OUTPUT_FLAG_DIRECT | AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD));
-    }
-
-    inline bool isMmap() const
-    {
-        return (asAudioPort()->getType() == AUDIO_PORT_TYPE_MIX)
-                && (((asAudioPort()->getRole() == AUDIO_PORT_ROLE_SOURCE) &&
-                        ((mFlags & AUDIO_OUTPUT_FLAG_MMAP_NOIRQ) != 0))
-                    || ((asAudioPort()->getRole() == AUDIO_PORT_ROLE_SINK) &&
-                        ((mFlags & AUDIO_INPUT_FLAG_MMAP_NOIRQ) != 0)));
-    }
-
     void addRoute(const sp<AudioRoute> &route) { mRoutes.add(route); }
     const AudioRouteVector &getRoutes() const { return mRoutes; }
 
@@ -129,7 +105,12 @@ private:
                          const ChannelMaskSet &channelMasks) const;
     void pickSamplingRate(uint32_t &rate, const SampleRateSet &samplingRates) const;
 
-    uint32_t mFlags; // attribute flags mask (e.g primary output, direct output...).
+    status_t checkAudioProfile(const struct audio_port_config *config,
+                               std::function<status_t(const AudioProfileVector&,
+                                                      const uint32_t samplingRate,
+                                                      audio_channel_mask_t,
+                                                      audio_format_t)> checkProfile) const;
+
     sp<HwModule> mModule;     // audio HW module exposing this I/O stream
     AudioRouteVector mRoutes; // Routes involving this port
 };
@@ -141,27 +122,18 @@ public:
 
     virtual sp<PolicyAudioPort> getPolicyAudioPort() const = 0;
 
-    status_t validationBeforeApplyConfig(const struct audio_port_config *config) const;
-
-    void applyPolicyAudioPortConfig(const struct audio_port_config *config) {
-        if (config->config_mask & AUDIO_PORT_CONFIG_FLAGS) {
-            mFlags = config->flags;
-        }
+    status_t validationBeforeApplyConfig(const struct audio_port_config *config) const {
+        sp<PolicyAudioPort> policyAudioPort = getPolicyAudioPort();
+        return policyAudioPort ? policyAudioPort->checkExactAudioProfile(config) : NO_INIT;
     }
 
-    void toPolicyAudioPortConfig(
-            struct audio_port_config *dstConfig,
-            const struct audio_port_config *srcConfig = NULL) const;
-
-
-    virtual bool hasSameHwModuleAs(const sp<PolicyAudioPortConfig>& other) const {
+    bool hasSameHwModuleAs(const sp<PolicyAudioPortConfig>& other) const {
         return (other.get() != nullptr) && (other->getPolicyAudioPort().get() != nullptr) &&
                 (getPolicyAudioPort().get() != nullptr) &&
                 (other->getPolicyAudioPort()->getModuleHandle() ==
                         getPolicyAudioPort()->getModuleHandle());
     }
 
-    union audio_io_flags mFlags = { AUDIO_INPUT_FLAG_NONE };
 };
 
 } // namespace android

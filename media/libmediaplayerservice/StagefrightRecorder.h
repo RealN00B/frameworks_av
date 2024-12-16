@@ -26,8 +26,12 @@
 #include <system/audio.h>
 
 #include <media/hardware/MetadataBufferType.h>
+#include <media/stagefright/foundation/AString.h>
+#include <android/content/AttributionSourceState.h>
 
 namespace android {
+
+using content::AttributionSourceState;
 
 class Camera;
 class ICameraRecordingProxy;
@@ -42,9 +46,10 @@ class MediaProfiles;
 struct ALooper;
 
 struct StagefrightRecorder : public MediaRecorderBase {
-    explicit StagefrightRecorder(const String16 &opPackageName);
+    explicit StagefrightRecorder(const AttributionSourceState& attributionSource);
     virtual ~StagefrightRecorder();
     virtual status_t init();
+    virtual status_t setLogSessionId(const String8 &id);
     virtual status_t setAudioSource(audio_source_t as);
             status_t setPrivacySensitive(bool privacySensitive) override;
             status_t isPrivacySensitive(bool *privacySensitive) const override;
@@ -78,7 +83,7 @@ struct StagefrightRecorder : public MediaRecorderBase {
     virtual status_t getRoutedDeviceId(audio_port_handle_t* deviceId);
     virtual void setAudioDeviceCallback(const sp<AudioSystem::AudioDeviceCallback>& callback);
     virtual status_t enableAudioDeviceCallback(bool enabled);
-    virtual status_t getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+    virtual status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones);
     virtual status_t setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
     virtual status_t setPreferredMicrophoneFieldDimension(float zoom);
             status_t getPortId(audio_port_handle_t *portId) const override;
@@ -98,9 +103,6 @@ private:
     sp<IGraphicBufferProducer> mPreviewSurface;
     sp<PersistentSurface> mPersistentSurface;
     sp<IMediaRecorderClient> mListener;
-    String16 mClientName;
-    uid_t mClientUid;
-    pid_t mClientPid;
     sp<MediaWriter> mWriter;
     int mOutputFd;
     sp<AudioSource> mAudioSourceNode;
@@ -110,6 +112,7 @@ private:
     void flushAndResetMetrics(bool reinitialize);
     void updateMetrics();
 
+    AString mLogSessionId;
     audio_source_t mAudioSource;
     privacy_sensitive_t mPrivacySensitive;
     video_source mVideoSource;
@@ -150,6 +153,7 @@ private:
     int32_t mRTPCVOExtMap;
     int32_t mRTPCVODegrees;
     int32_t mRTPSockDscp;
+    int32_t mRTPSockOptEcn;
     int64_t mRTPSockNetwork;
     uint32_t mLastSeqNo;
 
@@ -244,6 +248,7 @@ private:
     status_t setRTPCVOExtMap(int32_t extmap);
     status_t setRTPCVODegrees(int32_t cvoDegrees);
     status_t setParamRtpDscp(int32_t dscp);
+    status_t setParamRtpEcn(int32_t ecn);
     status_t setSocketNetwork(int64_t networkHandle);
     status_t requestIDRFrame();
     void clipVideoBitRate();

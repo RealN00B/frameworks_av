@@ -18,7 +18,6 @@
 #define ANDROID_SERVERS_CAMERA_TRACES_H_
 
 #include <utils/Errors.h>
-#include <utils/String16.h>
 #include <utils/Vector.h>
 
 namespace android {
@@ -42,7 +41,7 @@ public:
      *
      * <p>Each line is indented by DUMP_INDENT spaces.</p>
      */
-    static status_t dump(int fd, const Vector<String16>& args);
+    static status_t dump(int fd);
 
 private:
     enum {

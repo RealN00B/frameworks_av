@@ -23,14 +23,16 @@
 #include "client/AudioStreamInternal.h"
 
 using android::sp;
-using android::IAAudioService;
 
 namespace aaudio {
 
 class AudioStreamInternalCapture : public AudioStreamInternal {
 public:
-    AudioStreamInternalCapture(AAudioServiceInterface  &serviceInterface, bool inService = false);
-    virtual ~AudioStreamInternalCapture();
+    explicit AudioStreamInternalCapture(AAudioServiceInterface  &serviceInterface,
+                                        bool inService = false);
+    virtual ~AudioStreamInternalCapture() = default;
+
+    aaudio_result_t open(const AudioStreamBuilder &builder) override;
 
     aaudio_result_t read(void *buffer,
                          int32_t numFrames,
@@ -46,7 +48,7 @@ public:
     }
 protected:
 
-    void advanceClientToMatchServerPosition() override;
+    void advanceClientToMatchServerPosition(int32_t serverOffset) override;
 
 /**
  * Low level data processing that will not block. It will just read or write as much as it can.

@@ -127,6 +127,51 @@ void XMLParseTest::setUpDatabase() {
     setCodecProperties("test8.encoder", true, 8, {}, {}, {}, "audio/opus",
                        {pair<string, string>("max-limit1", "limit1Max")}, {}, "");
 
+    setCodecProperties("test9.encoder", true, 9, {}, {}, {}, "video/avc",
+           {
+                   pair<string, string>("mapping-sure-before", "after"),
+           },
+           {}, "");
+
+    setCodecProperties("test10.encoder", true, 10, {}, {}, {}, "video/hevc",
+           {
+                   pair<string, string>("mapping-fire-from", "to"),
+           },
+           {}, "");
+    setCodecProperties("test11.encoder", true, 11, {}, {}, {}, "video/av01",
+           {
+                   pair<string, string>("tuning-hungry", "yes"),
+                   pair<string, string>("tuning-pi", "3.1415"),
+           },
+           {}, "");
+
+    // minsdk
+    setCodecProperties("test12.encoder", true, 12, {"attribute::disabled"}, {}, {}, "video/t12",
+           {
+                   pair<string, string>("tuning-enable-goal", "no"),
+           },
+           {}, "");
+    setCodecProperties("test13.encoder", true, 13, {"attribute::disabled"}, {}, {}, "video/t13",
+           {
+                   pair<string, string>("tuning-enable-goal", "no"),
+           },
+           {}, "");
+    setCodecProperties("test14.encoder", true, 14, {"attribute::disabled"}, {}, {}, "video/t14",
+           {
+                   pair<string, string>("tuning-enable-goal", "no"),
+           },
+           {}, "");
+    setCodecProperties("test15.encoder", true, 15, {}, {}, {}, "video/t15",
+           {
+                   pair<string, string>("tuning-enable-goal", "yes"),
+           },
+           {}, "");
+    setCodecProperties("test16.encoder", true, 16, {}, {}, {}, "video/t16",
+           {
+                   pair<string, string>("tuning-enable-goal", "yes"),
+           },
+           {}, "");
+
     setRoleProperties("audio_decoder.mp3", false, 1, "audio/mpeg", "test1.decoder",
                       {pair<string, string>("attribute::disabled", "present"),
                        pair<string, string>("rank", "4")});
@@ -161,6 +206,33 @@ void XMLParseTest::setUpDatabase() {
 
     setRoleProperties("audio_encoder.opus", true, 8, "audio/opus", "test8.encoder",
                       {pair<string, string>("max-limit1", "limit1Max")});
+
+    setRoleProperties("video_encoder.avc", true, 9, "video/avc", "test9.encoder",
+                       {pair<string, string>("mapping-sure-before", "after")});
+
+    setRoleProperties("video_encoder.hevc", true, 10, "video/hevc", "test10.encoder",
+                       { pair<string, string>("mapping-fire-from", "to")});
+
+    setRoleProperties("video_encoder.av01", true, 11, "video/av01", "test11.encoder",
+                       {pair<string, string>("tuning-hungry", "yes"),
+                        pair<string, string>("tuning-pi", "3.1415")
+                       });
+
+    // minsdk
+    setRoleProperties("video_encoder.t12", true, 12, "video/t12", "test12.encoder",
+                       {pair<string, string>("tuning-enable-goal", "no"),
+                        pair<string, string>("attribute::disabled", "present") });
+    setRoleProperties("video_encoder.t13", true, 13, "video/t13", "test13.encoder",
+                       {pair<string, string>("tuning-enable-goal", "no"),
+                        pair<string, string>("attribute::disabled", "present") });
+    setRoleProperties("video_encoder.t14", true, 14, "video/t14", "test14.encoder",
+                       {pair<string, string>("tuning-enable-goal", "no"),
+                        pair<string, string>("attribute::disabled", "present") });
+    setRoleProperties("video_encoder.t15", true, 15, "video/t15", "test15.encoder",
+                       {pair<string, string>("tuning-enable-goal", "yes")});
+    setRoleProperties("video_encoder.t16", true, 16, "video/t16", "test16.encoder",
+                       {pair<string, string>("tuning-enable-goal", "yes")});
+
 
     setServiceAttribute(
             {pair<string, string>("domain-telephony", "0"), pair<string, string>("domain-tv", "0"),

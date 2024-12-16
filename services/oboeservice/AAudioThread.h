@@ -18,7 +18,7 @@
 #define AAUDIO_THREAD_H
 
 #include <atomic>
-#include <pthread.h>
+#include <thread>
 
 #include <aaudio/AAudio.h>
 
@@ -29,7 +29,7 @@ namespace aaudio {
  */
 class Runnable {
 public:
-    Runnable() {};
+    Runnable() = default;
     virtual ~Runnable() = default;
 
     virtual void run() = 0;
@@ -37,7 +37,6 @@ public:
 
 /**
  * Abstraction for a host dependent thread.
- * TODO Consider using Android "Thread" class or std::thread instead.
  */
 class AAudioThread
 {
@@ -46,7 +45,7 @@ public:
 
     explicit AAudioThread(const char *prefix);
 
-    virtual ~AAudioThread() = default;
+    virtual ~AAudioThread();
 
     /**
      * Start the thread running.
@@ -73,7 +72,7 @@ private:
 
     Runnable    *mRunnable = nullptr;
     bool         mHasThread = false;
-    pthread_t    mThread; // initialized in constructor
+    std::thread  mThread;
 
     static std::atomic<uint32_t> mNextThreadIndex;
     char         mName[16]; // max length for a pthread_name

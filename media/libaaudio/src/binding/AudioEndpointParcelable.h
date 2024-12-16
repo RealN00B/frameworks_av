@@ -20,16 +20,13 @@
 #include <stdint.h>
 
 //#include <sys/mman.h>
+#include <aaudio/Endpoint.h>
 #include <android-base/unique_fd.h>
-#include <binder/Parcel.h>
-#include <binder/Parcelable.h>
 
 #include "binding/AAudioServiceDefinitions.h"
 #include "binding/RingBufferParcelable.h"
 
 using android::status_t;
-using android::Parcel;
-using android::Parcelable;
 
 namespace aaudio {
 
@@ -39,10 +36,15 @@ namespace aaudio {
  * It contains no addresses, just sizes, offsets and file descriptors for
  * shared memory that can be passed through Binder.
  */
-class AudioEndpointParcelable : public Parcelable {
+class AudioEndpointParcelable {
 public:
-    AudioEndpointParcelable();
-    virtual ~AudioEndpointParcelable();
+    AudioEndpointParcelable() = default;
+
+    // Ctor/assignment from a parcelable representation.
+    // Since the parcelable object owns unique FDs (for shared memory blocks), move semantics are
+    // provided to avoid the need to dupe.
+    explicit AudioEndpointParcelable(Endpoint&& parcelable);
+    AudioEndpointParcelable& operator=(Endpoint&& parcelable);
 
     /**
      * Add the file descriptor to the table.
@@ -50,15 +52,31 @@ public:
      */
     int32_t addFileDescriptor(const android::base::unique_fd& fd, int32_t sizeInBytes);
 
-    virtual status_t writeToParcel(Parcel* parcel) const override;
+    /**
+     * Close current data file descriptor. The duplicated file descriptor will be closed.
+     */
+    void closeDataFileDescriptor();
 
-    virtual status_t readFromParcel(const Parcel* parcel) override;
+    /**
+     * Update current data file descriptor with given endpoint parcelable.
+     * @param endpointParcelable an endpoint parcelable that contains new data file
+     *                           descriptor information
+     * @return AAUDIO_OK if the data file descriptor updates successfully.
+     *         AAUDIO_ERROR_OUT_OF_RANGE if there is not enough space for the shared memory.
+     */
+    aaudio_result_t updateDataFileDescriptor(AudioEndpointParcelable* endpointParcelable);
 
     aaudio_result_t resolve(EndpointDescriptor *descriptor);
+    aaudio_result_t resolveDataQueue(RingBufferDescriptor *descriptor);
 
     aaudio_result_t close();
 
     void dump();
+
+    // Extract a parcelable representation of this object.
+    // Since our shared memory objects own a unique FD, move semantics are provided to avoid the
+    // need to dupe.
+    Endpoint parcelable()&&;
 
 public: // TODO add getters
     // Set capacityInFrames to zero if Queue is unused.
@@ -68,9 +86,10 @@ public: // TODO add getters
     RingBufferParcelable    mDownDataQueueParcelable;    // eg. playback
 
 private:
-    aaudio_result_t         validate() const;
+    // Return the first available shared memory position. Return -1 if all shared memories are
+    // in use.
+    int32_t getNextAvailableSharedMemoryPosition() const;
 
-    int32_t                 mNumSharedMemories = 0;
     SharedMemoryParcelable  mSharedMemories[MAX_SHARED_MEMORIES];
 };
 

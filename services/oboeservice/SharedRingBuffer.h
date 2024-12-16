@@ -18,8 +18,9 @@
 #define AAUDIO_SHARED_RINGBUFFER_H
 
 #include <android-base/unique_fd.h>
-#include <stdint.h>
 #include <cutils/ashmem.h>
+#include <stdint.h>
+#include <string>
 #include <sys/mman.h>
 
 #include "fifo/FifoBuffer.h"
@@ -38,24 +39,34 @@ namespace aaudio {
  */
 class SharedRingBuffer {
 public:
-    SharedRingBuffer() {}
+    SharedRingBuffer() = default;
 
     virtual ~SharedRingBuffer();
 
     aaudio_result_t allocate(android::fifo_frames_t bytesPerFrame, android::fifo_frames_t capacityInFrames);
 
-    void fillParcelable(AudioEndpointParcelable &endpointParcelable,
+    void fillParcelable(AudioEndpointParcelable* endpointParcelable,
                         RingBufferParcelable &ringBufferParcelable);
 
-    android::FifoBuffer * getFifoBuffer() {
+    /**
+     * Return available frames as a fraction of the capacity.
+     * @return fullness between 0.0 and 1.0
+     */
+    double getFractionalFullness() const;
+
+    // dump: write# read# available
+    std::string dump() const;
+
+    std::shared_ptr<android::FifoBuffer> getFifoBuffer() {
         return mFifoBuffer;
     }
 
 private:
     android::base::unique_fd  mFileDescriptor;
-    android::FifoBuffer      *mFifoBuffer = nullptr;
-    uint8_t                  *mSharedMemory = nullptr;
+    std::shared_ptr<android::FifoBufferIndirect>  mFifoBuffer;
+    uint8_t                  *mSharedMemory = nullptr; // mmap
     int32_t                   mSharedMemorySizeInBytes = 0;
+    // size of memory used for data vs counters
     int32_t                   mDataMemorySizeInBytes = 0;
     android::fifo_frames_t    mCapacityInFrames = 0;
 };

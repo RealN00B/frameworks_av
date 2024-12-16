@@ -19,8 +19,10 @@
 
 #include <unordered_set>
 
+#include <camera/CameraMetadata.h>
+
 #include <gui/IConsumerListener.h>
-#include <gui/IProducerListener.h>
+#include <gui/Surface.h>
 #include <gui/BufferItemConsumer.h>
 
 #include <utils/Condition.h>
@@ -28,10 +30,10 @@
 #include <utils/StrongPointer.h>
 #include <utils/Timers.h>
 
-#define SP_LOGV(x, ...) ALOGV("[%s] " x, mConsumerName.string(), ##__VA_ARGS__)
-#define SP_LOGI(x, ...) ALOGI("[%s] " x, mConsumerName.string(), ##__VA_ARGS__)
-#define SP_LOGW(x, ...) ALOGW("[%s] " x, mConsumerName.string(), ##__VA_ARGS__)
-#define SP_LOGE(x, ...) ALOGE("[%s] " x, mConsumerName.string(), ##__VA_ARGS__)
+#define SP_LOGV(x, ...) ALOGV("[%s] " x, mConsumerName.c_str(), ##__VA_ARGS__)
+#define SP_LOGI(x, ...) ALOGI("[%s] " x, mConsumerName.c_str(), ##__VA_ARGS__)
+#define SP_LOGW(x, ...) ALOGW("[%s] " x, mConsumerName.c_str(), ##__VA_ARGS__)
+#define SP_LOGE(x, ...) ALOGE("[%s] " x, mConsumerName.c_str(), ##__VA_ARGS__)
 
 namespace android {
 
@@ -55,7 +57,8 @@ public:
     // with output surfaces.
     status_t connect(const std::unordered_map<size_t, sp<Surface>> &surfaces,
             uint64_t consumerUsage, uint64_t producerUsage, size_t halMaxBuffers, uint32_t width,
-            uint32_t height, android::PixelFormat format, sp<Surface>* consumer);
+            uint32_t height, android::PixelFormat format, sp<Surface>* consumer,
+            int64_t dynamicRangeProfile);
 
     // addOutput adds an output BufferQueue to the splitter. The splitter
     // connects to outputQueue as a CPU producer, and any buffers queued
@@ -90,6 +93,8 @@ public:
 
     // Disconnect the buffer queue from output surfaces.
     void disconnect();
+
+    void setHalBufferManager(bool enabled);
 
 private:
     // From IConsumerListener
@@ -154,7 +159,7 @@ private:
     // the IProducerListener::onBufferReleased callback is associated with. We
     // create one of these per output BufferQueue, and then pass the producer
     // into onBufferReleasedByOutput above.
-    class OutputListener : public BnProducerListener,
+    class OutputListener : public SurfaceListener,
                            public IBinder::DeathRecipient {
     public:
         OutputListener(wp<Camera3StreamSplitter> splitter,
@@ -163,6 +168,9 @@ private:
 
         // From IProducerListener
         void onBufferReleased() override;
+        bool needsReleaseNotify() override { return true; };
+        void onBuffersDiscarded(const std::vector<sp<GraphicBuffer>>& /*buffers*/) override {};
+        void onBufferDetached(int /*slot*/) override {}
 
         // From IBinder::DeathRecipient
         void binderDied(const wp<IBinder>& who) override;
@@ -219,7 +227,7 @@ private:
             const BufferItem& bufferItem, size_t surfaceId);
 
     // Get unique name for the buffer queue consumer
-    String8 getUniqueConsumerName();
+    std::string getUniqueConsumerName();
 
     // Helper function to get the BufferQueue slot where a particular buffer is attached to.
     int getSlotForOutputLocked(const sp<IGraphicBufferProducer>& gbp,
@@ -232,6 +240,7 @@ private:
     uint32_t mHeight = 0;
     android::PixelFormat mFormat = android::PIXEL_FORMAT_NONE;
     uint64_t mProducerUsage = 0;
+    int mDynamicRangeProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD;
 
     // The attachBuffer call will happen on different thread according to mUseHalBufManager and have
     // different timing constraint.
@@ -250,6 +259,9 @@ private:
 
     //Map surface ids -> gbp outputs
     std::unordered_map<int, sp<IGraphicBufferProducer> > mOutputs;
+
+    //Map surface ids -> gbp outputs
+    std::unordered_map<int, sp<Surface>> mOutputSurfaces;
 
     //Map surface ids -> consumer buffer count
     std::unordered_map<int, size_t > mConsumerBufferCount;
@@ -282,9 +294,9 @@ private:
     // Currently acquired input buffers
     size_t mAcquiredInputBuffers;
 
-    String8 mConsumerName;
+    std::string mConsumerName;
 
-    const bool mUseHalBufManager;
+    bool mUseHalBufManager;
 };
 
 } // namespace android

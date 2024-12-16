@@ -35,14 +35,14 @@
 
 #define FILEREAD_MAX_LAYERS 2
 
-#define DRC_DEFAULT_MOBILE_REF_LEVEL -16.0  /* 64*-0.25dB = -16 dB below full scale for mobile conf */
-#define DRC_DEFAULT_MOBILE_DRC_CUT   1.0 /* maximum compression of dynamic range for mobile conf */
-#define DRC_DEFAULT_MOBILE_DRC_BOOST 1.0 /* maximum compression of dynamic range for mobile conf */
-#define DRC_DEFAULT_MOBILE_DRC_HEAVY C2Config::DRC_COMPRESSION_HEAVY   /* switch for heavy compression for mobile conf */
+#define DRC_DEFAULT_MOBILE_REF_LEVEL 64  /* 64*-0.25dB = -16 dB below full scale for mobile conf */
+#define DRC_DEFAULT_MOBILE_DRC_CUT   127 /* maximum compression of dynamic range for mobile conf */
+#define DRC_DEFAULT_MOBILE_DRC_BOOST 127 /* maximum compression of dynamic range for mobile conf */
+#define DRC_DEFAULT_MOBILE_DRC_HEAVY 1   /* switch for heavy compression for mobile conf */
 #define DRC_DEFAULT_MOBILE_DRC_EFFECT 3  /* MPEG-D DRC effect type; 3 => Limited playback range */
 #define DRC_DEFAULT_MOBILE_DRC_ALBUM  0  /* MPEG-D DRC album mode; 0 => album mode is disabled, 1 => album mode is enabled */
 #define DRC_DEFAULT_MOBILE_OUTPUT_LOUDNESS (0.25) /* decoder output loudness; -1 => the value is unknown, otherwise dB step value (e.g. 64 for -16 dB) */
-#define DRC_DEFAULT_MOBILE_ENC_LEVEL (0.25) /* encoder target level; -1 => the value is unknown, otherwise dB step value (e.g. 64 for -16 dB) */
+#define DRC_DEFAULT_MOBILE_ENC_LEVEL (-1) /* encoder target level; -1 => the value is unknown, otherwise dB step value (e.g. 64 for -16 dB) */
 #define MAX_CHANNEL_COUNT            8  /* maximum number of audio channels that can be decoded */
 // names of properties that can be used to override the default DRC settings
 #define PROP_DRC_OVERRIDE_REF_LEVEL  "aac_drc_reference_level"
@@ -145,9 +145,13 @@ public:
                 .withSetter(ProfileLevelSetter)
                 .build());
 
+        C2Config::drc_compression_mode_t defaultCompressionMode =
+                property_get_int32(PROP_DRC_OVERRIDE_HEAVY, DRC_DEFAULT_MOBILE_DRC_HEAVY) == 1
+                        ? C2Config::DRC_COMPRESSION_HEAVY
+                        : C2Config::DRC_COMPRESSION_LIGHT;
         addParameter(
                 DefineParam(mDrcCompressMode, C2_PARAMKEY_DRC_COMPRESSION_MODE)
-                .withDefault(new C2StreamDrcCompressionModeTuning::input(0u, C2Config::DRC_COMPRESSION_HEAVY))
+                .withDefault(new C2StreamDrcCompressionModeTuning::input(0u, defaultCompressionMode))
                 .withFields({
                     C2F(mDrcCompressMode, value).oneOf({
                             C2Config::DRC_COMPRESSION_ODM_DEFAULT,
@@ -158,37 +162,48 @@ public:
                 .withSetter(Setter<decltype(*mDrcCompressMode)>::StrictValueWithNoDeps)
                 .build());
 
+
+        float defaultRefLevel = -0.25 * property_get_int32(PROP_DRC_OVERRIDE_REF_LEVEL,
+                                                           DRC_DEFAULT_MOBILE_REF_LEVEL);
         addParameter(
                 DefineParam(mDrcTargetRefLevel, C2_PARAMKEY_DRC_TARGET_REFERENCE_LEVEL)
-                .withDefault(new C2StreamDrcTargetReferenceLevelTuning::input(0u, DRC_DEFAULT_MOBILE_REF_LEVEL))
+                .withDefault(new C2StreamDrcTargetReferenceLevelTuning::input(0u, defaultRefLevel))
                 .withFields({C2F(mDrcTargetRefLevel, value).inRange(-31.75, 0.25)})
                 .withSetter(Setter<decltype(*mDrcTargetRefLevel)>::StrictValueWithNoDeps)
                 .build());
 
+        float defaultEncLevel = -0.25 * property_get_int32(PROP_DRC_OVERRIDE_ENC_LEVEL,
+                                                           DRC_DEFAULT_MOBILE_ENC_LEVEL);
         addParameter(
                 DefineParam(mDrcEncTargetLevel, C2_PARAMKEY_DRC_ENCODED_TARGET_LEVEL)
-                .withDefault(new C2StreamDrcEncodedTargetLevelTuning::input(0u, DRC_DEFAULT_MOBILE_ENC_LEVEL))
+                .withDefault(new C2StreamDrcEncodedTargetLevelTuning::input(0u, defaultEncLevel))
                 .withFields({C2F(mDrcEncTargetLevel, value).inRange(-31.75, 0.25)})
                 .withSetter(Setter<decltype(*mDrcEncTargetLevel)>::StrictValueWithNoDeps)
                 .build());
 
+        float defaultDrcBoost =
+                property_get_int32(PROP_DRC_OVERRIDE_BOOST, DRC_DEFAULT_MOBILE_DRC_BOOST) / 127.;
         addParameter(
                 DefineParam(mDrcBoostFactor, C2_PARAMKEY_DRC_BOOST_FACTOR)
-                .withDefault(new C2StreamDrcBoostFactorTuning::input(0u, DRC_DEFAULT_MOBILE_DRC_BOOST))
+                .withDefault(new C2StreamDrcBoostFactorTuning::input(0u, defaultDrcBoost))
                 .withFields({C2F(mDrcBoostFactor, value).inRange(0, 1.)})
                 .withSetter(Setter<decltype(*mDrcBoostFactor)>::StrictValueWithNoDeps)
                 .build());
 
+        float defaultDrcCut =
+                property_get_int32(PROP_DRC_OVERRIDE_CUT, DRC_DEFAULT_MOBILE_DRC_CUT) / 127.;
         addParameter(
                 DefineParam(mDrcAttenuationFactor, C2_PARAMKEY_DRC_ATTENUATION_FACTOR)
-                .withDefault(new C2StreamDrcAttenuationFactorTuning::input(0u, DRC_DEFAULT_MOBILE_DRC_CUT))
+                .withDefault(new C2StreamDrcAttenuationFactorTuning::input(0u, defaultDrcCut))
                 .withFields({C2F(mDrcAttenuationFactor, value).inRange(0, 1.)})
                 .withSetter(Setter<decltype(*mDrcAttenuationFactor)>::StrictValueWithNoDeps)
                 .build());
 
+        C2Config::drc_effect_type_t defaultDrcEffectType = (C2Config::drc_effect_type_t)
+                property_get_int32(PROP_DRC_OVERRIDE_EFFECT, DRC_DEFAULT_MOBILE_DRC_EFFECT);
         addParameter(
                 DefineParam(mDrcEffectType, C2_PARAMKEY_DRC_EFFECT_TYPE)
-                .withDefault(new C2StreamDrcEffectTypeTuning::input(0u, C2Config::DRC_EFFECT_LIMITED_PLAYBACK_RANGE))
+                .withDefault(new C2StreamDrcEffectTypeTuning::input(0u, defaultDrcEffectType))
                 .withFields({
                     C2F(mDrcEffectType, value).oneOf({
                             C2Config::DRC_EFFECT_ODM_DEFAULT,
@@ -220,6 +235,12 @@ public:
                 .withDefault(new C2StreamDrcOutputLoudnessTuning::output(0u, DRC_DEFAULT_MOBILE_OUTPUT_LOUDNESS))
                 .withFields({C2F(mDrcOutputLoudness, value).inRange(-57.75, 0.25)})
                 .withSetter(Setter<decltype(*mDrcOutputLoudness)>::StrictValueWithNoDeps)
+                .build());
+
+        addParameter(DefineParam(mChannelMask, C2_PARAMKEY_CHANNEL_MASK)
+                .withDefault(new C2StreamChannelMaskInfo::output(0u, 0))
+                .withFields({C2F(mChannelMask, value).inRange(0, 4294967292)})
+                .withSetter(Setter<decltype(*mChannelMask)>::StrictValueWithNoDeps)
                 .build());
     }
 
@@ -255,6 +276,7 @@ private:
     std::shared_ptr<C2StreamDrcAlbumModeTuning::input> mDrcAlbumMode;
     std::shared_ptr<C2StreamMaxChannelCountInfo::input> mMaxChannelCount;
     std::shared_ptr<C2StreamDrcOutputLoudnessTuning::output> mDrcOutputLoudness;
+    std::shared_ptr<C2StreamChannelMaskInfo::output> mChannelMask;
     // TODO Add : C2StreamAacSbrModeTuning
 };
 
@@ -268,7 +290,8 @@ C2SoftAacDec::C2SoftAacDec(
       mStreamInfo(nullptr),
       mSignalledError(false),
       mOutputPortDelay(kDefaultOutputPortDelay),
-      mOutputDelayRingBuffer(nullptr) {
+      mOutputDelayRingBuffer(nullptr),
+      mDeviceApiLevel(android_get_device_api_level()) {
 }
 
 C2SoftAacDec::~C2SoftAacDec() {
@@ -287,6 +310,7 @@ c2_status_t C2SoftAacDec::onStop() {
     mOutputDelayRingBufferWritePos = 0;
     mOutputDelayRingBufferReadPos = 0;
     mOutputDelayRingBufferFilled = 0;
+    mOutputDelayRingBuffer.reset();
     mBuffersInfo.clear();
 
     status_t status = UNKNOWN_ERROR;
@@ -308,10 +332,7 @@ void C2SoftAacDec::onRelease() {
         aacDecoder_Close(mAACDecoder);
         mAACDecoder = nullptr;
     }
-    if (mOutputDelayRingBuffer) {
-        delete[] mOutputDelayRingBuffer;
-        mOutputDelayRingBuffer = nullptr;
-    }
+    mOutputDelayRingBuffer.reset();
 }
 
 status_t C2SoftAacDec::initDecoder() {
@@ -327,7 +348,7 @@ status_t C2SoftAacDec::initDecoder() {
 
     mOutputDelayCompensated = 0;
     mOutputDelayRingBufferSize = 2048 * MAX_CHANNEL_COUNT * kNumDelayBlocksMax;
-    mOutputDelayRingBuffer = new short[mOutputDelayRingBufferSize];
+    mOutputDelayRingBuffer.reset(new short[mOutputDelayRingBufferSize]);
     mOutputDelayRingBufferWritePos = 0;
     mOutputDelayRingBufferReadPos = 0;
     mOutputDelayRingBufferFilled = 0;
@@ -831,9 +852,11 @@ void C2SoftAacDec::process(
 
                 C2StreamSampleRateInfo::output sampleRateInfo(0u, mStreamInfo->sampleRate);
                 C2StreamChannelCountInfo::output channelCountInfo(0u, mStreamInfo->numChannels);
+                C2StreamChannelMaskInfo::output channelMaskInfo(0u,
+                        maskFromCount(mStreamInfo->numChannels));
                 std::vector<std::unique_ptr<C2SettingResult>> failures;
                 c2_status_t err = mIntf->config(
-                        { &sampleRateInfo, &channelCountInfo },
+                        { &sampleRateInfo, &channelCountInfo, &channelMaskInfo },
                         C2_MAY_BLOCK,
                         &failures);
                 if (err == OK) {
@@ -842,6 +865,7 @@ void C2SoftAacDec::process(
                     C2FrameData &output = work->worklets.front()->output;
                     output.configUpdate.push_back(C2Param::Copy(sampleRateInfo));
                     output.configUpdate.push_back(C2Param::Copy(channelCountInfo));
+                    output.configUpdate.push_back(C2Param::Copy(channelMaskInfo));
                 } else {
                     ALOGE("Config Update failed");
                     mSignalledError = true;
@@ -883,7 +907,7 @@ void C2SoftAacDec::process(
             work->worklets.front()->output.configUpdate.push_back(
                     C2Param::Copy(currentBoostFactor));
 
-            if (android_get_device_api_level() < __ANDROID_API_S__) {
+            if (mDeviceApiLevel < __ANDROID_API_S__) {
                 // We used to report DRC compression mode in the output format
                 // in Q and R, but stopped doing that in S
                 C2StreamDrcCompressionModeTuning::input currentCompressMode(0u,
@@ -1055,6 +1079,47 @@ void C2SoftAacDec::drainDecoder() {
         outputDelayRingBufferPutSamples(tmpOutBuffer, tmpOutBufferSamples);
 
         mOutputDelayCompensated -= tmpOutBufferSamples;
+    }
+}
+
+// definitions based on android.media.AudioFormat.CHANNEL_OUT_*
+#define CHANNEL_OUT_FL  0x4
+#define CHANNEL_OUT_FR  0x8
+#define CHANNEL_OUT_FC  0x10
+#define CHANNEL_OUT_LFE 0x20
+#define CHANNEL_OUT_BL  0x40
+#define CHANNEL_OUT_BR  0x80
+#define CHANNEL_OUT_SL  0x800
+#define CHANNEL_OUT_SR  0x1000
+
+uint32_t C2SoftAacDec::maskFromCount(uint32_t channelCount) {
+    // KEY_CHANNEL_MASK expects masks formatted according to Java android.media.AudioFormat
+    // where the two left-most bits are 0 for output channel mask
+    switch (channelCount) {
+        case 1: // mono is front left
+            return (CHANNEL_OUT_FL);
+        case 2: // stereo
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FR);
+        case 4: // 4.0 = stereo with backs
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FC
+                    | CHANNEL_OUT_BL | CHANNEL_OUT_BR);
+        case 5: // 5.0
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FC | CHANNEL_OUT_FR
+                    | CHANNEL_OUT_BL | CHANNEL_OUT_BR);
+        case 6: // 5.1 = 5.0 + LFE
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FC | CHANNEL_OUT_FR
+                    | CHANNEL_OUT_BL | CHANNEL_OUT_BR
+                    | CHANNEL_OUT_LFE);
+        case 7: // 7.0 = 5.0 + Sides
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FC | CHANNEL_OUT_FR
+                    | CHANNEL_OUT_BL | CHANNEL_OUT_BR
+                    | CHANNEL_OUT_SL | CHANNEL_OUT_SR);
+        case 8: // 7.1 = 7.0 + LFE
+            return (CHANNEL_OUT_FL | CHANNEL_OUT_FC | CHANNEL_OUT_FR
+                    | CHANNEL_OUT_BL | CHANNEL_OUT_BR | CHANNEL_OUT_SL | CHANNEL_OUT_SR
+                    | CHANNEL_OUT_LFE);
+        default:
+            return 0;
     }
 }
 

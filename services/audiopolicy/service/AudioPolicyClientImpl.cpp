@@ -27,6 +27,18 @@ namespace android {
 
 /* implementation of the client interface from the policy manager */
 
+status_t AudioPolicyService::AudioPolicyClient::getAudioPolicyConfig(
+        media::AudioPolicyConfig *config)
+{
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == 0) {
+        ALOGW("%s: could not get AudioFlinger", __func__);
+        return AUDIO_MODULE_HANDLE_NONE;
+    }
+
+    return af->getAudioPolicyConfig(config);
+}
+
 audio_module_handle_t AudioPolicyService::AudioPolicyClient::loadHwModule(const char *name)
 {
     sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
@@ -40,17 +52,46 @@ audio_module_handle_t AudioPolicyService::AudioPolicyClient::loadHwModule(const 
 
 status_t AudioPolicyService::AudioPolicyClient::openOutput(audio_module_handle_t module,
                                                            audio_io_handle_t *output,
-                                                           audio_config_t *config,
+                                                           audio_config_t *halConfig,
+                                                           audio_config_base_t *mixerConfig,
                                                            const sp<DeviceDescriptorBase>& device,
                                                            uint32_t *latencyMs,
-                                                           audio_output_flags_t flags)
+                                                           audio_output_flags_t flags,
+                                                           audio_attributes_t attributes)
 {
     sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
     if (af == 0) {
         ALOGW("%s: could not get AudioFlinger", __func__);
         return PERMISSION_DENIED;
     }
-    return af->openOutput(module, output, config, device, latencyMs, flags);
+
+    media::OpenOutputRequest request;
+    media::OpenOutputResponse response;
+
+    request.module = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_module_handle_t_int32_t(module));
+    request.halConfig = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_config_t_AudioConfig(*halConfig, false /*isInput*/));
+    request.mixerConfig = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_config_base_t_AudioConfigBase(*mixerConfig, false /*isInput*/));
+    request.device = VALUE_OR_RETURN_STATUS(legacy2aidl_DeviceDescriptorBase(device));
+    request.flags = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_output_flags_t_int32_t_mask(flags));
+    request.attributes = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_attributes_t_AudioAttributes(attributes));
+
+    status_t status = af->openOutput(request, &response);
+    if (status == OK) {
+        *output = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_audio_io_handle_t(response.output));
+        *halConfig = VALUE_OR_RETURN_STATUS(
+                aidl2legacy_AudioConfig_audio_config_t(response.config, false /*isInput*/));
+        *latencyMs = VALUE_OR_RETURN_STATUS(convertIntegral<uint32_t>(response.latencyMs));
+
+        audio_config_base_t config = {.sample_rate = halConfig->sample_rate,
+            .channel_mask = halConfig->channel_mask,
+            .format = halConfig->format,
+        };
+        mAudioPolicyService->registerOutput(*output, config, flags);
+    }
+    return status;
 }
 
 audio_io_handle_t AudioPolicyService::AudioPolicyClient::openDuplicateOutput(
@@ -71,7 +112,7 @@ status_t AudioPolicyService::AudioPolicyClient::closeOutput(audio_io_handle_t ou
     if (af == 0) {
         return PERMISSION_DENIED;
     }
-
+    mAudioPolicyService->unregisterOutput(output);
     return af->closeOutput(output);
 }
 
@@ -111,7 +152,25 @@ status_t AudioPolicyService::AudioPolicyClient::openInput(audio_module_handle_t 
         return PERMISSION_DENIED;
     }
 
-    return af->openInput(module, input, config, device, address, source, flags);
+    AudioDeviceTypeAddr deviceTypeAddr(*device, address.c_str());
+
+    media::OpenInputRequest request;
+    request.module = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_module_handle_t_int32_t(module));
+    request.input = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_io_handle_t_int32_t(*input));
+    request.config = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_config_t_AudioConfig(*config, true /*isInput*/));
+    request.device = VALUE_OR_RETURN_STATUS(legacy2aidl_AudioDeviceTypeAddress(deviceTypeAddr));
+    request.source = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_source_t_AudioSource(source));
+    request.flags = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_input_flags_t_int32_t_mask(flags));
+
+    media::OpenInputResponse response;
+    status_t status = af->openInput(request, &response);
+    if (status == OK) {
+        *input = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_audio_module_handle_t(response.input));
+        *config = VALUE_OR_RETURN_STATUS(
+                aidl2legacy_AudioConfig_audio_config_t(response.config, true /*isInput*/));
+    }
+    return status;
 }
 
 status_t AudioPolicyService::AudioPolicyClient::closeInput(audio_io_handle_t input)
@@ -132,21 +191,21 @@ status_t AudioPolicyService::AudioPolicyClient::setStreamVolume(audio_stream_typ
                                                delay_ms);
 }
 
-status_t AudioPolicyService::AudioPolicyClient::invalidateStream(audio_stream_type_t stream)
+status_t AudioPolicyService::AudioPolicyClient::setPortsVolume(
+        const std::vector<audio_port_handle_t> &ports, float volume, audio_io_handle_t output,
+        int delayMs)
 {
-    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
-    if (af == 0) {
-        return PERMISSION_DENIED;
+    if (ports.empty()) {
+        return NO_ERROR;
     }
-
-    return af->invalidateStream(stream);
+    return mAudioPolicyService->setPortsVolume(ports, volume, output, delayMs);
 }
 
 void AudioPolicyService::AudioPolicyClient::setParameters(audio_io_handle_t io_handle,
                    const String8& keyValuePairs,
                    int delay_ms)
 {
-    mAudioPolicyService->setParameters(io_handle, keyValuePairs.string(), delay_ms);
+    mAudioPolicyService->setParameters(io_handle, keyValuePairs.c_str(), delay_ms);
 }
 
 String8 AudioPolicyService::AudioPolicyClient::getParameters(audio_io_handle_t io_handle,
@@ -236,6 +295,16 @@ void AudioPolicyService::AudioPolicyClient::onAudioVolumeGroupChanged(volume_gro
     mAudioPolicyService->onAudioVolumeGroupChanged(group, flags);
 }
 
+void AudioPolicyService::AudioPolicyClient::onRoutingUpdated()
+{
+    mAudioPolicyService->onRoutingUpdated();
+}
+
+void AudioPolicyService::AudioPolicyClient::onVolumeRangeInitRequest()
+{
+    mAudioPolicyService->onVolumeRangeInitRequest();
+}
+
 audio_unique_id_t AudioPolicyService::AudioPolicyClient::newAudioUniqueId(audio_unique_id_use_t use)
 {
     return AudioSystem::newAudioUniqueId(use);
@@ -244,6 +313,65 @@ audio_unique_id_t AudioPolicyService::AudioPolicyClient::newAudioUniqueId(audio_
 void AudioPolicyService::AudioPolicyClient::setSoundTriggerCaptureState(bool active)
 {
     mAudioPolicyService->mCaptureStateNotifier.setCaptureState(active);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::getAudioPort(struct audio_port_v7 *port)
+{
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == 0) {
+        ALOGW("%s: could not get AudioFlinger", __func__);
+        return PERMISSION_DENIED;
+    }
+    return af->getAudioPort(port);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::updateSecondaryOutputs(
+        const TrackSecondaryOutputsMap& trackSecondaryOutputs) {
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == nullptr) {
+        ALOGW("%s: could not get AudioFlinger", __func__);
+        return PERMISSION_DENIED;
+    }
+    return af->updateSecondaryOutputs(trackSecondaryOutputs);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::setDeviceConnectedState(
+        const struct audio_port_v7 *port, media::DeviceConnectedState state) {
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == nullptr) {
+        ALOGW("%s: could not get AudioFlinger", __func__);
+        return PERMISSION_DENIED;
+    }
+    return af->setDeviceConnectedState(port, state);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::invalidateTracks(
+        const std::vector<audio_port_handle_t>& portIds) {
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == 0) {
+        return PERMISSION_DENIED;
+    }
+
+    return af->invalidateTracks(portIds);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::getAudioMixPort(
+        const struct audio_port_v7 *devicePort,
+        struct audio_port_v7 *port) {
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == 0) {
+        return PERMISSION_DENIED;
+    }
+    return af->getAudioMixPort(devicePort, port);
+}
+
+status_t AudioPolicyService::AudioPolicyClient::setTracksInternalMute(
+        const std::vector<media::TrackInternalMuteInfo>& tracksInternalMute) {
+    sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
+    if (af == nullptr) {
+        return PERMISSION_DENIED;
+    }
+    return af->setTracksInternalMute(tracksInternalMute);
 }
 
 } // namespace android

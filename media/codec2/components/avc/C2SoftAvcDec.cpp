@@ -16,6 +16,9 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2SoftAvcDec"
+#ifndef KEEP_THREADS_ACTIVE
+#define KEEP_THREADS_ACTIVE 0
+#endif
 #include <log/log.h>
 
 #include <media/stagefright/foundation/MediaDefs.h>
@@ -416,6 +419,7 @@ status_t C2SoftAvcDec::createDecoder() {
     ivdext_create_op_t s_create_op = {};
 
     s_create_ip.s_ivd_create_ip_t.u4_size = sizeof(ivdext_create_ip_t);
+    s_create_ip.u4_keep_threads_active = KEEP_THREADS_ACTIVE;
     s_create_ip.s_ivd_create_ip_t.e_cmd = IVD_CMD_CREATE;
     s_create_ip.s_ivd_create_ip_t.u4_share_disp_buf = 0;
     s_create_ip.s_ivd_create_ip_t.e_output_format = mIvColorFormat;
@@ -511,7 +515,7 @@ void C2SoftAvcDec::getVersion() {
 status_t C2SoftAvcDec::initDecoder() {
     if (OK != createDecoder()) return UNKNOWN_ERROR;
     mNumCores = MIN(getCpuCoreCount(), MAX_NUM_CORES);
-    mStride = ALIGN32(mWidth);
+    mStride = ALIGN128(mWidth);
     mSignalledError = false;
     resetPlugin();
     (void) setNumCores();
@@ -670,8 +674,10 @@ status_t C2SoftAvcDec::resetDecoder() {
 
 void C2SoftAvcDec::resetPlugin() {
     mSignalledOutputEos = false;
-    gettimeofday(&mTimeStart, nullptr);
-    gettimeofday(&mTimeEnd, nullptr);
+    mTimeStart = mTimeEnd = systemTime();
+    if (mOutBlock) {
+        mOutBlock.reset();
+    }
 }
 
 status_t C2SoftAvcDec::deleteDecoder() {
@@ -777,20 +783,20 @@ c2_status_t C2SoftAvcDec::ensureDecoderState(const std::shared_ptr<C2BlockPool> 
         return C2_CORRUPTED;
     }
     if (mOutBlock &&
-            (mOutBlock->width() != ALIGN32(mWidth) || mOutBlock->height() != mHeight)) {
+            (mOutBlock->width() != ALIGN128(mWidth) || mOutBlock->height() != mHeight)) {
         mOutBlock.reset();
     }
     if (!mOutBlock) {
         uint32_t format = HAL_PIXEL_FORMAT_YV12;
         C2MemoryUsage usage = { C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE };
         c2_status_t err =
-            pool->fetchGraphicBlock(ALIGN32(mWidth), mHeight, format, usage, &mOutBlock);
+            pool->fetchGraphicBlock(ALIGN128(mWidth), mHeight, format, usage, &mOutBlock);
         if (err != C2_OK) {
             ALOGE("fetchGraphicBlock for Output failed with status %d", err);
             return err;
         }
         ALOGV("provided (%dx%d) required (%dx%d)",
-              mOutBlock->width(), mOutBlock->height(), ALIGN32(mWidth), mHeight);
+              mOutBlock->width(), mOutBlock->height(), ALIGN128(mWidth), mHeight);
     }
 
     return C2_OK;
@@ -866,14 +872,13 @@ void C2SoftAvcDec::process(
                 setParams(mStride, IVD_DECODE_HEADER);
             }
 
-            WORD32 delay;
-            GETTIME(&mTimeStart, nullptr);
-            TIME_DIFF(mTimeEnd, mTimeStart, delay);
+            mTimeStart = systemTime();
+            nsecs_t delay = mTimeStart - mTimeEnd;
             (void) ivdec_api_function(mDecHandle, &s_h264d_decode_ip, &s_h264d_decode_op);
-            WORD32 decodeTime;
-            GETTIME(&mTimeEnd, nullptr);
-            TIME_DIFF(mTimeStart, mTimeEnd, decodeTime);
-            ALOGV("decodeTime=%6d delay=%6d numBytes=%6d", decodeTime, delay,
+
+            mTimeEnd = systemTime();
+            nsecs_t decodeTime = mTimeEnd - mTimeStart;
+            ALOGV("decodeTime=%" PRId64 " delay=%" PRId64 " numBytes=%6d", decodeTime, delay,
                   ps_decode_op->u4_num_bytes_consumed);
         }
         if (IVD_MEM_ALLOC_FAILED == (ps_decode_op->u4_error_code & IVD_ERROR_MASK)) {
@@ -928,7 +933,7 @@ void C2SoftAvcDec::process(
         if (0 < ps_decode_op->u4_pic_wd && 0 < ps_decode_op->u4_pic_ht) {
             if (mHeaderDecoded == false) {
                 mHeaderDecoded = true;
-                mStride = ALIGN32(ps_decode_op->u4_pic_wd);
+                mStride = ALIGN128(ps_decode_op->u4_pic_wd);
                 setParams(mStride, IVD_DECODE_FRAME);
             }
             if (ps_decode_op->u4_pic_wd != mWidth || ps_decode_op->u4_pic_ht != mHeight) {

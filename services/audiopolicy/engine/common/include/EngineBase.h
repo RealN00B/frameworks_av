@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <functional>
+
+#include <android/media/audio/common/AudioHalEngineConfig.h>
 #include <EngineConfig.h>
 #include <EngineInterface.h>
 #include <ProductStrategy.h>
@@ -53,7 +56,7 @@ public:
                                                audio_policy_dev_state_t /*state*/) override;
 
     product_strategy_t getProductStrategyForAttributes(
-            const audio_attributes_t &attr) const override;
+            const audio_attributes_t &attr, bool fallbackOnDefault = true) const override;
 
     audio_stream_type_t getStreamTypeForAttributes(const audio_attributes_t &attr) const override;
 
@@ -79,16 +82,25 @@ public:
 
     VolumeGroupVector getVolumeGroups() const override;
 
-    volume_group_t getVolumeGroupForAttributes(const audio_attributes_t &attr) const override;
+    volume_group_t getVolumeGroupForAttributes(
+            const audio_attributes_t &attr, bool fallbackOnDefault = true) const override;
 
-    volume_group_t getVolumeGroupForStreamType(audio_stream_type_t stream) const override;
+    volume_group_t getVolumeGroupForStreamType(
+            audio_stream_type_t stream, bool fallbackOnDefault = true) const override;
 
     status_t listAudioVolumeGroups(AudioVolumeGroupVector &groups) const override;
 
+    /**
+     * Get the list of currently connected removable device types ordered from most recently
+     * connected to least recently connected.
+     * @param group the device group to consider: wired, a2dp... If none, consider all groups.
+     * @param excludedDevices list of device types to ignore
+     * @return a potentially empty ordered list of connected removable devices.
+     */
     std::vector<audio_devices_t> getLastRemovableMediaDevices(
-            device_out_group_t group = GROUP_NONE) const
-    {
-        return mLastRemovableMediaDevices.getLastRemovableMediaDevices(group);
+            device_out_group_t group = GROUP_NONE,
+            std::vector<audio_devices_t> excludedDevices = {}) const {
+        return mLastRemovableMediaDevices.getLastRemovableMediaDevices(group, excludedDevices);
     }
 
     void dump(String8 *dst) const override;
@@ -96,12 +108,18 @@ public:
     status_t setDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role,
             const AudioDeviceTypeAddrVector &devices) override;
 
-    status_t removeDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role) override;
+    status_t removeDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role,
+            const AudioDeviceTypeAddrVector &devices) override;
+
+    status_t clearDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role) override;
 
     status_t getDevicesForRoleAndStrategy(product_strategy_t strategy, device_role_t role,
             AudioDeviceTypeAddrVector &devices) const override;
 
-    engineConfig::ParsingResult loadAudioPolicyEngineConfig();
+    engineConfig::ParsingResult loadAudioPolicyEngineConfig(
+            const media::audio::common::AudioHalEngineConfig& aidlConfig);
+
+    engineConfig::ParsingResult loadAudioPolicyEngineConfig(const std::string& xmlFilePath = "");
 
     const ProductStrategyMap &getProductStrategies() const { return mProductStrategies; }
 
@@ -110,6 +128,8 @@ public:
     product_strategy_t getProductStrategyForStream(audio_stream_type_t stream) const;
 
     product_strategy_t getProductStrategyByName(const std::string &name) const;
+
+    std::string getProductStrategyName(product_strategy_t id) const;
 
     AudioPolicyManagerObserver *getApmObserver() const { return mApmObserver; }
 
@@ -151,18 +171,70 @@ public:
     status_t getDevicesForRoleAndCapturePreset(audio_source_t audioSource,
             device_role_t role, AudioDeviceTypeAddrVector &devices) const override;
 
+    DeviceVector getActiveMediaDevices(const DeviceVector& availableDevices) const override;
+
+    void initializeDeviceSelectionCache() override;
+
+    void updateDeviceSelectionCache() override;
+
+protected:
+    DeviceVector getPreferredAvailableDevicesForProductStrategy(
+        const DeviceVector& availableOutputDevices, product_strategy_t strategy) const;
+    DeviceVector getDisabledDevicesForProductStrategy(
+        const DeviceVector& availableOutputDevices, product_strategy_t strategy) const;
+
 private:
+    engineConfig::ParsingResult processParsingResult(engineConfig::ParsingResult&& rawResult);
+
+    /**
+     * Get media devices as the given role
+     *
+     * @param role the audio devices role
+     * @param availableDevices all available devices
+     * @param devices the DeviceVector to store devices as the given role
+     * @return NO_ERROR if all devices associated to the given role are present in available devices
+     *         NAME_NO_FOUND if there is no strategy for media or there are no devices associate to
+     *         the given role
+     *         NOT_ENOUGH_DATA if not all devices as given role are present in available devices
+     */
+    status_t getMediaDevicesForRole(device_role_t role, const DeviceVector& availableDevices,
+            DeviceVector& devices) const;
+
+    void dumpCapturePresetDevicesRoleMap(String8 *dst, int spaces) const;
+
     AudioPolicyManagerObserver *mApmObserver = nullptr;
 
     ProductStrategyMap mProductStrategies;
-    ProductStrategyPreferredRoutingMap mProductStrategyPreferredDevices;
-    CapturePresetDevicesRoleMap mCapturePresetDevicesRole;
+    ProductStrategyDevicesRoleMap mProductStrategyDeviceRoleMap;
+    CapturePresetDevicesRoleMap mCapturePresetDevicesRoleMap;
     VolumeGroupMap mVolumeGroups;
     LastRemovableMediaDevices mLastRemovableMediaDevices;
     audio_mode_t mPhoneState = AUDIO_MODE_NORMAL;  /**< current phone state. */
 
     /** current forced use configuration. */
     audio_policy_forced_cfg_t mForceUse[AUDIO_POLICY_FORCE_USE_CNT] = {};
+
+protected:
+    /**
+     * Set the device information for a given strategy.
+     *
+     * @param strategy the strategy to set devices information
+     * @param devices the devices selected for the strategy
+     */
+    virtual void setStrategyDevices(const sp<ProductStrategy>& /*strategy*/,
+                                    const DeviceVector& /*devices*/) {
+        // In EngineBase, do nothing. It is up to the actual engine to decide if it is needed to
+        // set devices information for the given strategy.
+    }
+
+    /**
+     * Get devices that will be used for the given product strategy.
+     *
+     * @param strategy the strategy to query
+     */
+    virtual DeviceVector getDevicesForProductStrategy(product_strategy_t strategy) const = 0;
+
+    DeviceStrategyMap mDevicesForStrategies;
 };
 
 } // namespace audio_policy

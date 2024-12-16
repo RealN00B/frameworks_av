@@ -19,6 +19,7 @@
 
 #include "ProductStrategy.h"
 
+#include <android/media/audio/common/AudioHalProductStrategy.h>
 #include <media/AudioProductStrategy.h>
 #include <media/TypeConverter.h>
 #include <utils/String8.h>
@@ -30,22 +31,31 @@
 
 namespace android {
 
-ProductStrategy::ProductStrategy(const std::string &name) :
+using media::audio::common::AudioHalProductStrategy;
+
+/*
+ * Note on the id: either is provided (legacy strategies have hard coded id, aidl have
+ * own id, enforced to be started from VENDOR_STRATEGY_ID_START.
+ * REROUTING & PATCH system strategies are added.
+ * To prevent from collision, generate from VENDOR_STRATEGY_ID_START when id is not provided.
+ */
+ProductStrategy::ProductStrategy(const std::string &name, int id) :
     mName(name),
-    mId(static_cast<product_strategy_t>(HandleGenerator<uint32_t>::getNextHandle()))
+    mId((static_cast<product_strategy_t>(id) != PRODUCT_STRATEGY_NONE) ?
+            static_cast<product_strategy_t>(id) :
+            static_cast<product_strategy_t>(AudioHalProductStrategy::VENDOR_STRATEGY_ID_START +
+                    HandleGenerator<uint32_t>::getNextHandle())) {}
+
+void ProductStrategy::addAttributes(const VolumeGroupAttributes &volumeGroupAttributes)
 {
+    mAttributesVector.push_back(volumeGroupAttributes);
 }
 
-void ProductStrategy::addAttributes(const AudioAttributes &audioAttributes)
+std::vector<android::VolumeGroupAttributes> ProductStrategy::listVolumeGroupAttributes() const
 {
-    mAttributesVector.push_back(audioAttributes);
-}
-
-std::vector<android::AudioAttributes> ProductStrategy::listAudioAttributes() const
-{
-    std::vector<android::AudioAttributes> androidAa;
+    std::vector<android::VolumeGroupAttributes> androidAa;
     for (const auto &attr : mAttributesVector) {
-        androidAa.push_back({attr.mVolumeGroup, attr.mStream, attr.mAttributes});
+        androidAa.push_back({attr.getGroupId(), attr.getStreamType(), attr.getAttributes()});
     }
     return androidAa;
 }
@@ -54,7 +64,7 @@ AttributesVector ProductStrategy::getAudioAttributes() const
 {
     AttributesVector attrVector;
     for (const auto &attrGroup : mAttributesVector) {
-        attrVector.push_back(attrGroup.mAttributes);
+        attrVector.push_back(attrGroup.getAttributes());
     }
     if (not attrVector.empty()) {
         return attrVector;
@@ -62,52 +72,40 @@ AttributesVector ProductStrategy::getAudioAttributes() const
     return { AUDIO_ATTRIBUTES_INITIALIZER };
 }
 
-bool ProductStrategy::matches(const audio_attributes_t attr) const
+int ProductStrategy::matchesScore(const audio_attributes_t attr) const
 {
-    return std::find_if(begin(mAttributesVector), end(mAttributesVector),
-                        [&attr](const auto &supportedAttr) {
-        return AudioProductStrategy::attributesMatches(supportedAttr.mAttributes, attr);
-    }) != end(mAttributesVector);
-}
-
-audio_stream_type_t ProductStrategy::getStreamTypeForAttributes(
-        const audio_attributes_t &attr) const
-{
-    const auto &iter = std::find_if(begin(mAttributesVector), end(mAttributesVector),
-                                   [&attr](const auto &supportedAttr) {
-        return AudioProductStrategy::attributesMatches(supportedAttr.mAttributes, attr); });
-    if (iter == end(mAttributesVector)) {
-        return AUDIO_STREAM_DEFAULT;
+    int strategyScore = AudioProductStrategy::NO_MATCH;
+    for (const auto &attrGroup : mAttributesVector) {
+        int score = AudioProductStrategy::attributesMatchesScore(attrGroup.getAttributes(), attr);
+        if (score == AudioProductStrategy::MATCH_EQUALS) {
+            return score;
+        }
+        strategyScore = std::max(score, strategyScore);
     }
-    audio_stream_type_t streamType = iter->mStream;
-    ALOGW_IF(streamType == AUDIO_STREAM_DEFAULT,
-             "%s: Strategy %s supporting attributes %s has not stream type associated"
-             "fallback on MUSIC. Do not use stream volume API", __func__, mName.c_str(),
-             toString(attr).c_str());
-    return streamType != AUDIO_STREAM_DEFAULT ? streamType : AUDIO_STREAM_MUSIC;
+    return strategyScore;
 }
 
 audio_attributes_t ProductStrategy::getAttributesForStreamType(audio_stream_type_t streamType) const
 {
     const auto iter = std::find_if(begin(mAttributesVector), end(mAttributesVector),
                                    [&streamType](const auto &supportedAttr) {
-        return supportedAttr.mStream == streamType; });
-    return iter != end(mAttributesVector) ? iter->mAttributes : AUDIO_ATTRIBUTES_INITIALIZER;
+        return supportedAttr.getStreamType() == streamType; });
+    return iter != end(mAttributesVector) ? iter->getAttributes() : AUDIO_ATTRIBUTES_INITIALIZER;
 }
 
 bool ProductStrategy::isDefault() const
 {
     return std::find_if(begin(mAttributesVector), end(mAttributesVector), [](const auto &attr) {
-        return attr.mAttributes == defaultAttr; }) != end(mAttributesVector);
+        return attr.getAttributes() == defaultAttr; }) != end(mAttributesVector);
 }
 
 StreamTypeVector ProductStrategy::getSupportedStreams() const
 {
     StreamTypeVector streams;
     for (const auto &supportedAttr : mAttributesVector) {
-        if (std::find(begin(streams), end(streams), supportedAttr.mStream) == end(streams) &&
-                supportedAttr.mStream != AUDIO_STREAM_DEFAULT) {
-            streams.push_back(supportedAttr.mStream);
+        if (std::find(begin(streams), end(streams), supportedAttr.getStreamType())
+                == end(streams) && supportedAttr.getStreamType() != AUDIO_STREAM_DEFAULT) {
+            streams.push_back(supportedAttr.getStreamType());
         }
     }
     return streams;
@@ -117,24 +115,14 @@ bool ProductStrategy::supportStreamType(const audio_stream_type_t &streamType) c
 {
     return std::find_if(begin(mAttributesVector), end(mAttributesVector),
                         [&streamType](const auto &supportedAttr) {
-        return supportedAttr.mStream == streamType; }) != end(mAttributesVector);
-}
-
-volume_group_t ProductStrategy::getVolumeGroupForAttributes(const audio_attributes_t &attr) const
-{
-    for (const auto &supportedAttr : mAttributesVector) {
-        if (AudioProductStrategy::attributesMatches(supportedAttr.mAttributes, attr)) {
-            return supportedAttr.mVolumeGroup;
-        }
-    }
-    return VOLUME_GROUP_NONE;
+        return supportedAttr.getStreamType() == streamType; }) != end(mAttributesVector);
 }
 
 volume_group_t ProductStrategy::getVolumeGroupForStreamType(audio_stream_type_t stream) const
 {
     for (const auto &supportedAttr : mAttributesVector) {
-        if (supportedAttr.mStream == stream) {
-            return supportedAttr.mVolumeGroup;
+        if (supportedAttr.getStreamType() == stream) {
+            return supportedAttr.getGroupId();
         }
     }
     return VOLUME_GROUP_NONE;
@@ -143,42 +131,46 @@ volume_group_t ProductStrategy::getVolumeGroupForStreamType(audio_stream_type_t 
 volume_group_t ProductStrategy::getDefaultVolumeGroup() const
 {
     const auto &iter = std::find_if(begin(mAttributesVector), end(mAttributesVector),
-                                    [](const auto &attr) {return attr.mAttributes == defaultAttr;});
-    return iter != end(mAttributesVector) ? iter->mVolumeGroup : VOLUME_GROUP_NONE;
+                                    [](const auto &attr) {
+        return attr.getAttributes() == defaultAttr;
+    });
+    return iter != end(mAttributesVector) ? iter->getGroupId() : VOLUME_GROUP_NONE;
 }
 
 void ProductStrategy::dump(String8 *dst, int spaces) const
 {
     dst->appendFormat("\n%*s-%s (id: %d)\n", spaces, "", mName.c_str(), mId);
-    std::string deviceLiteral;
-    if (!deviceTypesToString(mApplicableDevices, deviceLiteral)) {
-        ALOGE("%s: failed to convert device %s",
-              __FUNCTION__, dumpDeviceTypes(mApplicableDevices).c_str());
-    }
-    dst->appendFormat("%*sSelected Device: {type:%s, @:%s}\n", spaces + 2, "",
+    std::string deviceLiteral = deviceTypesToString(mApplicableDevices);
+    dst->appendFormat("%*sSelected Device: {%s, @:%s}\n", spaces + 2, "",
                        deviceLiteral.c_str(), mDeviceAddress.c_str());
 
     for (const auto &attr : mAttributesVector) {
-        dst->appendFormat("%*sGroup: %d stream: %s\n", spaces + 3, "", attr.mVolumeGroup,
-                          android::toString(attr.mStream).c_str());
+        dst->appendFormat("%*sGroup: %d stream: %s\n", spaces + 3, "", attr.getGroupId(),
+                          android::toString(attr.getStreamType()).c_str());
         dst->appendFormat("%*s Attributes: ", spaces + 3, "");
-        std::string attStr =
-                attr.mAttributes == defaultAttr ? "{ Any }" : android::toString(attr.mAttributes);
+        std::string attStr = attr.getAttributes() == defaultAttr ?
+                "{ Any }" : android::toString(attr.getAttributes());
         dst->appendFormat("%s\n", attStr.c_str());
     }
 }
 
 product_strategy_t ProductStrategyMap::getProductStrategyForAttributes(
-        const audio_attributes_t &attr) const
+        const audio_attributes_t &attributes, bool fallbackOnDefault) const
 {
+    product_strategy_t bestStrategyOrdefault = PRODUCT_STRATEGY_NONE;
+    int matchScore = AudioProductStrategy::NO_MATCH;
     for (const auto &iter : *this) {
-        if (iter.second->matches(attr)) {
+        int score = iter.second->matchesScore(attributes);
+        if (score == AudioProductStrategy::MATCH_EQUALS) {
             return iter.second->getId();
         }
+        if (score > matchScore) {
+            bestStrategyOrdefault = iter.second->getId();
+            matchScore = score;
+        }
     }
-    ALOGV("%s: No matching product strategy for attributes %s, return default", __FUNCTION__,
-          toString(attr).c_str());
-    return getDefault();
+    return (matchScore != AudioProductStrategy::MATCH_ON_DEFAULT_SCORE || fallbackOnDefault) ?
+            bestStrategyOrdefault : PRODUCT_STRATEGY_NONE;
 }
 
 audio_attributes_t ProductStrategyMap::getAttributesForStreamType(audio_stream_type_t stream) const
@@ -192,20 +184,6 @@ audio_attributes_t ProductStrategyMap::getAttributesForStreamType(audio_stream_t
     ALOGV("%s: No product strategy for stream %s, using default", __FUNCTION__,
           toString(stream).c_str());
     return {};
-}
-
-audio_stream_type_t ProductStrategyMap::getStreamTypeForAttributes(
-        const audio_attributes_t &attr) const
-{
-    for (const auto &iter : *this) {
-        audio_stream_type_t stream = iter.second->getStreamTypeForAttributes(attr);
-        if (stream != AUDIO_STREAM_DEFAULT) {
-            return stream;
-        }
-    }
-    ALOGV("%s: No product strategy for attributes %s, using default (aka MUSIC)", __FUNCTION__,
-          toString(attr).c_str());
-    return  AUDIO_STREAM_MUSIC;
 }
 
 product_strategy_t ProductStrategyMap::getDefault() const
@@ -272,18 +250,43 @@ std::string ProductStrategyMap::getDeviceAddressForProductStrategy(product_strat
     return at(psId)->getDeviceAddress();
 }
 
-volume_group_t ProductStrategyMap::getVolumeGroupForAttributes(const audio_attributes_t &attr) const
+VolumeGroupAttributes ProductStrategyMap::getVolumeGroupAttributesForAttributes(
+        const audio_attributes_t &attr, bool fallbackOnDefault) const
 {
+    int matchScore = AudioProductStrategy::NO_MATCH;
+    VolumeGroupAttributes bestVolumeGroupAttributes = {};
     for (const auto &iter : *this) {
-        volume_group_t group = iter.second->getVolumeGroupForAttributes(attr);
-        if (group != VOLUME_GROUP_NONE) {
-            return group;
+        for (const auto &volGroupAttr : iter.second->getVolumeGroupAttributes()) {
+            int score = volGroupAttr.matchesScore(attr);
+            if (score == AudioProductStrategy::MATCH_EQUALS) {
+                return volGroupAttr;
+            }
+            if (score > matchScore) {
+                matchScore = score;
+                bestVolumeGroupAttributes = volGroupAttr;
+            }
         }
     }
-    return getDefaultVolumeGroup();
+    return (matchScore != AudioProductStrategy::MATCH_ON_DEFAULT_SCORE || fallbackOnDefault) ?
+            bestVolumeGroupAttributes : VolumeGroupAttributes();
 }
 
-volume_group_t ProductStrategyMap::getVolumeGroupForStreamType(audio_stream_type_t stream) const
+audio_stream_type_t ProductStrategyMap::getStreamTypeForAttributes(
+        const audio_attributes_t &attr) const
+{
+    audio_stream_type_t streamType = getVolumeGroupAttributesForAttributes(
+            attr, /* fallbackOnDefault= */ true).getStreamType();
+    return streamType != AUDIO_STREAM_DEFAULT ? streamType : AUDIO_STREAM_MUSIC;
+}
+
+volume_group_t ProductStrategyMap::getVolumeGroupForAttributes(
+        const audio_attributes_t &attr, bool fallbackOnDefault) const
+{
+    return getVolumeGroupAttributesForAttributes(attr, fallbackOnDefault).getGroupId();
+}
+
+volume_group_t ProductStrategyMap::getVolumeGroupForStreamType(
+        audio_stream_type_t stream, bool fallbackOnDefault) const
 {
     for (const auto &iter : *this) {
         volume_group_t group = iter.second->getVolumeGroupForStreamType(stream);
@@ -292,7 +295,7 @@ volume_group_t ProductStrategyMap::getVolumeGroupForStreamType(audio_stream_type
         }
     }
     ALOGW("%s: no volume group for %s, using default", __func__, toString(stream).c_str());
-    return getDefaultVolumeGroup();
+    return fallbackOnDefault ? getDefaultVolumeGroup() : VOLUME_GROUP_NONE;
 }
 
 volume_group_t ProductStrategyMap::getDefaultVolumeGroup() const
@@ -318,16 +321,16 @@ void ProductStrategyMap::dump(String8 *dst, int spaces) const
     }
 }
 
-void ProductStrategyPreferredRoutingMap::dump(android::String8* dst, int spaces) const {
-    dst->appendFormat("\n%*sPreferred devices per product strategy dump:", spaces, "");
-    for (const auto& iter : *this) {
-        dst->appendFormat("\n%*sStrategy %u %s",
-                          spaces + 2, "",
-                          (uint32_t) iter.first,
-                          dumpAudioDeviceTypeAddrVector(iter.second, true /*includeSensitiveInfo*/)
-                                  .c_str());
+void dumpProductStrategyDevicesRoleMap(
+        const ProductStrategyDevicesRoleMap& productStrategyDeviceRoleMap,
+        String8 *dst,
+        int spaces) {
+    dst->appendFormat("\n%*sDevice role per product strategy dump:", spaces, "");
+    for (const auto& [strategyRolePair, devices] : productStrategyDeviceRoleMap) {
+        dst->appendFormat("\n%*sStrategy(%u) Device Role(%u) Devices(%s)", spaces + 2, "",
+                strategyRolePair.first, strategyRolePair.second,
+                dumpAudioDeviceTypeAddrVector(devices, true /*includeSensitiveInfo*/).c_str());
     }
     dst->appendFormat("\n");
 }
 }
-

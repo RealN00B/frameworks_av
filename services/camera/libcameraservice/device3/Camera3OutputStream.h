@@ -17,15 +17,20 @@
 #ifndef ANDROID_SERVERS_CAMERA3_OUTPUT_STREAM_H
 #define ANDROID_SERVERS_CAMERA3_OUTPUT_STREAM_H
 
+#include <mutex>
+#include <optional>
 #include <utils/RefBase.h>
 #include <gui/IProducerListener.h>
 #include <gui/Surface.h>
+#include <gui/DisplayEventReceiver.h>
 
+#include "utils/IPCTransport.h"
 #include "utils/LatencyHistogram.h"
 #include "Camera3Stream.h"
 #include "Camera3IOStreamBase.h"
 #include "Camera3OutputStreamInterface.h"
 #include "Camera3BufferManager.h"
+#include "PreviewFrameSpacer.h"
 
 namespace android {
 
@@ -47,6 +52,7 @@ struct StreamInfo {
     uint64_t combinedUsage;
     size_t totalBufferCount;
     bool isConfigured;
+    bool isMultiRes;
     explicit StreamInfo(int id = CAMERA3_STREAM_ID_INVALID,
             int setId = CAMERA3_STREAM_SET_ID_INVALID,
             uint32_t w = 0,
@@ -55,7 +61,8 @@ struct StreamInfo {
             android_dataspace ds = HAL_DATASPACE_UNKNOWN,
             uint64_t usage = 0,
             size_t bufferCount = 0,
-            bool configured = false) :
+            bool configured = false,
+            bool multiRes = false) :
                 streamId(id),
                 streamSetId(setId),
                 width(w),
@@ -64,7 +71,8 @@ struct StreamInfo {
                 dataSpace(ds),
                 combinedUsage(usage),
                 totalBufferCount(bufferCount),
-                isConfigured(configured){}
+                isConfigured(configured),
+                isMultiRes(multiRes) {}
 };
 
 /**
@@ -81,10 +89,17 @@ class Camera3OutputStream :
      */
     Camera3OutputStream(int id, sp<Surface> consumer,
             uint32_t width, uint32_t height, int format,
-            android_dataspace dataSpace, camera3_stream_rotation_t rotation,
-            nsecs_t timestampOffset, const String8& physicalCameraId,
-            int setId = CAMERA3_STREAM_SET_ID_INVALID);
-
+            android_dataspace dataSpace, camera_stream_rotation_t rotation,
+            nsecs_t timestampOffset, const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed, IPCTransport transport,
+            int setId = CAMERA3_STREAM_SET_ID_INVALID, bool isMultiResolution = false,
+            int64_t dynamicProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            bool deviceTimeBaseIsRealtime = false,
+            int timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            int mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO,
+            int32_t colorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            bool useReadoutTimestamp = false);
     /**
      * Set up a stream for formats that have a variable buffer size for the same
      * dimensions, such as compressed JPEG.
@@ -93,10 +108,17 @@ class Camera3OutputStream :
      */
     Camera3OutputStream(int id, sp<Surface> consumer,
             uint32_t width, uint32_t height, size_t maxSize, int format,
-            android_dataspace dataSpace, camera3_stream_rotation_t rotation,
-            nsecs_t timestampOffset, const String8& physicalCameraId,
-            int setId = CAMERA3_STREAM_SET_ID_INVALID);
-
+            android_dataspace dataSpace, camera_stream_rotation_t rotation,
+            nsecs_t timestampOffset, const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed, IPCTransport transport,
+            int setId = CAMERA3_STREAM_SET_ID_INVALID, bool isMultiResolution = false,
+            int64_t dynamicProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            bool deviceTimeBaseIsRealtime = false,
+            int timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            int mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO,
+            int32_t colorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            bool useReadoutTimestamp = false);
     /**
      * Set up a stream with deferred consumer for formats that have 2 dimensions, such as
      * RAW and YUV. The consumer must be set before using this stream for output. A valid
@@ -104,9 +126,17 @@ class Camera3OutputStream :
      */
     Camera3OutputStream(int id, uint32_t width, uint32_t height, int format,
             uint64_t consumerUsage, android_dataspace dataSpace,
-            camera3_stream_rotation_t rotation, nsecs_t timestampOffset,
-            const String8& physicalCameraId,
-            int setId = CAMERA3_STREAM_SET_ID_INVALID);
+            camera_stream_rotation_t rotation, nsecs_t timestampOffset,
+            const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed, IPCTransport transport,
+            int setId = CAMERA3_STREAM_SET_ID_INVALID, bool isMultiResolution = false,
+            int64_t dynamicProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            bool deviceTimeBaseIsRealtime = false,
+            int timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            int mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO,
+            int32_t colorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            bool useReadoutTimestamp = false);
 
     virtual ~Camera3OutputStream();
 
@@ -114,27 +144,32 @@ class Camera3OutputStream :
      * Camera3Stream interface
      */
 
-    virtual void     dump(int fd, const Vector<String16> &args) const;
+    virtual void     dump(int fd, const Vector<String16> &args);
 
     /**
      * Set the transform on the output stream; one of the
      * HAL_TRANSFORM_* / NATIVE_WINDOW_TRANSFORM_* constants.
      */
-    status_t         setTransform(int transform);
+    status_t         setTransform(int transform, bool mayChangeMirror);
 
     /**
      * Return if this output stream is for video encoding.
      */
-    bool isVideoStream() const;
+    bool isVideoStream();
     /**
      * Return if this output stream is consumed by hardware composer.
      */
-    bool isConsumedByHWComposer() const;
+    bool isConsumedByHWComposer();
 
     /**
      * Return if this output stream is consumed by hardware texture.
      */
-    bool isConsumedByHWTexture() const;
+    bool isConsumedByHWTexture();
+
+    /**
+     * Return if this output stream is consumed by CPU.
+     */
+    bool isConsumedByCPU();
 
     /**
      * Return if the consumer configuration of this stream is deferred.
@@ -158,6 +193,7 @@ class Camera3OutputStream :
             virtual void onBufferReleased();
             virtual bool needsReleaseNotify() { return mNeedsReleaseNotify; }
             virtual void onBuffersDiscarded(const std::vector<sp<GraphicBuffer>>& buffers);
+            virtual void onBufferDetached(int /*slot*/) override {};
 
         private:
             wp<Camera3OutputStream> mParent;
@@ -180,7 +216,7 @@ class Camera3OutputStream :
     /**
      * Query the physical camera id for the output stream.
      */
-    virtual const String8& getPhysicalCameraId() const override;
+    virtual const std::string& getPhysicalCameraId() const override;
 
     /**
      * Set the graphic buffer manager to get/return the stream buffers.
@@ -206,34 +242,72 @@ class Camera3OutputStream :
             KeyedVector<sp<Surface>, size_t> *outputMap/*out*/);
 
     /**
+     * Set the batch size for buffer operations. The output stream will request
+     * buffers from buffer queue on a batch basis. Currently only video streams
+     * are allowed to set the batch size. Also if the stream is managed by
+     * buffer manager (Surface group in Java API) then batching is also not
+     * supported. Changing batch size on the fly while there is already batched
+     * buffers in the stream is also not supported.
+     * If the batch size is larger than the max dequeue count set
+     * by the camera HAL, the batch size will be set to the max dequeue count
+     * instead.
+     */
+    virtual status_t setBatchSize(size_t batchSize = 1) override;
+
+    /**
+     * Notify the stream on change of min frame durations or variable/fixed
+     * frame rate.
+     */
+    virtual void onMinDurationChanged(nsecs_t duration, bool fixedFps) override;
+
+    /**
+     * Modify stream use case
+     */
+    virtual void setStreamUseCase(int64_t streamUseCase) override;
+
+    /**
      * Apply ZSL related consumer usage quirk.
      */
     static void applyZSLUsageQuirk(int format, uint64_t *consumerUsage /*inout*/);
 
+    void setImageDumpMask(int mask) { mImageDumpMask = mask; }
+    bool shouldLogError(status_t res);
+    void onCachedBufferQueued();
+
   protected:
-    Camera3OutputStream(int id, camera3_stream_type_t type,
+    Camera3OutputStream(int id, camera_stream_type_t type,
             uint32_t width, uint32_t height, int format,
-            android_dataspace dataSpace, camera3_stream_rotation_t rotation,
-            const String8& physicalCameraId,
+            android_dataspace dataSpace, camera_stream_rotation_t rotation,
+            const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed, IPCTransport transport,
             uint64_t consumerUsage = 0, nsecs_t timestampOffset = 0,
-            int setId = CAMERA3_STREAM_SET_ID_INVALID);
+            int setId = CAMERA3_STREAM_SET_ID_INVALID, bool isMultiResolution = false,
+            int64_t dynamicProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            bool deviceTimeBaseIsRealtime = false,
+            int timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            int mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO,
+            int32_t colorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            bool useReadoutTimestamp = false);
 
     /**
      * Note that we release the lock briefly in this function
      */
     virtual status_t returnBufferCheckedLocked(
-            const camera3_stream_buffer &buffer,
+            const camera_stream_buffer &buffer,
             nsecs_t timestamp,
+            nsecs_t readoutTimestamp,
             bool output,
+            int32_t transform,
             const std::vector<size_t>& surface_ids,
             /*out*/
             sp<Fence> *releaseFenceOut);
 
     virtual status_t disconnectLocked();
+    status_t fixUpHidlJpegBlobHeader(ANativeWindowBuffer* anwBuffer, int fence);
 
-    status_t getEndpointUsageForSurface(uint64_t *usage,
-            const sp<Surface>& surface) const;
-    status_t configureConsumerQueueLocked();
+    status_t getEndpointUsageForSurface(uint64_t *usage, const sp<Surface>& surface);
+    status_t configureConsumerQueueLocked(bool allowPreviewRespace);
 
     // Consumer as the output of camera HAL
     sp<Surface> mConsumer;
@@ -253,12 +327,6 @@ class Camera3OutputStream :
 
     bool mTraceFirstBuffer;
 
-    // Name of Surface consumer
-    String8           mConsumerName;
-
-    // Whether consumer assumes MONOTONIC timestamp
-    bool mUseMonoTimestamp;
-
     /**
      * GraphicBuffer manager this stream is registered to. Used to replace the buffer
      * allocation/deallocation role of BufferQueue.
@@ -277,9 +345,18 @@ class Camera3OutputStream :
     bool mUseBufferManager;
 
     /**
-     * Timestamp offset for video and hardware composer consumed streams
+     * Offset used to override camera HAL produced timestamps
+     *
+     * The offset is first initialized to bootTime - monotonicTime in
+     * constructor, and may later be updated based on the client's timestampBase
+     * setting.
      */
     nsecs_t mTimestampOffset;
+
+    /**
+     * If camera readout time is used rather than the start-of-exposure time.
+     */
+    bool mUseReadoutTime;
 
     /**
      * Consumer end point usage flag set by the constructor for the deferred
@@ -287,18 +364,37 @@ class Camera3OutputStream :
      */
     uint64_t    mConsumerUsage;
 
+    /**
+     * Consumer end point usage flag retrieved from the buffer queue.
+     */
+    std::optional<uint64_t>    mConsumerUsageCachedValue;
+
     // Whether to drop valid buffers.
     bool mDropBuffers;
+
+
+
+    // The batch size for buffer operation
+    std::atomic_size_t mBatchSize = 1;
+
+    // Protecting batch states below, must be acquired after mLock
+    std::mutex mBatchLock;
+    // Prefetched buffers (ready to be handed to client)
+    std::vector<Surface::BatchBuffer> mBatchedBuffers;
+    // ---- End of mBatchLock protected scope ----
+
+    const int mMirrorMode;
 
     /**
      * Internal Camera3Stream interface
      */
-    virtual status_t getBufferLocked(camera3_stream_buffer *buffer,
+    virtual status_t getBufferLocked(camera_stream_buffer *buffer,
             const std::vector<size_t>& surface_ids);
 
     virtual status_t returnBufferLocked(
-            const camera3_stream_buffer &buffer,
-            nsecs_t timestamp, const std::vector<size_t>& surface_ids);
+            const camera_stream_buffer &buffer,
+            nsecs_t timestamp, nsecs_t readoutTimestamp,
+            int32_t transform, const std::vector<size_t>& surface_ids);
 
     virtual status_t queueBufferToConsumer(sp<ANativeWindow>& consumer,
             ANativeWindowBuffer* buffer, int anwReleaseFence,
@@ -306,7 +402,7 @@ class Camera3OutputStream :
 
     virtual status_t configureQueueLocked();
 
-    virtual status_t getEndpointUsage(uint64_t *usage) const;
+    virtual status_t getEndpointUsage(uint64_t *usage);
 
     /**
      * Private methods
@@ -325,9 +421,45 @@ class Camera3OutputStream :
     // STATE_ABANDONED
     static bool shouldLogError(status_t res, StreamState state);
 
+    // Dump images to disk before returning to consumer
+    void dumpImageToDisk(nsecs_t timestamp, ANativeWindowBuffer* anwBuffer, int fence);
+
+    void returnPrefetchedBuffersLocked();
+
+
     static const int32_t kDequeueLatencyBinSize = 5; // in ms
     CameraLatencyHistogram mDequeueBufferLatency;
+    IPCTransport mIPCTransport = IPCTransport::INVALID;
 
+    int mImageDumpMask = 0;
+
+    // Re-space frames by overriding timestamp to align with display Vsync.
+    // Default is on for SurfaceView bound streams.
+    bool    mFixedFps = false;
+    nsecs_t mMinExpectedDuration = 0;
+    bool mSyncToDisplay = false;
+    DisplayEventReceiver mDisplayEventReceiver;
+    nsecs_t mLastCaptureTime = 0;
+    nsecs_t mLastPresentTime = 0;
+    nsecs_t mCaptureToPresentOffset = 0;
+    static constexpr size_t kDisplaySyncExtraBuffer = 2;
+    static constexpr nsecs_t kSpacingResetIntervalNs = 50000000LL; // 50 millisecond
+    static constexpr nsecs_t kTimelineThresholdNs = 1000000LL; // 1 millisecond
+    static constexpr float kMaxIntervalRatioDeviation = 0.05f;
+    static constexpr int kMaxTimelines = 2;
+    nsecs_t syncTimestampToDisplayLocked(nsecs_t t, sp<Fence> releaseFence);
+
+    // In case of fence being used
+    sp<Fence> mReferenceFrameFence;
+    nsecs_t mReferenceCaptureTime = 0;
+    nsecs_t mReferenceArrivalTime = 0;
+    nsecs_t mFenceSignalOffset = 0;
+    VsyncEventData  mRefVsyncData;
+
+    // Re-space frames by delaying queueBuffer so that frame delivery has
+    // the same cadence as capture. Default is on for SurfaceTexture bound
+    // streams.
+    sp<PreviewFrameSpacer> mPreviewFrameSpacer;
 }; // class Camera3OutputStream
 
 } // namespace camera3

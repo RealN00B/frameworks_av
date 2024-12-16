@@ -59,7 +59,11 @@ class StagefrightRecorderTest
     }
 
     void SetUp() override {
-        mStfRecorder = new StagefrightRecorder(String16(LOG_TAG));
+        // TODO b/182392769: use attribution source util
+        AttributionSourceState attributionSource;
+        attributionSource.packageName = std::string(LOG_TAG);
+        attributionSource.token = sp<BBinder>::make();
+        mStfRecorder = new StagefrightRecorder(attributionSource);
         ASSERT_NE(mStfRecorder, nullptr) << "Failed to create the instance of recorder";
 
         mOutputAudioFp = fopen(OUTPUT_FILE_NAME_AUDIO, "wb");
@@ -282,7 +286,7 @@ TEST_F(StagefrightRecorderTest, GetActiveMicrophonesTest) {
     // Record media for 4 secs
     std::this_thread::sleep_for(std::chrono::seconds(kClipDurationInSec));
 
-    std::vector<media::MicrophoneInfo> activeMicrophones{};
+    std::vector<media::MicrophoneInfoFw> activeMicrophones{};
     status = mStfRecorder->getActiveMicrophones(&activeMicrophones);
     ASSERT_EQ(status, OK) << "Failed to get Active Microphones";
     ASSERT_GT(activeMicrophones.size(), 0) << "No active microphones are found";

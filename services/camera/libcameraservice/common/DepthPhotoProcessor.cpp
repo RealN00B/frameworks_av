@@ -42,6 +42,10 @@
 #include <xmpmeta/xmp_data.h>
 #include <xmpmeta/xmp_writer.h>
 
+#ifndef __unused
+#define __unused __attribute__((__unused__))
+#endif
+
 using dynamic_depth::Camera;
 using dynamic_depth::Cameras;
 using dynamic_depth::CameraParams;
@@ -413,7 +417,8 @@ std::unique_ptr<dynamic_depth::DepthMap> processDepthMapFrame(DepthPhotoInputFra
 int processDepthPhotoFrame(DepthPhotoInputFrame inputFrame, size_t depthPhotoBufferSize,
         void* depthPhotoBuffer /*out*/, size_t* depthPhotoActualSize /*out*/) {
     if ((inputFrame.mMainJpegBuffer == nullptr) || (inputFrame.mDepthMapBuffer == nullptr) ||
-            (depthPhotoBuffer == nullptr) || (depthPhotoActualSize == nullptr)) {
+            (depthPhotoBuffer == nullptr) || (depthPhotoActualSize == nullptr) ||
+            (inputFrame.mMaxJpegSize < MIN_JPEG_BUFFER_SIZE)) {
         return BAD_VALUE;
     }
 

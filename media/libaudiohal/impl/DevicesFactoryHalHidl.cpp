@@ -26,19 +26,18 @@
 #include <media/audiohal/hidl/HalDeathHandler.h>
 #include <utils/Log.h>
 
-#include "ConversionHelperHidl.h"
 #include "DeviceHalHidl.h"
 #include "DevicesFactoryHalHidl.h"
 
+using ::android::detail::AudioHalVersionInfo;
 using ::android::hardware::audio::CPP_VERSION::IDevice;
-using ::android::hardware::audio::CPP_VERSION::Result;
+using ::android::hardware::audio::CORE_TYPES_CPP_VERSION::Result;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
 using ::android::hidl::manager::V1_0::IServiceManager;
 using ::android::hidl::manager::V1_0::IServiceNotification;
 
 namespace android {
-namespace CPP_VERSION {
 
 class ServiceNotificationListener : public IServiceNotification {
   public:
@@ -107,6 +106,10 @@ static const char* idFromHal(const char *name, status_t* status) {
 }
 #endif
 
+status_t DevicesFactoryHalHidl::getDeviceNames(std::vector<std::string> *names __unused) {
+    return INVALID_OPERATION;
+}
+
 status_t DevicesFactoryHalHidl::openDevice(const char *name, sp<DeviceHalInterface> *device) {
     auto factories = copyDeviceFactories();
     if (factories.empty()) return NO_INIT;
@@ -115,14 +118,37 @@ status_t DevicesFactoryHalHidl::openDevice(const char *name, sp<DeviceHalInterfa
     if (status != OK) return status;
     Result retval = Result::NOT_INITIALIZED;
     for (const auto& factory : factories) {
-        Return<void> ret = factory->openDevice(
-                hidlId,
-                [&](Result r, const sp<IDevice>& result) {
-                    retval = r;
-                    if (retval == Result::OK) {
-                        *device = new DeviceHalHidl(result);
-                    }
-                });
+        Return<void> ret;
+        if (strcmp(name, AUDIO_HARDWARE_MODULE_ID_PRIMARY) == 0) {
+            // In V7.1 it's not possible to cast IDevice back to IPrimaryDevice,
+            // thus openPrimaryDevice must be used.
+#if MAJOR_VERSION == 7 && MINOR_VERSION == 1
+            ret = factory->openPrimaryDevice_7_1(
+#else
+            ret = factory->openPrimaryDevice(
+#endif
+                    [&](Result r,
+                        const sp<::android::hardware::audio::CPP_VERSION::IPrimaryDevice>& result) {
+                        retval = r;
+                        if (retval == Result::OK) {
+                            *device = new DeviceHalHidl(result);
+                        }
+                    });
+        } else {
+#if MAJOR_VERSION == 7 && MINOR_VERSION == 1
+            ret = factory->openDevice_7_1(
+#else
+            ret = factory->openDevice(
+#endif
+                    hidlId,
+                    [&](Result r,
+                        const sp<::android::hardware::audio::CPP_VERSION::IDevice>& result) {
+                        retval = r;
+                        if (retval == Result::OK) {
+                            *device = new DeviceHalHidl(result);
+                        }
+                    });
+        }
         if (!ret.isOk()) return FAILED_TRANSACTION;
         switch (retval) {
             // Device was found and was initialized successfully.
@@ -135,29 +161,6 @@ status_t DevicesFactoryHalHidl::openDevice(const char *name, sp<DeviceHalInterfa
     }
     ALOGW("The specified device name is not recognized: \"%s\"", name);
     return BAD_VALUE;
-}
-
-status_t DevicesFactoryHalHidl::getHalPids(std::vector<pid_t> *pids) {
-    std::set<pid_t> pidsSet;
-    auto factories = copyDeviceFactories();
-    for (const auto& factory : factories) {
-        using ::android::hidl::base::V1_0::DebugInfo;
-
-        DebugInfo debugInfo;
-        auto ret = factory->getDebugInfo([&] (const auto &info) {
-               debugInfo = info;
-            });
-        if (!ret.isOk()) {
-           return INVALID_OPERATION;
-        }
-        if (debugInfo.pid == (int)IServiceManager::PidConstant::NO_PID) {
-            continue;
-        }
-        pidsSet.insert(debugInfo.pid);
-    }
-
-    *pids = {pidsSet.begin(), pidsSet.end()};
-    return NO_ERROR;
 }
 
 status_t DevicesFactoryHalHidl::setCallbackOnce(sp<DevicesFactoryHalCallback> callback) {
@@ -178,7 +181,8 @@ status_t DevicesFactoryHalHidl::setCallbackOnce(sp<DevicesFactoryHalCallback> ca
     return NO_ERROR;
 }
 
-void DevicesFactoryHalHidl::addDeviceFactory(sp<IDevicesFactory> factory, bool needToNotify) {
+void DevicesFactoryHalHidl::addDeviceFactory(
+        sp<::android::hardware::audio::CPP_VERSION::IDevicesFactory> factory, bool needToNotify) {
     // It is assumed that the DevicesFactoryHalInterface instance is owned
     // by AudioFlinger and thus have the same lifespan.
     factory->linkToDeath(HalDeathHandler::getInstance(), 0 /*cookie*/);
@@ -198,10 +202,31 @@ void DevicesFactoryHalHidl::addDeviceFactory(sp<IDevicesFactory> factory, bool n
     }
 }
 
-std::vector<sp<IDevicesFactory>> DevicesFactoryHalHidl::copyDeviceFactories() {
+std::vector<sp<::android::hardware::audio::CPP_VERSION::IDevicesFactory>>
+        DevicesFactoryHalHidl::copyDeviceFactories() {
     std::lock_guard<std::mutex> lock(mLock);
     return mDeviceFactories;
 }
 
-} // namespace CPP_VERSION
+
+AudioHalVersionInfo DevicesFactoryHalHidl::getHalVersion() const {
+    return AudioHalVersionInfo(AudioHalVersionInfo::Type::HIDL, MAJOR_VERSION, MINOR_VERSION);
+}
+
+status_t DevicesFactoryHalHidl::getSurroundSoundConfig(
+        media::SurroundSoundConfig *config __unused) {
+    return INVALID_OPERATION;
+}
+
+status_t DevicesFactoryHalHidl::getEngineConfig(
+        media::audio::common::AudioHalEngineConfig *config __unused) {
+    return INVALID_OPERATION;
+}
+
+// Main entry-point to the shared library.
+extern "C" __attribute__((visibility("default"))) void* createIDevicesFactoryImpl() {
+    auto service = hardware::audio::CPP_VERSION::IDevicesFactory::getService();
+    return service ? new DevicesFactoryHalHidl(service) : nullptr;
+}
+
 } // namespace android

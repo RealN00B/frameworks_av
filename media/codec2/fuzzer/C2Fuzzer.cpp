@@ -239,17 +239,19 @@ void Codec2Fuzzer::deInitDecoder() {
 }
 
 void Codec2Fuzzer::decodeFrames(const uint8_t* data, size_t size) {
-  mBufferSource = new BufferSource(data, size);
-  if (!mBufferSource) {
+  static const size_t kPageSize = getpagesize();
+  std::unique_ptr<BufferSource> bufferSource = std::make_unique<BufferSource>(data, size);
+  if (!bufferSource) {
     return;
   }
-  mBufferSource->parse();
+  bufferSource->parse();
   c2_status_t status = C2_OK;
   size_t numFrames = 0;
-  while (!mBufferSource->isEos()) {
+  int32_t iterationCount = 0;
+  while (!bufferSource->isEos() && ++iterationCount <= kMaxIterations) {
     uint8_t* frame = nullptr;
     size_t frameSize = 0;
-    FrameData frameData = mBufferSource->getFrame();
+    FrameData frameData = bufferSource->getFrame();
     frame = std::get<0>(frameData);
     frameSize = std::get<1>(frameData);
 
@@ -269,7 +271,7 @@ void Codec2Fuzzer::decodeFrames(const uint8_t* data, size_t size) {
     work->input.ordinal.timestamp = 0;
     work->input.ordinal.frameIndex = ++numFrames;
     work->input.buffers.clear();
-    int32_t alignedSize = C2FUZZER_ALIGN(frameSize, PAGE_SIZE);
+    int32_t alignedSize = C2FUZZER_ALIGN(frameSize, kPageSize);
 
     std::shared_ptr<C2LinearBlock> block;
     status = mLinearPool->fetchLinearBlock(
@@ -298,7 +300,6 @@ void Codec2Fuzzer::decodeFrames(const uint8_t* data, size_t size) {
   mConditionalVariable.wait_for(waitForDecodeComplete, kC2FuzzerTimeOut, [this] { return mEos; });
   std::list<std::unique_ptr<C2Work>> c2flushedWorks;
   mComponent->flush_sm(C2Component::FLUSH_COMPONENT, &c2flushedWorks);
-  delete mBufferSource;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {

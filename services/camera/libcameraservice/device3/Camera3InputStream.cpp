@@ -18,22 +18,26 @@
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
 
+#include <camera/StringUtils.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
+
 #include "Camera3InputStream.h"
 
 namespace android {
 
 namespace camera3 {
 
-const String8 Camera3InputStream::DUMMY_ID;
+const std::string Camera3InputStream::FAKE_ID;
 
 Camera3InputStream::Camera3InputStream(int id,
         uint32_t width, uint32_t height, int format) :
-        Camera3IOStreamBase(id, CAMERA3_STREAM_INPUT, width, height, /*maxSize*/0,
-                            format, HAL_DATASPACE_UNKNOWN, CAMERA3_STREAM_ROTATION_0,
-                            DUMMY_ID) {
+        Camera3IOStreamBase(id, CAMERA_STREAM_INPUT, width, height, /*maxSize*/0,
+                            format, HAL_DATASPACE_UNKNOWN, CAMERA_STREAM_ROTATION_0,
+                            FAKE_ID,
+                            std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT}) {
 
     if (format == HAL_PIXEL_FORMAT_BLOB) {
         ALOGE("%s: Bad format, BLOB not supported", __FUNCTION__);
@@ -46,10 +50,14 @@ Camera3InputStream::~Camera3InputStream() {
 }
 
 status_t Camera3InputStream::getInputBufferLocked(
-        camera3_stream_buffer *buffer) {
+        camera_stream_buffer *buffer, Size *size) {
     ATRACE_CALL();
     status_t res;
 
+    if (size == nullptr) {
+        ALOGE("%s: size must not be null", __FUNCTION__);
+        return BAD_VALUE;
+    }
     // FIXME: will not work in (re-)registration
     if (mState == STATE_IN_CONFIG || mState == STATE_IN_RECONFIG) {
         ALOGE("%s: Stream %d: Buffer registration for input streams"
@@ -77,16 +85,18 @@ status_t Camera3InputStream::getInputBufferLocked(
         return res;
     }
 
+    size->width  = bufferItem.mGraphicBuffer->getWidth();
+    size->height = bufferItem.mGraphicBuffer->getHeight();
+
     anb = bufferItem.mGraphicBuffer->getNativeBuffer();
     assert(anb != NULL);
     fenceFd = bufferItem.mFence->dup();
-
     /**
      * FenceFD now owned by HAL except in case of error,
      * in which case we reassign it to acquire_fence
      */
     handoutBufferLocked(*buffer, &(anb->handle), /*acquireFence*/fenceFd,
-                        /*releaseFence*/-1, CAMERA3_BUFFER_STATUS_OK, /*output*/false);
+                        /*releaseFence*/-1, CAMERA_BUFFER_STATUS_OK, /*output*/false);
     mBuffersInFlight.push_back(bufferItem);
 
     mFrameCount++;
@@ -96,15 +106,15 @@ status_t Camera3InputStream::getInputBufferLocked(
 }
 
 status_t Camera3InputStream::returnBufferCheckedLocked(
-            const camera3_stream_buffer &buffer,
-            nsecs_t timestamp,
-            bool output,
+            const camera_stream_buffer &buffer,
+            [[maybe_unused]] nsecs_t timestamp,
+            [[maybe_unused]] nsecs_t readoutTimestamp,
+            [[maybe_unused]] bool output,
+            int32_t /*transform*/,
             const std::vector<size_t>&,
             /*out*/
             sp<Fence> *releaseFenceOut) {
 
-    (void)timestamp;
-    (void)output;
     ALOG_ASSERT(!output, "Expected output to be false");
 
     status_t res;
@@ -134,7 +144,7 @@ status_t Camera3InputStream::returnBufferCheckedLocked(
         return INVALID_OPERATION;
     }
 
-    if (buffer.status == CAMERA3_BUFFER_STATUS_ERROR) {
+    if (buffer.status == CAMERA_BUFFER_STATUS_ERROR) {
         if (buffer.release_fence != -1) {
             ALOGE("%s: Stream %d: HAL should not set release_fence(%d) when "
                   "there is an error", __FUNCTION__, mId, buffer.release_fence);
@@ -144,7 +154,7 @@ status_t Camera3InputStream::returnBufferCheckedLocked(
         /**
          * Reassign release fence as the acquire fence incase of error
          */
-        const_cast<camera3_stream_buffer*>(&buffer)->release_fence =
+        const_cast<camera_stream_buffer*>(&buffer)->release_fence =
                 buffer.acquire_fence;
     }
 
@@ -165,12 +175,28 @@ status_t Camera3InputStream::returnBufferCheckedLocked(
 }
 
 status_t Camera3InputStream::returnInputBufferLocked(
-        const camera3_stream_buffer &buffer) {
+        const camera_stream_buffer &buffer) {
     ATRACE_CALL();
 
-    return returnAnyBufferLocked(buffer, /*timestamp*/0, /*output*/false);
+    return returnAnyBufferLocked(buffer, /*timestamp*/0, /*readoutTimestamp*/0,
+                                 /*output*/false, /*transform*/ -1);
 }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+status_t Camera3InputStream::getInputSurfaceLocked(sp<Surface> *surface) {
+    ATRACE_CALL();
+
+    if (surface == NULL) {
+        return BAD_VALUE;
+    } else if (mSurface == NULL) {
+        ALOGE("%s: No input stream is configured", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    *surface = mSurface;
+    return OK;
+}
+#else
 status_t Camera3InputStream::getInputBufferProducerLocked(
             sp<IGraphicBufferProducer> *producer) {
     ATRACE_CALL();
@@ -185,6 +211,7 @@ status_t Camera3InputStream::getInputBufferProducerLocked(
     *producer = mProducer;
     return OK;
 }
+#endif
 
 status_t Camera3InputStream::disconnectLocked() {
 
@@ -207,11 +234,10 @@ status_t Camera3InputStream::disconnectLocked() {
     return OK;
 }
 
-void Camera3InputStream::dump(int fd, const Vector<String16> &args) const {
-    (void) args;
-    String8 lines;
-    lines.appendFormat("    Stream[%d]: Input\n", mId);
-    write(fd, lines.string(), lines.size());
+void Camera3InputStream::dump(int fd, [[maybe_unused]] const Vector<String16> &args) {
+    std::string lines;
+    lines += fmt::sprintf("    Stream[%d]: Input\n", mId);
+    write(fd, lines.c_str(), lines.size());
 
     Camera3IOStreamBase::dump(fd, args);
 }
@@ -224,16 +250,22 @@ status_t Camera3InputStream::configureQueueLocked() {
     }
 
     assert(mMaxSize == 0);
-    assert(camera3_stream::format != HAL_PIXEL_FORMAT_BLOB);
+    assert(camera_stream::format != HAL_PIXEL_FORMAT_BLOB);
 
     mHandoutTotalBufferCount = 0;
     mFrameCount = 0;
     mLastTimestamp = 0;
 
     if (mConsumer.get() == 0) {
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        sp<BufferItemConsumer> bufferItemConsumer = new BufferItemConsumer(mUsage);
+        sp<IGraphicBufferProducer> producer =
+                bufferItemConsumer->getSurface()->getIGraphicBufferProducer();
+#else
         sp<IGraphicBufferProducer> producer;
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&producer, &consumer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
         int minUndequeuedBuffers = 0;
         res = producer->query(NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &minUndequeuedBuffers);
@@ -244,14 +276,14 @@ status_t Camera3InputStream::configureQueueLocked() {
         }
         size_t minBufs = static_cast<size_t>(minUndequeuedBuffers);
 
-        if (camera3_stream::max_buffers == 0) {
+        if (camera_stream::max_buffers == 0) {
             ALOGE("%s: %d: HAL sets max_buffer to 0. Must be at least 1.",
                     __FUNCTION__, __LINE__);
             return INVALID_OPERATION;
         }
 
         /*
-         * We promise never to 'acquire' more than camera3_stream::max_buffers
+         * We promise never to 'acquire' more than camera_stream::max_buffers
          * at any one time.
          *
          * Boost the number up to meet the minimum required buffer count.
@@ -259,37 +291,50 @@ status_t Camera3InputStream::configureQueueLocked() {
          * (Note that this sets consumer-side buffer count only,
          * and not the sum of producer+consumer side as in other camera streams).
          */
-        mTotalBufferCount = camera3_stream::max_buffers > minBufs ?
-            camera3_stream::max_buffers : minBufs;
+        mTotalBufferCount = camera_stream::max_buffers > minBufs ?
+            camera_stream::max_buffers : minBufs;
         // TODO: somehow set the total buffer count when producer connects?
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mConsumer = bufferItemConsumer;
+        mConsumer->setName(String8::format("Camera3-InputStream-%d", mId));
+        mConsumer->setMaxAcquiredBufferCount(mTotalBufferCount);
+
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+        mSurface = mConsumer->getSurface();
+#else
+        mProducer = mConsumer->getSurface()->getIGraphicBufferProducer();
+#endif // WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+
+#else
         mConsumer = new BufferItemConsumer(consumer, mUsage,
                                            mTotalBufferCount);
         mConsumer->setName(String8::format("Camera3-InputStream-%d", mId));
 
         mProducer = producer;
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
         mConsumer->setBufferFreedListener(this);
     }
 
-    res = mConsumer->setDefaultBufferSize(camera3_stream::width,
-                                          camera3_stream::height);
+    res = mConsumer->setDefaultBufferSize(camera_stream::width,
+                                          camera_stream::height);
     if (res != OK) {
         ALOGE("%s: Stream %d: Could not set buffer dimensions %dx%d",
-              __FUNCTION__, mId, camera3_stream::width, camera3_stream::height);
+              __FUNCTION__, mId, camera_stream::width, camera_stream::height);
         return res;
     }
-    res = mConsumer->setDefaultBufferFormat(camera3_stream::format);
+    res = mConsumer->setDefaultBufferFormat(camera_stream::format);
     if (res != OK) {
         ALOGE("%s: Stream %d: Could not set buffer format %d",
-              __FUNCTION__, mId, camera3_stream::format);
+              __FUNCTION__, mId, camera_stream::format);
         return res;
     }
 
     return OK;
 }
 
-status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) const {
+status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) {
     // Per HAL3 spec, input streams have 0 for their initial usage field.
     *usage = 0;
     return OK;
@@ -298,8 +343,8 @@ status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) const {
 void Camera3InputStream::onBufferFreed(const wp<GraphicBuffer>& gb) {
     const sp<GraphicBuffer> buffer = gb.promote();
     if (buffer != nullptr) {
-        camera3_stream_buffer streamBuffer =
-                {nullptr, &buffer->handle, 0, -1, -1};
+        camera_stream_buffer streamBuffer =
+                {nullptr, &buffer->handle, CAMERA_BUFFER_STATUS_OK, -1, -1};
         // Check if this buffer is outstanding.
         if (isOutstandingBuffer(streamBuffer)) {
             ALOGV("%s: Stream %d: Trying to free a buffer that is still being "

@@ -9,17 +9,15 @@ package {
 
 cc_test {
     name: "codec2_core_param_test",
+    test_suites: ["device-tests"],
 
     srcs: [
         "C2Param_test.cpp",
     ],
 
-    include_dirs: [
-        "frameworks/av/media/codec2/vndk/include",
-    ],
-
     header_libs: [
         "libcodec2_headers",
+        "libcodec2_vndk_headers",
     ],
 
     // param tests must not depend on any codec2 libraries as all params should be templated
@@ -29,6 +27,7 @@ cc_test {
     static_libs: [
     ],
 
+    cpp_std: "gnu++17",
     cflags: [
         "-Werror",
         "-Wall",
@@ -37,15 +36,20 @@ cc_test {
 
 cc_test {
     name: "codec2_vndk_test",
+    test_suites: ["device-tests"],
+    // This test doesn't seem to support isolated with current assumption
+    isolated: false,
 
     srcs: [
         "C2_test.cpp",
         "C2SampleComponent_test.cpp",
         "C2UtilTest.cpp",
         "vndk/C2BufferTest.cpp",
+        "vndk/C2FenceTest.cpp",
     ],
 
-    include_dirs: [
+    static_libs: [
+        "libgmock",
     ],
 
     shared_libs: [
@@ -53,6 +57,7 @@ cc_test {
         "libcodec2_vndk",
         "libcutils",
         "liblog",
+        "libui",
         "libutils",
     ],
 

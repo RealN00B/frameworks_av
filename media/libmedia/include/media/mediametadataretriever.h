@@ -73,6 +73,9 @@ enum {
     METADATA_KEY_COLOR_RANGE     = 37,
     METADATA_KEY_SAMPLERATE      = 38,
     METADATA_KEY_BITS_PER_SAMPLE = 39,
+    METADATA_KEY_VIDEO_CODEC_MIME_TYPE = 40,
+    METADATA_KEY_XMP_OFFSET      = 41,
+    METADATA_KEY_XMP_LENGTH      = 42,
 
     // Add more here...
 };
@@ -93,13 +96,13 @@ public:
     status_t setDataSource(
             const sp<IDataSource>& dataSource, const char *mime = NULL);
     sp<IMemory> getFrameAtTime(int64_t timeUs, int option,
-            int colorFormat = HAL_PIXEL_FORMAT_RGB_565, bool metaOnly = false);
+            int colorFormat, bool metaOnly = false);
     sp<IMemory> getImageAtIndex(int index,
-            int colorFormat = HAL_PIXEL_FORMAT_RGB_565, bool metaOnly = false, bool thumbnail = false);
+            int colorFormat, bool metaOnly = false, bool thumbnail = false);
     sp<IMemory> getImageRectAtIndex(
             int index, int colorFormat, int left, int top, int right, int bottom);
     sp<IMemory>  getFrameAtIndex(
-            int index, int colorFormat = HAL_PIXEL_FORMAT_RGB_565, bool metaOnly = false);
+            int index, int colorFormat, bool metaOnly = false);
     sp<IMemory> extractAlbumArt();
     const char* extractMetadata(int keyCode);
 

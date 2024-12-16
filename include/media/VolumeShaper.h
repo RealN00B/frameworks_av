@@ -22,6 +22,11 @@
 #include <math.h>
 #include <sstream>
 
+#include <android/media/VolumeShaperConfiguration.h>
+#include <android/media/VolumeShaperConfigurationOptionFlag.h>
+#include <android/media/VolumeShaperOperation.h>
+#include <android/media/VolumeShaperOperationFlag.h>
+#include <android/media/VolumeShaperState.h>
 #include <binder/Parcel.h>
 #include <media/Interpolator.h>
 #include <utils/Mutex.h>
@@ -111,6 +116,16 @@ public:
             TYPE_SCALE,
         };
 
+        static std::string toString(Type type) {
+            switch (type) {
+                case TYPE_ID: return "TYPE_ID";
+                case TYPE_SCALE: return "TYPE_SCALE";
+                default:
+                    return std::string("Unknown Type: ")
+                            .append(std::to_string(static_cast<int>(type)));
+            }
+        }
+
         // Must match with VolumeShaper.java in frameworks/base.
         enum OptionFlag : int32_t {
             OPTION_FLAG_NONE           = 0,
@@ -119,6 +134,22 @@ public:
 
             OPTION_FLAG_ALL            = (OPTION_FLAG_VOLUME_IN_DBFS | OPTION_FLAG_CLOCK_TIME),
         };
+
+        static std::string toString(OptionFlag flag) {
+            std::string s;
+            for (const auto& flagPair : std::initializer_list<std::pair<OptionFlag, const char*>>{
+                    {OPTION_FLAG_VOLUME_IN_DBFS, "OPTION_FLAG_VOLUME_IN_DBFS"},
+                    {OPTION_FLAG_CLOCK_TIME, "OPTION_FLAG_CLOCK_TIME"},
+                }) {
+                if (flag & flagPair.first) {
+                    if (!s.empty()) {
+                        s.append("|");
+                    }
+                    s.append(flagPair.second);
+                }
+            }
+            return s;
+        }
 
         // Bring from base class; must match with VolumeShaper.java in frameworks/base.
         using InterpolatorType = Interpolator<S, T>::InterpolatorType;
@@ -284,39 +315,50 @@ public:
             clampVolume();
         }
 
-        // The parcel layout must match VolumeShaper.java
         status_t writeToParcel(Parcel *parcel) const override {
-            if (parcel == nullptr) return BAD_VALUE;
-            return parcel->writeInt32((int32_t)mType)
-                    ?: parcel->writeInt32(mId)
-                    ?: mType == TYPE_ID
-                        ? NO_ERROR
-                        : parcel->writeInt32((int32_t)mOptionFlags)
-                            ?: parcel->writeDouble(mDurationMs)
-                            ?: Interpolator<S, T>::writeToParcel(parcel);
+            VolumeShaperConfiguration parcelable;
+            writeToParcelable(&parcelable);
+            return parcelable.writeToParcel(parcel);
         }
 
-        status_t readFromParcel(const Parcel *parcel) override {
-            int32_t type, optionFlags;
-            return parcel->readInt32(&type)
-                    ?: setType((Type)type)
-                    ?: parcel->readInt32(&mId)
-                    ?: mType == TYPE_ID
-                        ? NO_ERROR
-                        : parcel->readInt32(&optionFlags)
-                            ?: setOptionFlags((OptionFlag)optionFlags)
-                            ?: parcel->readDouble(&mDurationMs)
-                            ?: Interpolator<S, T>::readFromParcel(*parcel)
-                            ?: checkCurve();
+        void writeToParcelable(VolumeShaperConfiguration *parcelable) const {
+            parcelable->id = getId();
+            parcelable->type = getTypeAsAidl();
+            parcelable->optionFlags = 0;
+            if (mType != TYPE_ID) {
+                parcelable->optionFlags = getOptionFlagsAsAidl();
+                parcelable->durationMs = getDurationMs();
+                parcelable->interpolatorConfig.emplace(); // create value in std::optional
+                Interpolator<S, T>::writeToConfig(&*parcelable->interpolatorConfig);
+            }
+        }
+
+        status_t readFromParcel(const Parcel* parcel) override {
+            VolumeShaperConfiguration data;
+            return data.readFromParcel(parcel)
+                   ?: readFromParcelable(data);
+        }
+
+        status_t readFromParcelable(const VolumeShaperConfiguration& parcelable) {
+            setId(parcelable.id);
+            return setTypeFromAidl(parcelable.type)
+                   ?: mType == TYPE_ID
+                      ? NO_ERROR
+                      : setOptionFlagsFromAidl(parcelable.optionFlags)
+                        ?: setDurationMs(parcelable.durationMs)
+                           ?: !parcelable.interpolatorConfig  // check std::optional for value
+                               ? BAD_VALUE // must be nonnull.
+                               : Interpolator<S, T>::readFromConfig(*parcelable.interpolatorConfig)
+                                   ?: checkCurve();
         }
 
         // Returns a string for debug printing.
         std::string toString() const {
             std::stringstream ss;
-            ss << "VolumeShaper::Configuration{mType=" << static_cast<int32_t>(mType);
+            ss << "VolumeShaper::Configuration{mType=" << toString(mType);
             ss << ", mId=" << mId;
             if (mType != TYPE_ID) {
-                ss << ", mOptionFlags=" << static_cast<int32_t>(mOptionFlags);
+                ss << ", mOptionFlags=" << toString(mOptionFlags);
                 ss << ", mDurationMs=" << mDurationMs;
                 ss << ", " << Interpolator<S, T>::toString().c_str();
             }
@@ -329,6 +371,51 @@ public:
         int32_t mId;             // A valid id is >= 0.
         OptionFlag mOptionFlags; // option flags for the configuration.
         double mDurationMs;      // duration, must be > 0; default is 1000 ms.
+
+        int32_t getOptionFlagsAsAidl() const {
+            int32_t result = 0;
+            if (getOptionFlags() & OPTION_FLAG_VOLUME_IN_DBFS) {
+                result |=
+                        1 << static_cast<int>(VolumeShaperConfigurationOptionFlag::VOLUME_IN_DBFS);
+            }
+            if (getOptionFlags() & OPTION_FLAG_CLOCK_TIME) {
+                result |= 1 << static_cast<int>(VolumeShaperConfigurationOptionFlag::CLOCK_TIME);
+            }
+            return result;
+        }
+
+        status_t setOptionFlagsFromAidl(int32_t aidl) {
+            std::underlying_type_t<OptionFlag> options = 0;
+            if (aidl & (1 << static_cast<int>(VolumeShaperConfigurationOptionFlag::VOLUME_IN_DBFS))) {
+                options |= OPTION_FLAG_VOLUME_IN_DBFS;
+            }
+            if (aidl & (1 << static_cast<int>(VolumeShaperConfigurationOptionFlag::CLOCK_TIME))) {
+                options |= OPTION_FLAG_CLOCK_TIME;
+            }
+            return setOptionFlags(static_cast<OptionFlag>(options));
+        }
+
+        status_t setTypeFromAidl(VolumeShaperConfigurationType aidl) {
+            switch (aidl) {
+                case VolumeShaperConfigurationType::ID:
+                    return setType(TYPE_ID);
+                case VolumeShaperConfigurationType::SCALE:
+                    return setType(TYPE_SCALE);
+                default:
+                    return BAD_VALUE;
+            }
+        }
+
+        VolumeShaperConfigurationType getTypeAsAidl() const {
+            switch (getType()) {
+                case TYPE_ID:
+                    return VolumeShaperConfigurationType::ID;
+                case TYPE_SCALE:
+                    return VolumeShaperConfigurationType::SCALE;
+                default:
+                    LOG_ALWAYS_FATAL("Shouldn't get here");
+            }
+        }
     }; // Configuration
 
     /* VolumeShaper::Operation expresses an operation to perform on the
@@ -352,6 +439,25 @@ public:
             FLAG_ALL       = (FLAG_REVERSE | FLAG_TERMINATE | FLAG_JOIN | FLAG_DELAY
                             | FLAG_CREATE_IF_NECESSARY),
         };
+
+        static std::string toString(Flag flag) {
+            std::string s;
+            for (const auto& flagPair : std::initializer_list<std::pair<Flag, const char*>>{
+                    {FLAG_REVERSE, "FLAG_REVERSE"},
+                    {FLAG_TERMINATE, "FLAG_TERMINATE"},
+                    {FLAG_JOIN, "FLAG_JOIN"},
+                    {FLAG_DELAY, "FLAG_DELAY"},
+                    {FLAG_CREATE_IF_NECESSARY, "FLAG_CREATE_IF_NECESSARY"},
+                }) {
+                if (flag & flagPair.first) {
+                    if (!s.empty()) {
+                        s.append("|");
+                    }
+                    s.append(flagPair.second);
+                }
+            }
+            return s;
+        }
 
         Operation()
             : Operation(FLAG_NONE, -1 /* replaceId */) {
@@ -420,28 +526,80 @@ public:
             return NO_ERROR;
         }
 
-        status_t writeToParcel(Parcel *parcel) const override {
+        status_t writeToParcel(Parcel* parcel) const override {
             if (parcel == nullptr) return BAD_VALUE;
-            return parcel->writeInt32((int32_t)mFlags)
-                    ?: parcel->writeInt32(mReplaceId)
-                    ?: parcel->writeFloat(mXOffset);
+            VolumeShaperOperation op;
+            writeToParcelable(&op);
+            return op.writeToParcel(parcel);
         }
 
-        status_t readFromParcel(const Parcel *parcel) override {
-            int32_t flags;
-            return parcel->readInt32(&flags)
-                    ?: parcel->readInt32(&mReplaceId)
-                    ?: parcel->readFloat(&mXOffset)
-                    ?: setFlags((Flag)flags);
+        void writeToParcelable(VolumeShaperOperation* op) const {
+            op->flags = getFlagsAsAidl();
+            op->replaceId = mReplaceId;
+            op->xOffset = mXOffset;
+        }
+
+        status_t readFromParcel(const Parcel* parcel) override {
+            VolumeShaperOperation op;
+            return op.readFromParcel(parcel)
+                   ?: readFromParcelable(op);
+        }
+
+        status_t readFromParcelable(const VolumeShaperOperation& op) {
+            mReplaceId = op.replaceId;
+            mXOffset = op.xOffset;
+            return setFlagsFromAidl(op.flags);
         }
 
         std::string toString() const {
             std::stringstream ss;
-            ss << "VolumeShaper::Operation{mFlags=" << static_cast<int32_t>(mFlags) ;
+            ss << "VolumeShaper::Operation{mFlags=" << toString(mFlags);
             ss << ", mReplaceId=" << mReplaceId;
             ss << ", mXOffset=" << mXOffset;
             ss << "}";
             return ss.str();
+        }
+
+    private:
+        status_t setFlagsFromAidl(int32_t aidl) {
+            std::underlying_type_t<Flag> flags = 0;
+            if (aidl & (1 << static_cast<int>(VolumeShaperOperationFlag::REVERSE))) {
+                flags |= FLAG_REVERSE;
+            }
+            if (aidl & (1 << static_cast<int>(VolumeShaperOperationFlag::TERMINATE))) {
+                flags |= FLAG_TERMINATE;
+            }
+            if (aidl & (1 << static_cast<int>(VolumeShaperOperationFlag::JOIN))) {
+                flags |= FLAG_JOIN;
+            }
+            if (aidl & (1 << static_cast<int>(VolumeShaperOperationFlag::DELAY))) {
+                flags |= FLAG_DELAY;
+            }
+            if (aidl & (1 << static_cast<int>(VolumeShaperOperationFlag::CREATE_IF_NECESSARY))) {
+                flags |= FLAG_CREATE_IF_NECESSARY;
+            }
+            return setFlags(static_cast<Flag>(flags));
+        }
+
+        int32_t getFlagsAsAidl() const {
+            int32_t aidl = 0;
+            std::underlying_type_t<Flag> flags = getFlags();
+            if (flags & FLAG_REVERSE) {
+                aidl |= (1 << static_cast<int>(VolumeShaperOperationFlag::REVERSE));
+            }
+            if (flags & FLAG_TERMINATE) {
+                aidl |= (1 << static_cast<int>(VolumeShaperOperationFlag::TERMINATE));
+            }
+            if (flags & FLAG_JOIN) {
+                aidl |= (1 << static_cast<int>(VolumeShaperOperationFlag::JOIN));
+            }
+            if (flags & FLAG_DELAY) {
+                aidl |= (1 << static_cast<int>(VolumeShaperOperationFlag::DELAY));
+            }
+            if (flags & FLAG_CREATE_IF_NECESSARY) {
+                aidl |= (1 << static_cast<int>(VolumeShaperOperationFlag::CREATE_IF_NECESSARY));
+            }
+            return aidl;
         }
 
     private:
@@ -483,15 +641,28 @@ public:
             mXOffset = xOffset;
         }
 
-        status_t writeToParcel(Parcel *parcel) const override {
+        status_t writeToParcel(Parcel* parcel) const override {
             if (parcel == nullptr) return BAD_VALUE;
-            return parcel->writeFloat(mVolume)
-                    ?: parcel->writeFloat(mXOffset);
+            VolumeShaperState state;
+            writeToParcelable(&state);
+            return state.writeToParcel(parcel);
         }
 
-        status_t readFromParcel(const Parcel *parcel) override {
-            return parcel->readFloat(&mVolume)
-                     ?: parcel->readFloat(&mXOffset);
+        void writeToParcelable(VolumeShaperState* parcelable) const {
+            parcelable->volume = mVolume;
+            parcelable->xOffset = mXOffset;
+        }
+
+        status_t readFromParcel(const Parcel* parcel) override {
+            VolumeShaperState state;
+            return state.readFromParcel(parcel)
+                   ?: readFromParcelable(state);
+        }
+
+        status_t readFromParcelable(const VolumeShaperState& parcelable) {
+            mVolume = parcelable.volume;
+            mXOffset = parcelable.xOffset;
+            return OK;
         }
 
         std::string toString() const {
@@ -973,7 +1144,7 @@ public:
      * internal to the VolumeHandler.
      */
     void setIdIfNecessary(const sp<VolumeShaper::Configuration> &configuration) {
-        if (configuration->getType() == VolumeShaper::Configuration::TYPE_SCALE) {
+        if (configuration && configuration->getType() == VolumeShaper::Configuration::TYPE_SCALE) {
             const int id = configuration->getId();
             if (id == -1) {
                 // Reassign to a unique id, skipping system ids.

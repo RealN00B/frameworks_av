@@ -135,6 +135,14 @@ extern const char* AMEDIAFORMAT_KEY_AAC_ENCODED_TARGET_LEVEL __INTRODUCED_IN(28)
 extern const char* AMEDIAFORMAT_KEY_AAC_MAX_OUTPUT_CHANNEL_COUNT __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_AAC_PROFILE __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_AAC_SBR_MODE __INTRODUCED_IN(28);
+/**
+ * A key for applications to opt out of allowing
+ * a Surface to discard undisplayed/unconsumed frames
+ * as means to catch up after falling behind.
+ *
+ * Semantics match those of {@link android.media.MediaFormat#KEY_ALLOW_FRAME_DROP}
+ */
+extern const char* AMEDIAFORMAT_KEY_ALLOW_FRAME_DROP __INTRODUCED_IN(34);
 extern const char* AMEDIAFORMAT_KEY_AUDIO_SESSION_ID __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_BITRATE_MODE __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_BIT_RATE __INTRODUCED_IN(21);
@@ -160,6 +168,7 @@ extern const char* AMEDIAFORMAT_KEY_GRID_COLUMNS __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_GRID_ROWS __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_HDR_STATIC_INFO __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_HEIGHT __INTRODUCED_IN(21);
+extern const char* AMEDIAFORMAT_KEY_IMPORTANCE __INTRODUCED_IN(35);
 extern const char* AMEDIAFORMAT_KEY_INTRA_REFRESH_PERIOD __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_IS_ADTS __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_IS_AUTOSELECT __INTRODUCED_IN(21);
@@ -169,8 +178,17 @@ extern const char* AMEDIAFORMAT_KEY_I_FRAME_INTERVAL __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_LANGUAGE __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_LATENCY __INTRODUCED_IN(28);
 extern const char* AMEDIAFORMAT_KEY_LEVEL __INTRODUCED_IN(28);
+/**
+ * A key describing the maximum number of B frames between I or P frames,
+ * to be used by a video encoder.
+ *
+ * Semantics match those of {@link android.media.MediaFormat#KEY_MAX_B_FRAMES}
+ */
+extern const char* AMEDIAFORMAT_KEY_MAX_B_FRAMES __INTRODUCED_IN(34);
 extern const char* AMEDIAFORMAT_KEY_MAX_HEIGHT __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_MAX_INPUT_SIZE __INTRODUCED_IN(21);
+extern const char* AMEDIAFORMAT_KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE __INTRODUCED_IN(35);
+extern const char* AMEDIAFORMAT_KEY_BUFFER_BATCH_THRESHOLD_OUTPUT_SIZE __INTRODUCED_IN(35);
 extern const char* AMEDIAFORMAT_KEY_MAX_WIDTH __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_MIME __INTRODUCED_IN(21);
 extern const char* AMEDIAFORMAT_KEY_MPEG_USER_DATA __INTRODUCED_IN(28);
@@ -301,6 +319,56 @@ extern const char* AMEDIAFORMAT_KEY_YEAR __INTRODUCED_IN(29);
  * Available since API level 30.
  */
 extern const char* AMEDIAFORMAT_KEY_LOW_LATENCY __INTRODUCED_IN(30);
+
+extern const char* AMEDIAFORMAT_KEY_HDR10_PLUS_INFO __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_SLOW_MOTION_MARKERS __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_THUMBNAIL_CSD_AV1C __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_XMP_OFFSET __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_XMP_SIZE __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_SAMPLE_FILE_OFFSET __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_LAST_SAMPLE_INDEX_IN_CHUNK __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_KEY_SAMPLE_TIME_BEFORE_APPEND __INTRODUCED_IN(31);
+
+extern const char* AMEDIAFORMAT_KEY_PICTURE_TYPE __INTRODUCED_IN(33);
+extern const char* AMEDIAFORMAT_KEY_VIDEO_ENCODING_STATISTICS_LEVEL __INTRODUCED_IN(33);
+extern const char* AMEDIAFORMAT_KEY_VIDEO_QP_AVERAGE __INTRODUCED_IN(33);
+
+extern const char* AMEDIAFORMAT_VIDEO_QP_B_MAX __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_B_MIN __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_I_MAX __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_I_MIN __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_MAX __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_MIN __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_P_MAX __INTRODUCED_IN(31);
+extern const char* AMEDIAFORMAT_VIDEO_QP_P_MIN __INTRODUCED_IN(31);
+
+/**
+ * MPEG-H audio profile and level compatibility.
+ *
+ * See FDAmd_2 of ISO_IEC_23008-3;2019 MHAProfileAndLevelCompatibilitySetBox.
+ *
+ * Available since API level 32.
+ */
+extern const char* AMEDIAFORMAT_KEY_MPEGH_COMPATIBLE_SETS __INTRODUCED_IN(32);
+
+/**
+ * MPEG-H audio profile level indication.
+ *
+ * See ISO_IEC_23008-3;2019 MHADecoderConfigurationRecord mpegh3daProfileLevelIndication.
+ *
+ * Available since API level 32.
+ */
+extern const char* AMEDIAFORMAT_KEY_MPEGH_PROFILE_LEVEL_INDICATION __INTRODUCED_IN(32);
+
+/**
+ * MPEG-H audio reference channel layout.
+ *
+ * See ISO_IEC_23008-3;2019 MHADecoderConfigurationRecord referenceChannelLayout
+ * and ISO_IEC_23001‐8 ChannelConfiguration value.
+ *
+ * Available since API level 32.
+ */
+extern const char* AMEDIAFORMAT_KEY_MPEGH_REFERENCE_CHANNEL_LAYOUT __INTRODUCED_IN(32);
 
 __END_DECLS
 

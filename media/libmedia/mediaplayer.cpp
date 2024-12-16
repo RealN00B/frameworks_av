@@ -40,8 +40,10 @@
 namespace android {
 
 using media::VolumeShaper;
+using content::AttributionSourceState;
 
-MediaPlayer::MediaPlayer(const std::string opPackageName) : mOpPackageName(opPackageName)
+MediaPlayer::MediaPlayer(const AttributionSourceState& attributionSource,
+    const audio_session_t sessionId) : mAttributionSource(attributionSource)
 {
     ALOGV("constructor");
     mListener = NULL;
@@ -59,7 +61,12 @@ MediaPlayer::MediaPlayer(const std::string opPackageName) : mOpPackageName(opPac
     mLeftVolume = mRightVolume = 1.0;
     mVideoWidth = mVideoHeight = 0;
     mLockThreadId = 0;
-    mAudioSessionId = (audio_session_t) AudioSystem::newAudioUniqueId(AUDIO_UNIQUE_ID_USE_SESSION);
+    if (sessionId == AUDIO_SESSION_ALLOCATE) {
+        mAudioSessionId = static_cast<audio_session_t>(
+            AudioSystem::newAudioUniqueId(AUDIO_UNIQUE_ID_USE_SESSION));
+    } else {
+        mAudioSessionId = sessionId;
+    }
     AudioSystem::acquireAudioSessionId(mAudioSessionId, (pid_t)-1, (uid_t)-1); // always in client.
     mSendLevel = 0;
     mRetransmitEndpointValid = false;
@@ -152,7 +159,7 @@ status_t MediaPlayer::setDataSource(
     if (url != NULL) {
         const sp<IMediaPlayerService> service(getMediaPlayerService());
         if (service != 0) {
-            sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mOpPackageName));
+            sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mAttributionSource));
             if ((NO_ERROR != doSetRetransmitEndpoint(player)) ||
                 (NO_ERROR != player->setDataSource(httpService, url, headers))) {
                 player.clear();
@@ -169,7 +176,7 @@ status_t MediaPlayer::setDataSource(int fd, int64_t offset, int64_t length)
     status_t err = UNKNOWN_ERROR;
     const sp<IMediaPlayerService> service(getMediaPlayerService());
     if (service != 0) {
-        sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mOpPackageName));
+        sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mAttributionSource));
         if ((NO_ERROR != doSetRetransmitEndpoint(player)) ||
             (NO_ERROR != player->setDataSource(fd, offset, length))) {
             player.clear();
@@ -185,7 +192,7 @@ status_t MediaPlayer::setDataSource(const sp<IDataSource> &source)
     status_t err = UNKNOWN_ERROR;
     const sp<IMediaPlayerService> service(getMediaPlayerService());
     if (service != 0) {
-        sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mOpPackageName));
+        sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mAttributionSource));
         if ((NO_ERROR != doSetRetransmitEndpoint(player)) ||
             (NO_ERROR != player->setDataSource(source))) {
             player.clear();
@@ -201,7 +208,7 @@ status_t MediaPlayer::setDataSource(const String8& rtpParams)
     status_t err = UNKNOWN_ERROR;
     const sp<IMediaPlayerService> service(getMediaPlayerService());
     if (service != 0) {
-        sp<IMediaPlayer> player(service->create(this, mAudioSessionId));
+        sp<IMediaPlayer> player(service->create(this, mAudioSessionId, mAttributionSource));
         if ((NO_ERROR != doSetRetransmitEndpoint(player)) ||
             (NO_ERROR != player->setDataSource(rtpParams))) {
             player.clear();
@@ -946,6 +953,9 @@ void MediaPlayer::notify(int msg, int ext1, int ext2, const Parcel *obj)
         ALOGV("New video size %d x %d", ext1, ext2);
         mVideoWidth = ext1;
         mVideoHeight = ext2;
+        break;
+    case MEDIA_STARTED:
+        ALOGV("Received media started message");
         break;
     case MEDIA_NOTIFY_TIME:
         ALOGV("Received notify time message");

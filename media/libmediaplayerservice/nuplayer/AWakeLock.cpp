@@ -28,11 +28,13 @@
 
 namespace android {
 
+const int32_t INVALID_DISPLAY_ID = -1;
+
 AWakeLock::AWakeLock() :
     mPowerManager(NULL),
     mWakeLockToken(NULL),
     mWakeLockCount(0),
-    mDeathRecipient(new PMDeathRecipient(this)) {}
+    mDeathRecipient(new PMDeathRecipient(this)){}
 
 AWakeLock::~AWakeLock() {
     if (mPowerManager != NULL) {
@@ -52,20 +54,27 @@ bool AWakeLock::acquire() {
             if (binder == NULL) {
                 ALOGW("could not get the power manager service");
             } else {
-                mPowerManager = interface_cast<IPowerManager>(binder);
+                mPowerManager = interface_cast<os::IPowerManager>(binder);
                 binder->linkToDeath(mDeathRecipient);
             }
         }
         if (mPowerManager != NULL) {
             sp<IBinder> binder = new BBinder();
             int64_t token = IPCThreadState::self()->clearCallingIdentity();
-            status_t status = mPowerManager->acquireWakeLock(
-                    POWERMANAGER_PARTIAL_WAKE_LOCK,
-                    binder, String16("AWakeLock"), String16("media"));
+            binder::Status status = mPowerManager->acquireWakeLock(
+                binder,
+                /*flags= */ POWERMANAGER_PARTIAL_WAKE_LOCK,
+                /*tag=*/ String16("AWakeLock"),
+                /*packageName=*/ String16("media"),
+                /*ws=*/ {},
+                /*historyTag=*/ {},
+                /*displayId=*/ INVALID_DISPLAY_ID,
+                /*callback=*/NULL);
             IPCThreadState::self()->restoreCallingIdentity(token);
-            if (status == NO_ERROR) {
+            if (status.isOk()) {
                 mWakeLockToken = binder;
                 mWakeLockCount++;
+                ALOGI("AwakeLock acquired");
                 return true;
             }
         }
@@ -92,6 +101,7 @@ void AWakeLock::release(bool force) {
             IPCThreadState::self()->restoreCallingIdentity(token);
         }
         mWakeLockToken.clear();
+        ALOGI("AwakeLock released");
     }
 }
 

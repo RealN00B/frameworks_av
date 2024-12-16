@@ -17,29 +17,34 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ACameraDeviceVendor"
 
-#include <vector>
-#include <inttypes.h>
-#include <android/frameworks/cameraservice/service/2.0/ICameraService.h>
-#include <android/frameworks/cameraservice/device/2.0/types.h>
-#include <CameraMetadata.h>
-
-#include "ndk_vendor/impl/ACameraDevice.h"
 #include "ACameraCaptureSession.h"
 #include "ACameraMetadata.h"
 #include "ACaptureRequest.h"
+#include "ndk_vendor/impl/ACameraDevice.h"
 #include "utils.h"
+#include <CameraMetadata.h>
+#include <aidl/android/frameworks/cameraservice/device/CameraMetadata.h>
+#include <aidl/android/frameworks/cameraservice/device/OutputConfiguration.h>
+#include <aidl/android/frameworks/cameraservice/device/SessionConfiguration.h>
+#include <android/native_window_aidl.h>
+#include <inttypes.h>
+#include <map>
+#include <utility>
+#include <vector>
 
-#include "ACameraCaptureSession.inc"
-
-#define CHECK_TRANSACTION_AND_RET(remoteRet, status, callName) \
-    if (!remoteRet.isOk()) { \
-        ALOGE("%s: Transaction error during %s call %s", __FUNCTION__, callName, \
-                  remoteRet.description().c_str()); \
-        return ACAMERA_ERROR_UNKNOWN; \
-    } \
-    if (status != Status::NO_ERROR) { \
-        ALOGE("%s: %s call failed", __FUNCTION__, callName); \
-        return utils::convertFromHidl(status); \
+#define CHECK_TRANSACTION_AND_RET(ret, callName)                                            \
+    if (!remoteRet.isOk()) {                                                                \
+        if (remoteRet.getExceptionCode() != EX_SERVICE_SPECIFIC) {                          \
+            ALOGE("%s: Transaction error during %s call %d", __FUNCTION__, callName,        \
+                                ret.getExceptionCode());                                    \
+            return ACAMERA_ERROR_UNKNOWN;                                                   \
+        } else {                                                                            \
+            Status errStatus = static_cast<Status>(remoteRet.getServiceSpecificError());    \
+            std::string errorMsg =                                                          \
+                    aidl::android::frameworks::cameraservice::common::toString(errStatus);  \
+            ALOGE("%s: %s call failed: %s", __FUNCTION__, callName, errorMsg.c_str());      \
+            return utils::convertFromAidl(errStatus);                                       \
+        }                                                                                   \
     }
 
 using namespace android;
@@ -51,10 +56,11 @@ ACameraDevice::~ACameraDevice() {
 namespace android {
 namespace acam {
 
-using HCameraMetadata = frameworks::cameraservice::device::V2_0::CameraMetadata;
-using OutputConfiguration = frameworks::cameraservice::device::V2_0::OutputConfiguration;
-using SessionConfiguration = frameworks::cameraservice::device::V2_0::SessionConfiguration;
-using hardware::Void;
+using AidlCameraMetadata = ::aidl::android::frameworks::cameraservice::device::CameraMetadata;
+using ::aidl::android::frameworks::cameraservice::device::OutputConfiguration;
+using ::aidl::android::frameworks::cameraservice::device::SessionConfiguration;
+using ::aidl::android::view::Surface;
+using ::ndk::ScopedAStatus;
 
 // Static member definitions
 const char* CameraDevice::kContextKey        = "Context";
@@ -83,7 +89,6 @@ CameraDevice::CameraDevice(
         mCameraId(id),
         mAppCallbacks(*cb),
         mChars(std::move(chars)),
-        mServiceCallback(new ServiceCallback(this)),
         mWrapper(wrapper),
         mInError(false),
         mError(ACAMERA_OK),
@@ -127,8 +132,11 @@ CameraDevice::CameraDevice(
 
 CameraDevice::~CameraDevice() { }
 
-void
-CameraDevice::postSessionMsgAndCleanup(sp<AMessage>& msg) {
+void CameraDevice::init() {
+    mServiceCallback = ndk::SharedRefBase::make<ServiceCallback>(weak_from_this());
+}
+
+void CameraDevice::postSessionMsgAndCleanup(sp<AMessage>& msg) {
     msg->post();
     msg.clear();
     sp<AMessage> cleanupMsg = new AMessage(kWhatCleanUpSessions, mHandler);
@@ -136,8 +144,7 @@ CameraDevice::postSessionMsgAndCleanup(sp<AMessage>& msg) {
 }
 
 // TODO: cached created request?
-camera_status_t
-CameraDevice::createCaptureRequest(
+camera_status_t CameraDevice::createCaptureRequest(
         ACameraDevice_request_template templateId,
         const ACameraIdList* physicalCameraIdList,
         ACaptureRequest** request) const {
@@ -149,20 +156,16 @@ CameraDevice::createCaptureRequest(
     if (mRemote == nullptr) {
         return ACAMERA_ERROR_CAMERA_DISCONNECTED;
     }
-    CameraMetadata rawRequest;
-    Status status = Status::UNKNOWN_ERROR;
-    auto remoteRet = mRemote->createDefaultRequest(
-        utils::convertToHidl(templateId),
-        [&status, &rawRequest](auto s, const hidl_vec<uint8_t> &metadata) {
-            status = s;
-            if (status == Status::NO_ERROR && utils::convertFromHidlCloned(metadata, &rawRequest)) {
-            } else {
-                ALOGE("%s: Couldn't create default request", __FUNCTION__);
-            }
-        });
-    CHECK_TRANSACTION_AND_RET(remoteRet, status, "createDefaultRequest()")
+
+    AidlCameraMetadata aidlMetadata;
+    ScopedAStatus remoteRet = mRemote->createDefaultRequest(
+            utils::convertToAidl(templateId), &aidlMetadata);
+    CHECK_TRANSACTION_AND_RET(remoteRet, "createDefaultRequest()")
+
+    camera_metadata_t* rawRequest;
+    utils::cloneFromAidl(aidlMetadata, &rawRequest);
     ACaptureRequest* outReq = new ACaptureRequest();
-    outReq->settings = new ACameraMetadata(rawRequest.release(), ACameraMetadata::ACM_REQUEST);
+    outReq->settings = new ACameraMetadata(rawRequest, ACameraMetadata::ACM_REQUEST);
     if (physicalCameraIdList != nullptr) {
         for (auto i = 0; i < physicalCameraIdList->numCameras; i++) {
             outReq->physicalSettings.emplace(physicalCameraIdList->cameraIds[i],
@@ -174,12 +177,12 @@ CameraDevice::createCaptureRequest(
     return ACAMERA_OK;
 }
 
-camera_status_t
-CameraDevice::createCaptureSession(
-        const ACaptureSessionOutputContainer*       outputs,
+camera_status_t CameraDevice::createCaptureSession(
+        const ACaptureSessionOutputContainer* outputs,
         const ACaptureRequest* sessionParameters,
         const ACameraCaptureSession_stateCallbacks* callbacks,
         /*out*/ACameraCaptureSession** session) {
+    nsecs_t startTimeNs = systemTime();
     sp<ACameraCaptureSession> currentSession = mCurrentSession.promote();
     Mutex::Autolock _l(mDeviceLock);
     camera_status_t ret = checkCameraClosedOrErrorLocked();
@@ -193,14 +196,14 @@ CameraDevice::createCaptureSession(
     }
 
     // Create new session
-    ret = configureStreamsLocked(outputs, sessionParameters);
+    ret = configureStreamsLocked(outputs, sessionParameters, startTimeNs);
     if (ret != ACAMERA_OK) {
         ALOGE("Fail to create new session. cannot configure streams");
         return ret;
     }
 
     ACameraCaptureSession* newSession = new ACameraCaptureSession(
-            mNextSessionId++, outputs, callbacks, this);
+            mNextSessionId++, outputs, callbacks, weak_from_this());
 
     // set new session as current session
     newSession->incStrong((void *) ACameraDevice_createCaptureSession);
@@ -226,41 +229,40 @@ camera_status_t CameraDevice::isSessionConfigurationSupported(
     sessionConfig.outputStreams.resize(sessionOutputContainer->mOutputs.size());
     size_t index = 0;
     for (const auto& output : sessionOutputContainer->mOutputs) {
-        sessionConfig.outputStreams[index].rotation = utils::convertToHidl(output.mRotation);
-        sessionConfig.outputStreams[index].windowGroupId = -1;
-        sessionConfig.outputStreams[index].windowHandles.resize(output.mSharedWindows.size() + 1);
-        sessionConfig.outputStreams[index].windowHandles[0] = output.mWindow;
-        sessionConfig.outputStreams[index].physicalCameraId = output.mPhysicalCameraId;
+        OutputConfiguration& outputStream = sessionConfig.outputStreams[index];
+        outputStream.rotation = utils::convertToAidl(output.mRotation);
+        outputStream.windowGroupId = -1;
+        auto& surfaces = outputStream.surfaces;
+        surfaces.reserve(output.mSharedWindows.size() + 1);
+        surfaces.emplace_back(output.mWindow);
+        outputStream.physicalCameraId = output.mPhysicalCameraId;
         index++;
     }
 
     bool configSupported = false;
-    Status status = Status::UNKNOWN_ERROR;
-    auto remoteRet = mRemote->isSessionConfigurationSupported(sessionConfig,
-        [&status, &configSupported](auto s, auto supported) {
-            status = s;
-            configSupported = supported;
-        });
-
-    CHECK_TRANSACTION_AND_RET(remoteRet, status, "isSessionConfigurationSupported()");
+    ScopedAStatus remoteRet = mRemote->isSessionConfigurationSupported(
+            sessionConfig, &configSupported);
+    CHECK_TRANSACTION_AND_RET(remoteRet, "isSessionConfigurationSupported()")
     return configSupported ? ACAMERA_OK : ACAMERA_ERROR_STREAM_CONFIGURE_FAIL;
 }
 
 static void addMetadataToPhysicalCameraSettings(const CameraMetadata *metadata,
         const std::string &cameraId, PhysicalCameraSettings *physicalCameraSettings) {
-    CameraMetadata metadataCopy = *metadata;
-    camera_metadata_t *camera_metadata = metadataCopy.release();
-    HCameraMetadata hCameraMetadata;
-    utils::convertToHidl(camera_metadata, &hCameraMetadata, /*shouldOwn*/ true);
-    physicalCameraSettings->settings.metadata(std::move(hCameraMetadata));
+    const camera_metadata_t* cameraMetadata = metadata->getAndLock();
+    AidlCameraMetadata aidlCameraMetadata;
+    utils::convertToAidl(cameraMetadata, &aidlCameraMetadata);
+    metadata->unlock(cameraMetadata);
+    physicalCameraSettings->settings.set<CaptureMetadataInfo::metadata>(
+            std::move(aidlCameraMetadata));
     physicalCameraSettings->id = cameraId;
 }
 
 void CameraDevice::addRequestSettingsMetadata(ACaptureRequest *aCaptureRequest,
         sp<CaptureRequest> &req) {
     req->mPhysicalCameraSettings.resize(1 + aCaptureRequest->physicalSettings.size());
-    addMetadataToPhysicalCameraSettings(&(aCaptureRequest->settings->getInternalData()), getId(),
-                    &(req->mPhysicalCameraSettings[0]));
+    addMetadataToPhysicalCameraSettings(
+            &(aCaptureRequest->settings->getInternalData()),
+            getId(),&(req->mPhysicalCameraSettings[0]));
     size_t i = 1;
     for (auto &physicalSetting : aCaptureRequest->physicalSettings) {
         addMetadataToPhysicalCameraSettings(&(physicalSetting.second->getInternalData()),
@@ -286,7 +288,7 @@ camera_status_t CameraDevice::updateOutputConfigurationLocked(ACaptureSessionOut
 
     int32_t streamId = -1;
     for (auto& kvPair : mConfiguredOutputs) {
-        if (utils::isWindowNativeHandleEqual(kvPair.second.first, output->mWindow)) {
+        if (kvPair.second.first == output->mWindow) {
             streamId = kvPair.first;
             break;
         }
@@ -296,55 +298,86 @@ camera_status_t CameraDevice::updateOutputConfigurationLocked(ACaptureSessionOut
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
 
-    OutputConfigurationWrapper outConfigW;
-    OutputConfiguration &outConfig = outConfigW.mOutputConfiguration;
-    outConfig.rotation = utils::convertToHidl(output->mRotation);
-    outConfig.windowHandles.resize(output->mSharedWindows.size() + 1);
-    outConfig.windowHandles[0] = output->mWindow;
+    OutputConfiguration outConfig;
+    outConfig.rotation = utils::convertToAidl(output->mRotation);
+    auto& surfaces = outConfig.surfaces;
+    surfaces.reserve(output->mSharedWindows.size() + 1);
+    surfaces.emplace_back(output->mWindow);
     outConfig.physicalCameraId = output->mPhysicalCameraId;
-    int i = 1;
     for (auto& anw : output->mSharedWindows) {
-        outConfig.windowHandles[i++] = anw;
+        surfaces.emplace_back(anw);
     }
 
-    auto remoteRet = mRemote->updateOutputConfiguration(streamId, outConfig);
+    auto remoteRet = mRemote->updateOutputConfiguration(streamId,
+                                                        outConfig);
+
     if (!remoteRet.isOk()) {
-        ALOGE("%s: Transaction error in updating OutputConfiguration: %s", __FUNCTION__,
-              remoteRet.description().c_str());
-        return ACAMERA_ERROR_UNKNOWN;
+        if (remoteRet.getExceptionCode() == EX_SERVICE_SPECIFIC) {
+            Status st = static_cast<Status>(remoteRet.getServiceSpecificError());
+            switch (st) {
+                case Status::NO_ERROR:
+                    break;
+                case Status::INVALID_OPERATION:
+                    ALOGE("Camera device %s invalid operation", getId());
+                    return ACAMERA_ERROR_INVALID_OPERATION;
+                case Status::ALREADY_EXISTS:
+                    ALOGE("Camera device %s output surface already exists", getId());
+                    return ACAMERA_ERROR_INVALID_PARAMETER;
+                case Status::ILLEGAL_ARGUMENT:
+                    ALOGE("Camera device %s invalid input argument", getId());
+                    return ACAMERA_ERROR_INVALID_PARAMETER;
+                default:
+                    ALOGE("Camera device %s failed to add shared output", getId());
+                    return ACAMERA_ERROR_UNKNOWN;
+            }
+        } else {
+            ALOGE("%s: Transaction error in updating OutputConfiguration: %d", __FUNCTION__,
+                remoteRet.getExceptionCode());
+            return ACAMERA_ERROR_UNKNOWN;
+        }
     }
 
-    switch (remoteRet) {
-            case Status::NO_ERROR:
-                break;
-            case Status::INVALID_OPERATION:
-                ALOGE("Camera device %s invalid operation", getId());
-                return ACAMERA_ERROR_INVALID_OPERATION;
-            case Status::ALREADY_EXISTS:
-                ALOGE("Camera device %s output surface already exists", getId());
-                return ACAMERA_ERROR_INVALID_PARAMETER;
-            case Status::ILLEGAL_ARGUMENT:
-                ALOGE("Camera device %s invalid input argument", getId());
-                return ACAMERA_ERROR_INVALID_PARAMETER;
-            default:
-                ALOGE("Camera device %s failed to add shared output", getId());
-                return ACAMERA_ERROR_UNKNOWN;
-    }
-
-    mConfiguredOutputs[streamId] = std::make_pair(output->mWindow, outConfigW);
-
+    mConfiguredOutputs[streamId] = std::make_pair(output->mWindow,
+                                        std::move(outConfig));
     return ACAMERA_OK;
 }
 
-camera_status_t
-CameraDevice::allocateCaptureRequestLocked(
+camera_status_t CameraDevice::prepareLocked(ANativeWindow *window) {
+    camera_status_t ret = checkCameraClosedOrErrorLocked();
+    if (ret != ACAMERA_OK) {
+        return ret;
+    }
+
+    if (window == nullptr) {
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+
+    int32_t streamId = -1;
+    for (auto& kvPair : mConfiguredOutputs) {
+        if (window == kvPair.second.first) {
+            streamId = kvPair.first;
+            break;
+        }
+    }
+    if (streamId < 0) {
+        ALOGE("Error: Invalid output configuration");
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+
+    auto remoteRet = mRemote->prepare(streamId);
+    CHECK_TRANSACTION_AND_RET(remoteRet, "prepare()")
+    return ACAMERA_OK;
+}
+
+camera_status_t CameraDevice::allocateCaptureRequestLocked(
         const ACaptureRequest* request, /*out*/sp<CaptureRequest> &outReq) {
     sp<CaptureRequest> req(new CaptureRequest());
     req->mCaptureRequest.physicalCameraSettings.resize(1 + request->physicalSettings.size());
 
     size_t index = 0;
     allocateOneCaptureRequestMetadata(
-            req->mCaptureRequest.physicalCameraSettings[index++], mCameraId, request->settings);
+            req->mCaptureRequest.physicalCameraSettings[index++],
+            mCameraId, request->settings);
 
     for (auto& physicalEntry : request->physicalSettings) {
         allocateOneCaptureRequestMetadata(
@@ -354,19 +387,21 @@ CameraDevice::allocateCaptureRequestLocked(
 
     std::vector<int32_t> requestStreamIdxList;
     std::vector<int32_t> requestSurfaceIdxList;
-    for (auto outputTarget : request->targets->mOutputs) {
-        native_handle_t* anw = outputTarget.mWindow;
+
+    for (auto& outputTarget : request->targets->mOutputs) {
+        ANativeWindow *anw = outputTarget.mWindow;
         bool found = false;
         req->mSurfaceList.push_back(anw);
         // lookup stream/surface ID
         for (const auto& kvPair : mConfiguredOutputs) {
             int streamId = kvPair.first;
-            const OutputConfigurationWrapper& outConfig = kvPair.second.second;
-            const auto& windowHandles = outConfig.mOutputConfiguration.windowHandles;
-            for (int surfaceId = 0; surfaceId < (int) windowHandles.size(); surfaceId++) {
-                // If two native handles are equivalent, so are their surfaces.
-                if (utils::isWindowNativeHandleEqual(windowHandles[surfaceId].getNativeHandle(),
-                                                      anw)) {
+            const OutputConfiguration& outConfig = kvPair.second.second;
+            const auto& surfaces = outConfig.surfaces;
+            for (int surfaceId = 0; surfaceId < (int) surfaces.size(); surfaceId++) {
+                // If two window handles point to the same native window,
+                // they have the same surfaces.
+                auto& surface = surfaces[surfaceId];
+                if (anw == surface.get()) {
                     found = true;
                     requestStreamIdxList.push_back(streamId);
                     requestSurfaceIdxList.push_back(surfaceId);
@@ -395,54 +430,57 @@ void CameraDevice::allocateOneCaptureRequestMetadata(
         PhysicalCameraSettings& cameraSettings,
         const std::string& id, const sp<ACameraMetadata>& metadata) {
     cameraSettings.id = id;
-    // TODO: Do we really need to copy the metadata here ?
-    CameraMetadata metadataCopy = metadata->getInternalData();
-    camera_metadata_t *cameraMetadata = metadataCopy.release();
-    HCameraMetadata hCameraMetadata;
-    utils::convertToHidl(cameraMetadata, &hCameraMetadata, true);
-    if (metadata != nullptr) {
-        if (hCameraMetadata.data() != nullptr &&
-            mCaptureRequestMetadataQueue != nullptr &&
-            mCaptureRequestMetadataQueue->write(
-                reinterpret_cast<const uint8_t *>(hCameraMetadata.data()),
-                hCameraMetadata.size())) {
-            // The metadata field of the union would've been destructued, so no need
-            // to re-size it.
-            cameraSettings.settings.fmqMetadataSize(hCameraMetadata.size());
-        } else {
-            ALOGE("Fmq write capture result failed, falling back to hwbinder");
-            cameraSettings.settings.metadata(std::move(hCameraMetadata));
-        }
+
+    if (metadata == nullptr) {
+        return;
+    }
+
+    const camera_metadata_t* cameraMetadata = metadata->getInternalData().getAndLock();
+    AidlCameraMetadata aidlCameraMetadata;
+    utils::convertToAidl(cameraMetadata, &aidlCameraMetadata);
+    metadata->getInternalData().unlock(cameraMetadata);
+
+    if (aidlCameraMetadata.metadata.data() != nullptr &&
+        mCaptureRequestMetadataQueue != nullptr &&
+        mCaptureRequestMetadataQueue->write(
+                reinterpret_cast<const int8_t*>(aidlCameraMetadata.metadata.data()),
+                aidlCameraMetadata.metadata.size())) {
+        cameraSettings.settings.set<CaptureMetadataInfo::fmqMetadataSize>(
+                aidlCameraMetadata.metadata.size());
+    } else {
+        ALOGE("Fmq write capture result failed, falling back to hwbinder");
+        cameraSettings.settings.set<CaptureMetadataInfo::metadata>(std::move(aidlCameraMetadata));
     }
 }
 
 
-ACaptureRequest*
-CameraDevice::allocateACaptureRequest(sp<CaptureRequest>& req, const char* deviceId) {
+ACaptureRequest* CameraDevice::allocateACaptureRequest(sp<CaptureRequest>& req,
+                                                       const char* deviceId) {
     ACaptureRequest* pRequest = new ACaptureRequest();
     for (size_t i = 0; i < req->mPhysicalCameraSettings.size(); i++) {
         const std::string& id = req->mPhysicalCameraSettings[i].id;
-        CameraMetadata clone;
-        utils::convertFromHidlCloned(req->mPhysicalCameraSettings[i].settings.metadata(), &clone);
-        camera_metadata_t *clonep = clone.release();
+        camera_metadata_t* clone;
+        AidlCameraMetadata& aidlCameraMetadata = req->mPhysicalCameraSettings[i].settings
+                                                         .get<CaptureMetadataInfo::metadata>();
+        utils::cloneFromAidl(aidlCameraMetadata, &clone);
+
         if (id == deviceId) {
-            pRequest->settings = new ACameraMetadata(clonep, ACameraMetadata::ACM_REQUEST);
+            pRequest->settings = new ACameraMetadata(clone, ACameraMetadata::ACM_REQUEST);
         } else {
             pRequest->physicalSettings[req->mPhysicalCameraSettings[i].id] =
-                    new ACameraMetadata(clonep, ACameraMetadata::ACM_REQUEST);
+                    new ACameraMetadata(clone, ACameraMetadata::ACM_REQUEST);
         }
     }
     pRequest->targets = new ACameraOutputTargets();
     for (size_t i = 0; i < req->mSurfaceList.size(); i++) {
-        native_handle_t* anw = req->mSurfaceList[i];
+        ANativeWindow *anw = req->mSurfaceList[i];
         ACameraOutputTarget outputTarget(anw);
-        pRequest->targets->mOutputs.insert(outputTarget);
+        pRequest->targets->mOutputs.insert(std::move(outputTarget));
     }
     return pRequest;
 }
 
-void
-CameraDevice::freeACaptureRequest(ACaptureRequest* req) {
+void CameraDevice::freeACaptureRequest(ACaptureRequest* req) {
     if (req == nullptr) {
         return;
     }
@@ -459,7 +497,7 @@ CameraDevice::notifySessionEndOfLifeLocked(ACameraCaptureSession* session) {
     }
 
     if (mCurrentSession != session) {
-        // Session has been replaced by other seesion or device is closed
+        // Session has been replaced by other session or device is closed
         return;
     }
     mCurrentSession = nullptr;
@@ -471,8 +509,12 @@ CameraDevice::notifySessionEndOfLifeLocked(ACameraCaptureSession* session) {
         return;
     }
 
-    // No new session, unconfigure now
-    camera_status_t ret = configureStreamsLocked(nullptr, nullptr);
+    // No new session, un-configure now
+    // Note: The un-configuration of session won't be accounted for session
+    // latency because a stream configuration with 0 streams won't ever become
+    // active.
+    nsecs_t startTimeNs = systemTime();
+    camera_status_t ret = configureStreamsLocked(nullptr, nullptr, startTimeNs);
     if (ret != ACAMERA_OK) {
         ALOGE("Unconfigure stream failed. Device might still be configured! ret %d", ret);
     }
@@ -487,10 +529,11 @@ CameraDevice::disconnectLocked(sp<ACameraCaptureSession>& session) {
     }
 
     if (mRemote != nullptr) {
+        ALOGD("%s: binder disconnect reached", __FUNCTION__);
         auto ret = mRemote->disconnect();
         if (!ret.isOk()) {
-            ALOGE("%s: Transaction error while disconnecting device %s", __FUNCTION__,
-                  ret.description().c_str());
+            ALOGE("%s: Transaction error while disconnecting device %d", __FUNCTION__,
+                  ret.getExceptionCode());
         }
     }
     mRemote = nullptr;
@@ -500,8 +543,7 @@ CameraDevice::disconnectLocked(sp<ACameraCaptureSession>& session) {
     }
 }
 
-camera_status_t
-CameraDevice::stopRepeatingLocked() {
+camera_status_t CameraDevice::stopRepeatingLocked() {
     camera_status_t ret = checkCameraClosedOrErrorLocked();
     if (ret != ACAMERA_OK) {
         ALOGE("Camera %s stop repeating failed! ret %d", getId(), ret);
@@ -512,20 +554,14 @@ CameraDevice::stopRepeatingLocked() {
         mRepeatingSequenceId = REQUEST_ID_NONE;
 
         int64_t lastFrameNumber;
-        Status status = Status::UNKNOWN_ERROR;
-        auto remoteRet = mRemote->cancelRepeatingRequest(
-                [&status, &lastFrameNumber](Status s, auto frameNumber) {
-                    status = s;
-                    lastFrameNumber = frameNumber;
-                });
-        CHECK_TRANSACTION_AND_RET(remoteRet, status, "cancelRepeatingRequest()");
+        ScopedAStatus remoteRet = mRemote->cancelRepeatingRequest(&lastFrameNumber);
+        CHECK_TRANSACTION_AND_RET(remoteRet, "cancelRepeatingRequest()");
         checkRepeatingSequenceCompleteLocked(repeatingSequenceId, lastFrameNumber);
     }
     return ACAMERA_OK;
 }
 
-camera_status_t
-CameraDevice::flushLocked(ACameraCaptureSession* session) {
+camera_status_t CameraDevice::flushLocked(ACameraCaptureSession* session) {
     camera_status_t ret = checkCameraClosedOrErrorLocked();
     if (ret != ACAMERA_OK) {
         ALOGE("Camera %s abort captures failed! ret %d", getId(), ret);
@@ -566,20 +602,15 @@ CameraDevice::flushLocked(ACameraCaptureSession* session) {
     }
 
     int64_t lastFrameNumber;
-    Status status = Status::UNKNOWN_ERROR;
-    auto remoteRet = mRemote->flush([&status, &lastFrameNumber](auto s, auto frameNumber) {
-                                        status = s;
-                                        lastFrameNumber = frameNumber;
-                                    });
-    CHECK_TRANSACTION_AND_RET(remoteRet, status, "flush()")
+    ScopedAStatus remoteRet = mRemote->flush(&lastFrameNumber);
+    CHECK_TRANSACTION_AND_RET(remoteRet, "flush()")
     if (mRepeatingSequenceId != REQUEST_ID_NONE) {
         checkRepeatingSequenceCompleteLocked(mRepeatingSequenceId, lastFrameNumber);
     }
     return ACAMERA_OK;
 }
 
-camera_status_t
-CameraDevice::waitUntilIdleLocked() {
+camera_status_t CameraDevice::waitUntilIdleLocked() {
     camera_status_t ret = checkCameraClosedOrErrorLocked();
     if (ret != ACAMERA_OK) {
         ALOGE("Wait until camera %s idle failed! ret %d", getId(), ret);
@@ -592,13 +623,13 @@ CameraDevice::waitUntilIdleLocked() {
     }
 
     auto remoteRet = mRemote->waitUntilIdle();
-    CHECK_TRANSACTION_AND_RET(remoteRet, remoteRet, "waitUntilIdle()")
+    CHECK_TRANSACTION_AND_RET(remoteRet, "waitUntilIdle()")
     return ACAMERA_OK;
 }
 
-camera_status_t
-CameraDevice::configureStreamsLocked(const ACaptureSessionOutputContainer* outputs,
-        const ACaptureRequest* sessionParameters) {
+camera_status_t CameraDevice::configureStreamsLocked(const ACaptureSessionOutputContainer* outputs,
+                                                     const ACaptureRequest* sessionParameters,
+                                                     nsecs_t startTimeNs) {
     ACaptureSessionOutputContainer emptyOutput;
     if (outputs == nullptr) {
         outputs = &emptyOutput;
@@ -609,30 +640,38 @@ CameraDevice::configureStreamsLocked(const ACaptureSessionOutputContainer* outpu
         return ret;
     }
 
-    std::set<std::pair<native_handle_ptr_wrapper, OutputConfigurationWrapper>> outputSet;
-    for (auto outConfig : outputs->mOutputs) {
-        native_handle_t* anw = outConfig.mWindow;
-        OutputConfigurationWrapper outConfigInsertW;
-        OutputConfiguration &outConfigInsert = outConfigInsertW.mOutputConfiguration;
-        outConfigInsert.rotation = utils::convertToHidl(outConfig.mRotation);
+    std::map<ANativeWindow *, OutputConfiguration> windowToConfig;
+    for (const auto& outConfig : outputs->mOutputs) {
+        ANativeWindow *anw = outConfig.mWindow;
+        OutputConfiguration outConfigInsert;
+        outConfigInsert.rotation = utils::convertToAidl(outConfig.mRotation);
         outConfigInsert.windowGroupId = -1;
-        outConfigInsert.windowHandles.resize(outConfig.mSharedWindows.size() + 1);
-        outConfigInsert.windowHandles[0] = anw;
+        auto& surfaces = outConfigInsert.surfaces;
+        surfaces.reserve(outConfig.mSharedWindows.size() + 1);
+        surfaces.emplace_back(anw);
         outConfigInsert.physicalCameraId = outConfig.mPhysicalCameraId;
-        native_handle_ptr_wrapper wrap(anw);
-        outputSet.insert(std::make_pair(anw, outConfigInsertW));
+        windowToConfig.insert({anw, std::move(outConfigInsert)});
     }
-    std::set<std::pair<native_handle_ptr_wrapper, OutputConfigurationWrapper>> addSet = outputSet;
+
+    std::set<ANativeWindow *> addSet;
+    for (auto& kvPair : windowToConfig) {
+        addSet.insert(kvPair.first);
+    }
+
     std::vector<int32_t> deleteList;
 
     // Determine which streams need to be created, which to be deleted
     for (auto& kvPair : mConfiguredOutputs) {
         int32_t streamId = kvPair.first;
         auto& outputPair = kvPair.second;
-        if (outputSet.count(outputPair)) {
-            deleteList.push_back(streamId); // Need to delete a no longer needed stream
+        auto& anw = outputPair.first;
+        auto& configuredOutput = outputPair.second;
+
+        auto itr = windowToConfig.find(anw);
+        if (itr != windowToConfig.end() && (itr->second) == configuredOutput) {
+            deleteList.push_back(streamId);
         } else {
-            addSet.erase(outputPair);        // No need to add already existing stream
+            addSet.erase(anw);
         }
     }
 
@@ -667,105 +706,96 @@ CameraDevice::configureStreamsLocked(const ACaptureSessionOutputContainer* outpu
     mIdle = true;
 
     auto remoteRet = mRemote->beginConfigure();
-    CHECK_TRANSACTION_AND_RET(remoteRet, remoteRet, "beginConfigure()")
+    CHECK_TRANSACTION_AND_RET(remoteRet, "beginConfigure()")
 
     // delete to-be-deleted streams
     for (auto streamId : deleteList) {
         remoteRet = mRemote->deleteStream(streamId);
-        CHECK_TRANSACTION_AND_RET(remoteRet, remoteRet, "deleteStream()")
+        CHECK_TRANSACTION_AND_RET(remoteRet, "deleteStream()")
         mConfiguredOutputs.erase(streamId);
     }
 
     // add new streams
-    for (auto outputPair : addSet) {
-        int streamId;
-        Status status = Status::UNKNOWN_ERROR;
-        auto ret = mRemote->createStream(outputPair.second,
-                                         [&status, &streamId](Status s, auto stream_id) {
-                                             status = s;
-                                             streamId = stream_id;
-                                         });
-        CHECK_TRANSACTION_AND_RET(ret, status, "createStream()")
-        mConfiguredOutputs.insert(std::make_pair(streamId, outputPair));
+    for (const auto &anw : addSet) {
+        int32_t streamId;
+        auto itr = windowToConfig.find(anw);
+        remoteRet = mRemote->createStream(itr->second, &streamId);
+        CHECK_TRANSACTION_AND_RET(remoteRet, "createStream()")
+        mConfiguredOutputs.insert(std::make_pair(streamId,
+                                                 std::make_pair(anw,
+                                                                std::move(itr->second))));
+        windowToConfig.erase(itr);
     }
 
-    CameraMetadata params;
-    HCameraMetadata hidlParams;
+    AidlCameraMetadata aidlParams;
     if ((sessionParameters != nullptr) && (sessionParameters->settings != nullptr)) {
-        params.append(sessionParameters->settings->getInternalData());
-        const camera_metadata_t *params_metadata = params.getAndLock();
-        utils::convertToHidl(params_metadata, &hidlParams);
-        params.unlock(params_metadata);
+        const CameraMetadata &params = sessionParameters->settings->getInternalData();
+        const camera_metadata_t* paramsMetadata = params.getAndLock();
+        utils::convertToAidl(paramsMetadata, &aidlParams);
+        params.unlock(paramsMetadata);
     }
-    remoteRet = mRemote->endConfigure(StreamConfigurationMode::NORMAL_MODE, hidlParams);
-    CHECK_TRANSACTION_AND_RET(remoteRet, remoteRet, "endConfigure()")
+    remoteRet = mRemote->endConfigure(StreamConfigurationMode::NORMAL_MODE,
+                                      aidlParams, startTimeNs);
+    CHECK_TRANSACTION_AND_RET(remoteRet, "endConfigure()")
     return ACAMERA_OK;
 }
 
-void
-CameraDevice::setRemoteDevice(sp<ICameraDeviceUser> remote) {
+void CameraDevice::setRemoteDevice(std::shared_ptr<ICameraDeviceUser> remote) {
     Mutex::Autolock _l(mDeviceLock);
-    mRemote = remote;
+    mRemote = std::move(remote);
 }
 
-bool
-CameraDevice::setDeviceMetadataQueues() {
+bool CameraDevice::setDeviceMetadataQueues() {
         if (mRemote == nullptr) {
           ALOGE("mRemote must not be null while trying to fetch metadata queues");
           return false;
         }
         std::shared_ptr<RequestMetadataQueue> &reqQueue = mCaptureRequestMetadataQueue;
-        auto ret =
-            mRemote->getCaptureRequestMetadataQueue(
-                [&reqQueue](const auto &mqDescriptor) {
-                    reqQueue = std::make_shared<RequestMetadataQueue>(mqDescriptor);
-                    if (!reqQueue->isValid() || reqQueue->availableToWrite() <=0) {
-                        ALOGE("Empty fmq from cameraserver");
-                        reqQueue = nullptr;
-                    }
-                });
+        MQDescriptor<int8_t, SynchronizedReadWrite> reqMqDescriptor;
+        ScopedAStatus ret = mRemote->getCaptureRequestMetadataQueue(&reqMqDescriptor);
         if (!ret.isOk()) {
             ALOGE("Transaction error trying to get capture request metadata queue");
             return false;
         }
+        reqQueue = std::make_shared<RequestMetadataQueue>(reqMqDescriptor);
+        if (!reqQueue->isValid() || reqQueue->availableToWrite() <= 0) {
+            ALOGE("Empty fmq from cameraserver");
+            reqQueue = nullptr;
+        }
+
+        MQDescriptor<int8_t, SynchronizedReadWrite> resMqDescriptor;
         std::shared_ptr<ResultMetadataQueue> &resQueue = mCaptureResultMetadataQueue;
-        ret =
-                mRemote->getCaptureResultMetadataQueue(
-                        [&resQueue](const auto &mqDescriptor) {
-                            resQueue = std::make_shared<ResultMetadataQueue>(mqDescriptor);
-                            if (!resQueue->isValid() || resQueue->availableToWrite() <=0) {
-                                ALOGE("Empty fmq from cameraserver");
-                            }
-                        });
+        ret = mRemote->getCaptureResultMetadataQueue(&resMqDescriptor);
         if (!ret.isOk()) {
             ALOGE("Transaction error trying to get capture result metadata queue");
             return false;
         }
+        resQueue = std::make_shared<ResultMetadataQueue>(resMqDescriptor);
+        if (!resQueue->isValid() || resQueue->availableToWrite() <= 0) {
+            ALOGE("Empty fmq from cameraserver");
+        }
+
         return true;
 }
 
-camera_status_t
-CameraDevice::checkCameraClosedOrErrorLocked() const {
+camera_status_t CameraDevice::checkCameraClosedOrErrorLocked() const {
     if (mRemote == nullptr) {
         ALOGE("%s: camera device already closed", __FUNCTION__);
         return ACAMERA_ERROR_CAMERA_DISCONNECTED;
     }
-    if (mInError) {// triggered by onDeviceError
-        ALOGE("%s: camera device has encountered a serious error", __FUNCTION__);
+    if (mInError) { // triggered by onDeviceError
+        ALOGE("%s: camera device has encountered a serious error: %d", __FUNCTION__, mError);
         return mError;
     }
     return ACAMERA_OK;
 }
 
-void
-CameraDevice::setCameraDeviceErrorLocked(camera_status_t error) {
+void CameraDevice::setCameraDeviceErrorLocked(camera_status_t error) {
     mInError = true;
     mError = error;
-    return;
 }
 
-void
-CameraDevice::FrameNumberTracker::updateTracker(int64_t frameNumber, bool isError) {
+void CameraDevice::FrameNumberTracker::updateTracker(int64_t frameNumber, bool isError) {
     ALOGV("updateTracker frame %" PRId64 " isError %d", frameNumber, isError);
     if (isError) {
         mFutureErrorSet.insert(frameNumber);
@@ -784,8 +814,7 @@ CameraDevice::FrameNumberTracker::updateTracker(int64_t frameNumber, bool isErro
     update();
 }
 
-void
-CameraDevice::FrameNumberTracker::update() {
+void CameraDevice::FrameNumberTracker::update() {
     for (auto it = mFutureErrorSet.begin(); it != mFutureErrorSet.end();) {
         int64_t errorFrameNumber = *it;
         if (errorFrameNumber == mCompletedFrameNumber + 1) {
@@ -804,10 +833,8 @@ CameraDevice::FrameNumberTracker::update() {
     ALOGV("Update complete frame %" PRId64, mCompletedFrameNumber);
 }
 
-void
-CameraDevice::onCaptureErrorLocked(
-        ErrorCode errorCode,
-        const CaptureResultExtras& resultExtras) {
+void CameraDevice::onCaptureErrorLocked(ErrorCode errorCode,
+                                        const CaptureResultExtras& resultExtras) {
     int sequenceId = resultExtras.requestId;
     int64_t frameNumber = resultExtras.frameNumber;
     int32_t burstId = resultExtras.burstId;
@@ -819,7 +846,7 @@ CameraDevice::onCaptureErrorLocked(
         return;
     }
 
-    CallbackHolder cbh = (*it).second;
+    CallbackHolder cbh = it->second;
     sp<ACameraCaptureSession> session = cbh.mSession;
     if ((size_t) burstId >= cbh.mRequests.size()) {
         ALOGE("%s: Error: request index %d out of bound (size %zu)",
@@ -841,13 +868,31 @@ CameraDevice::onCaptureErrorLocked(
             return;
         }
 
-        const auto& windowHandles = outputPairIt->second.second.mOutputConfiguration.windowHandles;
-        for (const auto& outHandle : windowHandles) {
-            for (auto streamAndWindowId : request->mCaptureRequest.streamAndWindowIds) {
-                int32_t windowId = streamAndWindowId.windowId;
-                if (utils::isWindowNativeHandleEqual(windowHandles[windowId],outHandle)) {
-                    native_handle_t* anw =
-                        const_cast<native_handle_t *>(windowHandles[windowId].getNativeHandle());
+        // Get the surfaces corresponding to the error stream id, go through
+        // them and try to match the surfaces in the corresponding
+        // CaptureRequest.
+        const auto& errorSurfaces =
+                outputPairIt->second.second.surfaces;
+        for (const auto& errorSurface : errorSurfaces) {
+            for (const auto &requestStreamAndWindowId :
+                        request->mCaptureRequest.streamAndWindowIds) {
+                // Go through the surfaces in the capture request and see which
+                // ones match the surfaces in the error stream.
+                int32_t requestWindowId = requestStreamAndWindowId.windowId;
+                auto requestSurfacePairIt =
+                        mConfiguredOutputs.find(requestStreamAndWindowId.streamId);
+                if (requestSurfacePairIt == mConfiguredOutputs.end()) {
+                    ALOGE("%s: Error: request stream id %d does not exist", __FUNCTION__,
+                              requestStreamAndWindowId.streamId);
+                    setCameraDeviceErrorLocked(ACAMERA_ERROR_CAMERA_SERVICE);
+                    return;
+                }
+
+                const auto &requestSurfaces = requestSurfacePairIt->second.second.surfaces;
+                auto& requestSurface = requestSurfaces[requestWindowId];
+
+                if (requestSurface == errorSurface) {
+                    const ANativeWindow *anw = requestSurface.get();
                     ALOGV("Camera %s Lost output buffer for ANW %p frame %" PRId64,
                             getId(), anw, frameNumber);
 
@@ -872,14 +917,16 @@ CameraDevice::onCaptureErrorLocked(
         failure->sequenceId  = sequenceId;
         failure->wasImageCaptured = (errorCode == ErrorCode::CAMERA_RESULT);
 
-        sp<AMessage> msg = new AMessage(cbh.mIsLogicalCameraCallback ? kWhatLogicalCaptureFail :
-                kWhatCaptureFail, mHandler);
+        sp<AMessage> msg = new AMessage(cbh.mIsLogicalCameraCallback ? kWhatLogicalCaptureFail
+                                                                     : kWhatCaptureFail,
+                                        mHandler);
         msg->setPointer(kContextKey, cbh.mContext);
         msg->setObject(kSessionSpKey, session);
         if (cbh.mIsLogicalCameraCallback) {
-            if (resultExtras.errorPhysicalCameraId.size() > 0) {
-                msg->setString(kFailingPhysicalCameraId, resultExtras.errorPhysicalCameraId.c_str(),
-                        resultExtras.errorPhysicalCameraId.size());
+            if (!resultExtras.errorPhysicalCameraId.empty()) {
+                msg->setString(kFailingPhysicalCameraId,
+                               resultExtras.errorPhysicalCameraId.c_str(),
+                               resultExtras.errorPhysicalCameraId.size());
             }
             msg->setPointer(kCallbackFpKey, (void*) cbh.mOnLogicalCameraCaptureFailed);
         } else {
@@ -893,7 +940,6 @@ CameraDevice::onCaptureErrorLocked(
         mFrameNumberTracker.updateTracker(frameNumber, /*isError*/true);
         checkAndFireSequenceCompleteLocked();
     }
-    return;
 }
 
 CameraDevice::CallbackHandler::CallbackHandler(const char *id) : mId(id) { }
@@ -905,6 +951,7 @@ void CameraDevice::CallbackHandler::onMessageReceived(
         case kWhatOnError:
         case kWhatSessionStateCb:
         case kWhatCaptureStart:
+        case kWhatCaptureStart2:
         case kWhatCaptureResult:
         case kWhatLogicalCaptureResult:
         case kWhatCaptureFail:
@@ -912,6 +959,7 @@ void CameraDevice::CallbackHandler::onMessageReceived(
         case kWhatCaptureSeqEnd:
         case kWhatCaptureSeqAbort:
         case kWhatCaptureBufferLost:
+        case kWhatPreparedCb:
             ALOGV("%s: Received msg %d", __FUNCTION__, msg->what());
             break;
         case kWhatCleanUpSessions:
@@ -977,6 +1025,7 @@ void CameraDevice::CallbackHandler::onMessageReceived(
         }
         case kWhatSessionStateCb:
         case kWhatCaptureStart:
+        case kWhatCaptureStart2:
         case kWhatCaptureResult:
         case kWhatLogicalCaptureResult:
         case kWhatCaptureFail:
@@ -984,6 +1033,7 @@ void CameraDevice::CallbackHandler::onMessageReceived(
         case kWhatCaptureSeqEnd:
         case kWhatCaptureSeqAbort:
         case kWhatCaptureBufferLost:
+        case kWhatPreparedCb:
         {
             sp<RefBase> obj;
             found = msg->findObject(kSessionSpKey, &obj);
@@ -992,11 +1042,12 @@ void CameraDevice::CallbackHandler::onMessageReceived(
                 return;
             }
             sp<ACameraCaptureSession> session(static_cast<ACameraCaptureSession*>(obj.get()));
-            mCachedSessions.push(session);
+            mCachedSessions.push_back(session);
             sp<CaptureRequest> requestSp = nullptr;
             const char *id_cstr = mId.c_str();
             switch (msg->what()) {
                 case kWhatCaptureStart:
+                case kWhatCaptureStart2:
                 case kWhatCaptureResult:
                 case kWhatLogicalCaptureResult:
                 case kWhatCaptureFail:
@@ -1026,6 +1077,26 @@ void CameraDevice::CallbackHandler::onMessageReceived(
                     (*onState)(context, session.get());
                     break;
                 }
+                case kWhatPreparedCb:
+                {
+                    ACameraCaptureSession_prepareCallback onWindowPrepared;
+                    found = msg->findPointer(kCallbackFpKey, (void**) &onWindowPrepared);
+                    if (!found) {
+                        ALOGE("%s: Cannot find state callback!", __FUNCTION__);
+                        return;
+                    }
+                    if (onWindowPrepared == nullptr) {
+                        return;
+                    }
+                    ANativeWindow* anw;
+                    found = msg->findPointer(kAnwKey, (void**) &anw);
+                    if (!found) {
+                        ALOGE("%s: Cannot find ANativeWindow: %d!", __FUNCTION__, __LINE__);
+                        return;
+                    }
+                    (*onWindowPrepared)(context, anw, session.get());
+                    break;
+                }
                 case kWhatCaptureStart:
                 {
                     ACameraCaptureSession_captureCallback_start onStart;
@@ -1045,6 +1116,35 @@ void CameraDevice::CallbackHandler::onMessageReceived(
                     }
                     ACaptureRequest* request = allocateACaptureRequest(requestSp, id_cstr);
                     (*onStart)(context, session.get(), request, timestamp);
+                    freeACaptureRequest(request);
+                    break;
+                }
+                case kWhatCaptureStart2:
+                {
+                    ACameraCaptureSession_captureCallback_startV2 onStart2;
+                    found = msg->findPointer(kCallbackFpKey, (void**) &onStart2);
+                    if (!found) {
+                        ALOGE("%s: Cannot find capture startV2 callback!", __FUNCTION__);
+                        return;
+                    }
+                    if (onStart2 == nullptr) {
+                        return;
+                    }
+                    int64_t timestamp;
+                    found = msg->findInt64(kTimeStampKey, &timestamp);
+                    if (!found) {
+                        ALOGE("%s: Cannot find timestamp!", __FUNCTION__);
+                        return;
+                    }
+                    int64_t frameNumber;
+                    found = msg->findInt64(kFrameNumberKey, &frameNumber);
+                    if (!found) {
+                        ALOGE("%s: Cannot find frame number!", __FUNCTION__);
+                        return;
+                    }
+
+                    ACaptureRequest* request = allocateACaptureRequest(requestSp, id_cstr);
+                    (*onStart2)(context, session.get(), request, timestamp, frameNumber);
                     freeACaptureRequest(request);
                     break;
                 }
@@ -1109,7 +1209,8 @@ void CameraDevice::CallbackHandler::onMessageReceived(
                         clone.update(ANDROID_SYNC_FRAME_NUMBER,
                                 &physicalResult->mFrameNumber, /*data_count*/1);
                         sp<ACameraMetadata> metadata =
-                                new ACameraMetadata(clone.release(), ACameraMetadata::ACM_RESULT);
+                                new ACameraMetadata(clone.release(),
+                                                    ACameraMetadata::ACM_RESULT);
                         physicalMetadataCopy.push_back(metadata);
                     }
                     std::vector<const char*> physicalCameraIdPtrs;
@@ -1244,10 +1345,10 @@ void CameraDevice::CallbackHandler::onMessageReceived(
                         return;
                     }
 
-                    native_handle_t* anw;
+                    ANativeWindow* anw;
                     found = msg->findPointer(kAnwKey, (void**) &anw);
                     if (!found) {
-                        ALOGE("%s: Cannot find native_handle_t!", __FUNCTION__);
+                        ALOGE("%s: Cannot find ANativeWindow!", __FUNCTION__);
                         return;
                     }
 
@@ -1271,11 +1372,12 @@ void CameraDevice::CallbackHandler::onMessageReceived(
 
 CameraDevice::CallbackHolder::CallbackHolder(
         sp<ACameraCaptureSession>          session,
-        const Vector<sp<CaptureRequest> >& requests,
+        std::vector<sp<CaptureRequest>>  requests,
         bool                               isRepeating,
         ACameraCaptureSession_captureCallbacks* cbs) :
-        mSession(session), mRequests(requests),
+        mSession(std::move(session)), mRequests(std::move(requests)),
         mIsRepeating(isRepeating),
+        mIs2Callback(false),
         mIsLogicalCameraCallback(false) {
     initCaptureCallbacks(cbs);
 
@@ -1287,13 +1389,48 @@ CameraDevice::CallbackHolder::CallbackHolder(
 
 CameraDevice::CallbackHolder::CallbackHolder(
         sp<ACameraCaptureSession>          session,
-        const Vector<sp<CaptureRequest> >& requests,
+        std::vector<sp<CaptureRequest>>  requests,
         bool                               isRepeating,
         ACameraCaptureSession_logicalCamera_captureCallbacks* lcbs) :
-        mSession(session), mRequests(requests),
+        mSession(std::move(session)), mRequests(std::move(requests)),
         mIsRepeating(isRepeating),
+        mIs2Callback(false),
         mIsLogicalCameraCallback(true) {
     initCaptureCallbacks(lcbs);
+
+    if (lcbs != nullptr) {
+        mOnLogicalCameraCaptureCompleted = lcbs->onLogicalCameraCaptureCompleted;
+        mOnLogicalCameraCaptureFailed = lcbs->onLogicalCameraCaptureFailed;
+    }
+}
+
+CameraDevice::CallbackHolder::CallbackHolder(
+        sp<ACameraCaptureSession>          session,
+        std::vector<sp<CaptureRequest>>  requests,
+        bool                               isRepeating,
+        ACameraCaptureSession_captureCallbacksV2* cbs) :
+        mSession(std::move(session)), mRequests(std::move(requests)),
+        mIsRepeating(isRepeating),
+        mIs2Callback(true),
+        mIsLogicalCameraCallback(false) {
+    initCaptureCallbacksV2(cbs);
+
+    if (cbs != nullptr) {
+        mOnCaptureCompleted = cbs->onCaptureCompleted;
+        mOnCaptureFailed = cbs->onCaptureFailed;
+    }
+}
+
+CameraDevice::CallbackHolder::CallbackHolder(
+        sp<ACameraCaptureSession>          session,
+        std::vector<sp<CaptureRequest>>  requests,
+        bool                               isRepeating,
+        ACameraCaptureSession_logicalCamera_captureCallbacksV2* lcbs) :
+        mSession(std::move(session)), mRequests(std::move(requests)),
+        mIsRepeating(isRepeating),
+        mIs2Callback(true),
+        mIsLogicalCameraCallback(true) {
+    initCaptureCallbacksV2(lcbs);
 
     if (lcbs != nullptr) {
         mOnLogicalCameraCaptureCompleted = lcbs->onLogicalCameraCaptureCompleted;
@@ -1407,23 +1544,21 @@ void CameraDevice::stopLooperAndDisconnect() {
 /**
   * Camera service callback implementation
   */
-android::hardware::Return<void>
-CameraDevice::ServiceCallback::onDeviceError(
-        ErrorCode errorCode,
-        const CaptureResultExtras& resultExtras) {
+ScopedAStatus CameraDevice::ServiceCallback::onDeviceError(
+        ErrorCode errorCode, const CaptureResultExtras& resultExtras) {
     ALOGD("Device error received, code %d, frame number %" PRId64 ", request ID %d, subseq ID %d"
             " physical camera ID %s", errorCode, resultExtras.frameNumber, resultExtras.requestId,
             resultExtras.burstId, resultExtras.errorPhysicalCameraId.c_str());
-    auto ret = Void();
-    sp<CameraDevice> dev = mDevice.promote();
+
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
     if (dev == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
 
     sp<ACameraCaptureSession> session = dev->mCurrentSession.promote();
     Mutex::Autolock _l(dev->mDeviceLock);
     if (dev->mRemote == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
     switch (errorCode) {
         case ErrorCode::CAMERA_DISCONNECTED:
@@ -1476,26 +1611,25 @@ CameraDevice::ServiceCallback::onDeviceError(
             dev->onCaptureErrorLocked(errorCode, resultExtras);
             break;
     }
-    return ret;
+    return ScopedAStatus::ok();
 }
 
-android::hardware::Return<void>
-CameraDevice::ServiceCallback::onDeviceIdle() {
+ScopedAStatus CameraDevice::ServiceCallback::onDeviceIdle() {
     ALOGV("Camera is now idle");
-    auto ret = Void();
-    sp<CameraDevice> dev = mDevice.promote();
+
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
     if (dev == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
 
     Mutex::Autolock _l(dev->mDeviceLock);
     if (dev->isClosed() || dev->mRemote == nullptr) {
-        return ret;
+        return ScopedAStatus::ok();
     }
 
     if (dev->mIdle) {
         // Already in idle state. Possibly other thread did waitUntilIdle
-        return ret;
+        return ScopedAStatus::ok();
     }
 
     if (dev->mCurrentSession != nullptr) {
@@ -1503,13 +1637,14 @@ CameraDevice::ServiceCallback::onDeviceIdle() {
         if (dev->mBusySession != dev->mCurrentSession) {
             ALOGE("Current session != busy session");
             dev->setCameraDeviceErrorLocked(ACAMERA_ERROR_CAMERA_DEVICE);
-            return ret;
+            return ScopedAStatus::ok();
         }
 
         sp<AMessage> msg = new AMessage(kWhatSessionStateCb, dev->mHandler);
         msg->setPointer(kContextKey, dev->mBusySession->mUserSessionCallback.context);
         msg->setObject(kSessionSpKey, dev->mBusySession);
-        msg->setPointer(kCallbackFpKey, (void*) dev->mBusySession->mUserSessionCallback.onReady);
+        msg->setPointer(kCallbackFpKey,
+                        (void*) dev->mBusySession->mUserSessionCallback.onReady);
         // Make sure we clear the sp first so the session destructor can
         // only happen on handler thread (where we don't hold device/session lock)
         dev->mBusySession.clear();
@@ -1517,31 +1652,32 @@ CameraDevice::ServiceCallback::onDeviceIdle() {
     }
     dev->mIdle = true;
     dev->mFlushing = false;
-    return ret;
+    return ScopedAStatus::ok();
 }
 
-android::hardware::Return<void>
-CameraDevice::ServiceCallback::onCaptureStarted(
-        const CaptureResultExtras& resultExtras,
-        uint64_t timestamp) {
-    auto ret = Void();
 
-    sp<CameraDevice> dev = mDevice.promote();
+
+ndk::ScopedAStatus CameraDevice::ServiceCallback::onCaptureStarted(
+        const CaptureResultExtras& resultExtras, int64_t timestamp) {
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
     if (dev == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
     Mutex::Autolock _l(dev->mDeviceLock);
     if (dev->isClosed() || dev->mRemote == nullptr) {
-        return ret;
+        return ScopedAStatus::ok();
     }
 
     int32_t sequenceId = resultExtras.requestId;
     int32_t burstId = resultExtras.burstId;
+    int64_t frameNumber = resultExtras.frameNumber;
 
     auto it = dev->mSequenceCallbackMap.find(sequenceId);
     if (it != dev->mSequenceCallbackMap.end()) {
-        CallbackHolder cbh = (*it).second;
+        CallbackHolder &cbh = it->second;
         ACameraCaptureSession_captureCallback_start onStart = cbh.mOnCaptureStarted;
+        ACameraCaptureSession_captureCallback_startV2 onStart2 = cbh.mOnCaptureStarted2;
+        bool v2Callback = cbh.mIs2Callback;
         sp<ACameraCaptureSession> session = cbh.mSession;
         if ((size_t) burstId >= cbh.mRequests.size()) {
             ALOGE("%s: Error: request index %d out of bound (size %zu)",
@@ -1549,32 +1685,38 @@ CameraDevice::ServiceCallback::onCaptureStarted(
             dev->setCameraDeviceErrorLocked(ACAMERA_ERROR_CAMERA_SERVICE);
         }
         sp<CaptureRequest> request = cbh.mRequests[burstId];
-        sp<AMessage> msg = new AMessage(kWhatCaptureStart, dev->mHandler);
+        ALOGE("%s: request = %p", __FUNCTION__, request.get());
+        sp<AMessage> msg = nullptr;
+        if (v2Callback) {
+            msg = new AMessage(kWhatCaptureStart2, dev->mHandler);
+            msg->setPointer(kCallbackFpKey, (void*) onStart2);
+        } else {
+            msg = new AMessage(kWhatCaptureStart, dev->mHandler);
+            msg->setPointer(kCallbackFpKey, (void*) onStart);
+        }
         msg->setPointer(kContextKey, cbh.mContext);
         msg->setObject(kSessionSpKey, session);
-        msg->setPointer(kCallbackFpKey, (void*) onStart);
         msg->setObject(kCaptureRequestKey, request);
         msg->setInt64(kTimeStampKey, timestamp);
+        msg->setInt64(kFrameNumberKey, frameNumber);
         dev->postSessionMsgAndCleanup(msg);
     }
-    return ret;
+    return ScopedAStatus::ok();
 }
 
-android::hardware::Return<void>
-CameraDevice::ServiceCallback::onResultReceived(
-        const FmqSizeOrMetadata& resultMetadata,
+ScopedAStatus CameraDevice::ServiceCallback::onResultReceived(
+        const CaptureMetadataInfo& resultMetadata,
         const CaptureResultExtras& resultExtras,
-        const hidl_vec<PhysicalCaptureResultInfo>& physicalResultInfos) {
-    auto ret = Void();
+        const std::vector<PhysicalCaptureResultInfo>& physicalResultInfos) {
 
-    sp<CameraDevice> dev = mDevice.promote();
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
     if (dev == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
     int32_t sequenceId = resultExtras.requestId;
     int64_t frameNumber = resultExtras.frameNumber;
     int32_t burstId = resultExtras.burstId;
-    bool    isPartialResult = (resultExtras.partialResultCount < dev->mPartialResultCount);
+    bool isPartialResult = (resultExtras.partialResultCount < dev->mPartialResultCount);
 
     if (!isPartialResult) {
         ALOGV("SeqId %d frame %" PRId64 " result arrive.", sequenceId, frameNumber);
@@ -1582,7 +1724,7 @@ CameraDevice::ServiceCallback::onResultReceived(
 
     Mutex::Autolock _l(dev->mDeviceLock);
     if (dev->mRemote == nullptr) {
-        return ret; // device has been disconnected
+        return ScopedAStatus::ok(); // device has been disconnected
     }
 
     if (dev->isClosed()) {
@@ -1590,7 +1732,7 @@ CameraDevice::ServiceCallback::onResultReceived(
             dev->mFrameNumberTracker.updateTracker(frameNumber, /*isError*/false);
         }
         // early return to avoid callback sent to closed devices
-        return ret;
+        return ScopedAStatus::ok();
     }
 
     CameraMetadata metadataCopy;
@@ -1598,11 +1740,12 @@ CameraDevice::ServiceCallback::onResultReceived(
             dev->mCaptureResultMetadataQueue.get(), &metadataCopy);
     if (status != ACAMERA_OK) {
         ALOGE("%s: result metadata couldn't be converted", __FUNCTION__);
-        return ret;
+        return ScopedAStatus::ok();
     }
 
-    metadataCopy.update(ANDROID_LENS_INFO_SHADING_MAP_SIZE, dev->mShadingMapSize, /*data_count*/2);
-    metadataCopy.update(ANDROID_SYNC_FRAME_NUMBER, &frameNumber, /*data_count*/1);
+    metadataCopy.update(ANDROID_LENS_INFO_SHADING_MAP_SIZE, dev->mShadingMapSize,
+                        /* data_count= */ 2);
+    metadataCopy.update(ANDROID_SYNC_FRAME_NUMBER, &frameNumber, /* data_count= */1);
 
     auto it = dev->mSequenceCallbackMap.find(sequenceId);
     if (it != dev->mSequenceCallbackMap.end()) {
@@ -1626,7 +1769,7 @@ CameraDevice::ServiceCallback::onResultReceived(
                     &localPhysicalResult[i].physicalMetadata);
             if (status != ACAMERA_OK) {
                 ALOGE("%s: physical camera result metadata couldn't be converted", __FUNCTION__);
-                return ret;
+                return ScopedAStatus::ok();
             }
         }
         sp<ACameraPhysicalCaptureResultInfo> physicalResult(
@@ -1658,17 +1801,14 @@ CameraDevice::ServiceCallback::onResultReceived(
         dev->checkAndFireSequenceCompleteLocked();
     }
 
-    return ret;
+    return ScopedAStatus::ok();
 }
 
-android::hardware::Return<void>
-CameraDevice::ServiceCallback::onRepeatingRequestError(
-        uint64_t lastFrameNumber, int32_t stoppedSequenceId) {
-    auto ret = Void();
-
-    sp<CameraDevice> dev = mDevice.promote();
+ScopedAStatus CameraDevice::ServiceCallback::onRepeatingRequestError(int64_t lastFrameNumber,
+                                                                     int32_t stoppedSequenceId) {
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
     if (dev == nullptr) {
-        return ret; // device has been closed
+        return ScopedAStatus::ok(); // device has been closed
     }
 
     Mutex::Autolock _l(dev->mDeviceLock);
@@ -1680,33 +1820,72 @@ CameraDevice::ServiceCallback::onRepeatingRequestError(
 
     dev->checkRepeatingSequenceCompleteLocked(repeatingSequenceId, lastFrameNumber);
 
-    return ret;
+    return ScopedAStatus::ok();
+}
+
+ScopedAStatus CameraDevice::ServiceCallback::onPrepared(int32_t streamId) {
+    ALOGV("%s: callback for stream id %d", __FUNCTION__, streamId);
+    std::shared_ptr<CameraDevice> dev = mDevice.lock();
+    if (dev == nullptr) {
+        return ScopedAStatus::ok();
+    }
+    Mutex::Autolock _l(dev->mDeviceLock);
+    if (dev->isClosed() || dev->mRemote == nullptr) {
+        return ScopedAStatus::ok();
+    }
+    auto it = dev->mConfiguredOutputs.find(streamId);
+    if (it == dev->mConfiguredOutputs.end()) {
+        ALOGE("%s: stream id %d does not exist", __FUNCTION__ , streamId);
+        return ScopedAStatus::ok();
+    }
+    sp<ACameraCaptureSession> session = dev->mCurrentSession.promote();
+    if (session == nullptr) {
+        ALOGE("%s: Session is dead already", __FUNCTION__ );
+        return ScopedAStatus::ok();
+    }
+    // We've found the window corresponding to the surface id.
+    const ANativeWindow *anw = it->second.first;
+    sp<AMessage> msg = new AMessage(kWhatPreparedCb, dev->mHandler);
+    msg->setPointer(kContextKey, session->mPreparedCb.context);
+    msg->setPointer(kAnwKey, (void *)anw);
+    msg->setObject(kSessionSpKey, session);
+    msg->setPointer(kCallbackFpKey, (void *)session->mPreparedCb.onWindowPrepared);
+    dev->postSessionMsgAndCleanup(msg);
+    return ScopedAStatus::ok();
 }
 
 camera_status_t CameraDevice::ServiceCallback::readOneResultMetadata(
-        const FmqSizeOrMetadata& fmqSizeOrMetadata, ResultMetadataQueue* metadataQueue,
+        const CaptureMetadataInfo& captureMetadataInfo, ResultMetadataQueue* metadataQueue,
         CameraMetadata* metadata) {
     if (metadataQueue == nullptr || metadata == nullptr) {
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
     bool converted;
-    HCameraMetadata hCameraMetadata;
-    if (fmqSizeOrMetadata.getDiscriminator() ==
-            FmqSizeOrMetadata::hidl_discriminator::fmqMetadataSize) {
-        hCameraMetadata.resize(fmqSizeOrMetadata.fmqMetadataSize());
-        bool read = metadataQueue->read(
-                hCameraMetadata.data(), fmqSizeOrMetadata.fmqMetadataSize());
+    AidlCameraMetadata aidlCameraMetadata;
+    std::vector<uint8_t>& metadataVec = aidlCameraMetadata.metadata;
+    camera_metadata_t* clonedMetadata;
+    if (captureMetadataInfo.getTag() == CaptureMetadataInfo::fmqMetadataSize) {
+        int64_t size = captureMetadataInfo.get<CaptureMetadataInfo::fmqMetadataSize>();
+        metadataVec.resize(size);
+        bool read = metadataQueue->read(reinterpret_cast<int8_t*>(metadataVec.data()), size);
         if (!read) {
             ALOGE("%s capture request settings could't be read from fmq", __FUNCTION__);
             return ACAMERA_ERROR_UNKNOWN;
         }
         // TODO: Do we actually need to clone here ?
-        converted = utils::convertFromHidlCloned(hCameraMetadata, metadata);
+        converted = utils::cloneFromAidl(aidlCameraMetadata, &clonedMetadata);
     } else {
-        converted = utils::convertFromHidlCloned(fmqSizeOrMetadata.metadata(), metadata);
+        const AidlCameraMetadata &embeddedMetadata =
+                captureMetadataInfo.get<CaptureMetadataInfo::metadata>();
+        converted = utils::cloneFromAidl(embeddedMetadata, &clonedMetadata);
     }
 
-    return converted ? ACAMERA_OK : ACAMERA_ERROR_UNKNOWN;
+    if (converted) {
+        *metadata = CameraMetadata(clonedMetadata);
+        return ACAMERA_OK;
+    }
+
+    return ACAMERA_ERROR_UNKNOWN;
 }
 
 } // namespace acam

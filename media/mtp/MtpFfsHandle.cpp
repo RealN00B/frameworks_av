@@ -297,6 +297,11 @@ int MtpFfsHandle::start(bool ptp) {
 }
 
 void MtpFfsHandle::close() {
+    // Join all child threads before destruction
+    for (auto& thread : mChildThreads) {
+        thread.join();
+    }
+
     io_destroy(mCtx);
     closeEndpoints();
     closeConfig();
@@ -518,7 +523,8 @@ int MtpFfsHandle::receiveFile(mtp_file_range mfr, bool zero_packet) {
                 }
             }
             if (short_packet) {
-                if (cancelEvents(mIobuf[i].iocb.data(), ioevs, short_i, mIobuf[i].actual, false)) {
+                if (cancelEvents(mIobuf[i].iocb.data(), ioevs, short_i, mIobuf[i].actual,
+                        mBatchCancel)) {
                     write_error = true;
                 }
             }
@@ -586,6 +592,9 @@ int MtpFfsHandle::sendFile(mtp_file_range mfr) {
 
     // Send the header data
     mtp_data_header *header = reinterpret_cast<mtp_data_header*>(mIobuf[0].bufs.data());
+    if (header == NULL) {
+        return -1;
+    }
     header->length = htole32(given_length);
     header->type = htole16(2); // data packet
     header->command = htole16(mfr.command);
@@ -668,8 +677,11 @@ int MtpFfsHandle::sendEvent(mtp_event me) {
     char *temp = new char[me.length];
     memcpy(temp, me.data, me.length);
     me.data = temp;
+
     std::thread t([this, me]() { return this->doSendEvent(me); });
-    t.detach();
+
+    // Store the thread object for later joining
+    mChildThreads.emplace_back(std::move(t));
     return 0;
 }
 

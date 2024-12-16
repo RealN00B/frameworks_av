@@ -17,12 +17,13 @@ cc_library {
 
     static_libs: ["libavcdec"],
 
+    cflags: [
+        "-DKEEP_THREADS_ACTIVE=1",
+    ],
+
     srcs: ["C2SoftAvcDec.cpp"],
 
-    include_dirs: [
-        "external/libavc/decoder",
-        "external/libavc/common",
-    ],
+    export_include_dirs: ["."],
 }
 
 cc_library {
@@ -37,10 +38,7 @@ cc_library {
 
     srcs: ["C2SoftAvcEnc.cpp"],
 
-    include_dirs: [
-        "external/libavc/encoder",
-        "external/libavc/common",
-    ],
+    export_include_dirs: ["."],
 
     cflags: [
         "-Wno-unused-variable",

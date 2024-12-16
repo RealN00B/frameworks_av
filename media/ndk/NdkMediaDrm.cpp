@@ -97,6 +97,8 @@ struct AMediaDrm {
     List<idvec_t> mIds;
     KeyedVector<String8, String8> mQueryResults;
     Vector<uint8_t> mKeyRequest;
+    String8 mDefaultUrl;
+    AMediaDrmKeyRequestType mkeyRequestType;
     Vector<uint8_t> mProvisionRequest;
     String8 mProvisionUrl;
     String8 mPropertyString;
@@ -181,7 +183,7 @@ void DrmListener::sendEvent(
     AMediaDrmSessionId asid = {sessionId.data(), sessionId.size()};
     int32_t dataSize = data.size();
     const uint8_t *dataPtr = data.data();
-    if (dataSize > 0) {
+    if (dataSize >= 0) {
         (*mEventListener)(mObj, &asid, ndkEventType, 0, dataPtr, dataSize);
     } else {
         ALOGE("invalid event data size=%d", dataSize);
@@ -251,7 +253,7 @@ static status_t GetAppPackageName(String8 *packageName) {
 }
 
 static sp<IDrm> CreateDrm() {
-    return DrmUtils::MakeDrm();
+    return DrmUtils::MakeDrm(IDRM_NDK);
 }
 
 
@@ -380,12 +382,15 @@ media_status_t AMediaDrm_openSession(AMediaDrm *mObj, AMediaDrmSessionId *sessio
     }
     Vector<uint8_t> session;
     status_t status = mObj->mDrm->openSession(DrmPlugin::kSecurityLevelMax, session);
-    if (status == OK) {
-        mObj->mIds.push_front(session);
-        List<idvec_t>::iterator iter = mObj->mIds.begin();
-        sessionId->ptr = iter->array();
-        sessionId->length = iter->size();
+    if (status != OK) {
+        sessionId->ptr = NULL;
+        sessionId->length = 0;
+        return translateStatus(status);
     }
+    mObj->mIds.push_front(session);
+    List<idvec_t>::iterator iter = mObj->mIds.begin();
+    sessionId->ptr = iter->array();
+    sessionId->length = iter->size();
     return AMEDIA_OK;
 }
 
@@ -412,6 +417,21 @@ media_status_t AMediaDrm_getKeyRequest(AMediaDrm *mObj, const AMediaDrmScope *sc
         const uint8_t *init, size_t initSize, const char *mimeType, AMediaDrmKeyType keyType,
         const AMediaDrmKeyValue *optionalParameters, size_t numOptionalParameters,
         const uint8_t **keyRequest, size_t *keyRequestSize) {
+
+    return AMediaDrm_getKeyRequestWithDefaultUrlAndType(mObj,
+        scope, init, initSize, mimeType, keyType, optionalParameters,
+        numOptionalParameters, keyRequest,
+        keyRequestSize, NULL, NULL);
+}
+
+EXPORT
+media_status_t AMediaDrm_getKeyRequestWithDefaultUrlAndType(AMediaDrm *mObj,
+        const AMediaDrmScope *scope, const uint8_t *init, size_t initSize,
+        const char *mimeType, AMediaDrmKeyType keyType,
+        const AMediaDrmKeyValue *optionalParameters,
+        size_t numOptionalParameters, const uint8_t **keyRequest,
+        size_t *keyRequestSize, const char **defaultUrl,
+        AMediaDrmKeyRequestType *keyRequestType) {
 
     if (!mObj || mObj->mDrm == NULL) {
         return AMEDIA_ERROR_INVALID_OBJECT;
@@ -446,18 +466,43 @@ media_status_t AMediaDrm_getKeyRequest(AMediaDrm *mObj, const AMediaDrmScope *sc
         mdOptionalParameters.add(String8(optionalParameters[i].mKey),
                 String8(optionalParameters[i].mValue));
     }
-    String8 defaultUrl;
-    DrmPlugin::KeyRequestType keyRequestType;
+
+    DrmPlugin::KeyRequestType requestType;
     mObj->mKeyRequest.clear();
     status_t status = mObj->mDrm->getKeyRequest(*iter, mdInit, String8(mimeType),
-            mdKeyType, mdOptionalParameters, mObj->mKeyRequest, defaultUrl,
-            &keyRequestType);
+            mdKeyType, mdOptionalParameters, mObj->mKeyRequest, mObj->mDefaultUrl,
+            &requestType);
     if (status != OK) {
         return translateStatus(status);
     } else {
         *keyRequest = mObj->mKeyRequest.array();
         *keyRequestSize = mObj->mKeyRequest.size();
+        if (defaultUrl != NULL)
+            *defaultUrl = mObj->mDefaultUrl.c_str();
+        switch(requestType) {
+            case DrmPlugin::kKeyRequestType_Initial:
+                mObj->mkeyRequestType = KEY_REQUEST_TYPE_INITIAL;
+                break;
+            case DrmPlugin::kKeyRequestType_Renewal:
+                mObj->mkeyRequestType = KEY_REQUEST_TYPE_RENEWAL;
+                break;
+            case DrmPlugin::kKeyRequestType_Release:
+                mObj->mkeyRequestType = KEY_REQUEST_TYPE_RELEASE;
+                break;
+            case DrmPlugin::kKeyRequestType_None:
+                mObj->mkeyRequestType = KEY_REQUEST_TYPE_NONE;
+                break;
+            case DrmPlugin::kKeyRequestType_Update:
+                mObj->mkeyRequestType = KEY_REQUEST_TYPE_UPDATE;
+                break;
+            default:
+                return AMEDIA_ERROR_UNKNOWN;
+        }
+
+        if (keyRequestType != NULL)
+            *keyRequestType = mObj->mkeyRequestType;
     }
+
     return AMEDIA_OK;
 }
 
@@ -489,6 +534,7 @@ media_status_t AMediaDrm_provideKeyResponse(AMediaDrm *mObj, const AMediaDrmScop
     } else {
         keySetId->ptr = NULL;
         keySetId->length = 0;
+        return translateStatus(status);
     }
     return AMEDIA_OK;
 }
@@ -560,8 +606,8 @@ media_status_t AMediaDrm_queryKeyStatus(AMediaDrm *mObj, const AMediaDrmSessionI
     }
 
     for (size_t i = 0; i < mObj->mQueryResults.size(); i++) {
-        keyValuePairs[i].mKey = mObj->mQueryResults.keyAt(i).string();
-        keyValuePairs[i].mValue = mObj->mQueryResults.valueAt(i).string();
+        keyValuePairs[i].mKey = mObj->mQueryResults.keyAt(i).c_str();
+        keyValuePairs[i].mValue = mObj->mQueryResults.valueAt(i).c_str();
     }
     *numPairs = mObj->mQueryResults.size();
     return AMEDIA_OK;
@@ -584,7 +630,7 @@ media_status_t AMediaDrm_getProvisionRequest(AMediaDrm *mObj, const uint8_t **pr
     } else {
         *provisionRequest = mObj->mProvisionRequest.array();
         *provisionRequestSize = mObj->mProvisionRequest.size();
-        *serverUrl = mObj->mProvisionUrl.string();
+        *serverUrl = mObj->mProvisionUrl.c_str();
     }
     return AMEDIA_OK;
 }
@@ -668,7 +714,7 @@ media_status_t AMediaDrm_getPropertyString(AMediaDrm *mObj, const char *property
             mObj->mPropertyString);
 
     if (status == OK) {
-        *propertyValue = mObj->mPropertyString.string();
+        *propertyValue = mObj->mPropertyString.c_str();
     } else {
         *propertyValue = NULL;
     }
@@ -712,6 +758,9 @@ media_status_t AMediaDrm_setPropertyString(AMediaDrm *mObj,
 EXPORT
 media_status_t AMediaDrm_setPropertyByteArray(AMediaDrm *mObj,
         const char *propertyName, const uint8_t *value, size_t valueSize) {
+    if (!mObj || mObj->mDrm == NULL) {
+        return AMEDIA_ERROR_INVALID_OBJECT;
+    }
 
     Vector<uint8_t> byteArray;
     byteArray.appendArray(value, valueSize);

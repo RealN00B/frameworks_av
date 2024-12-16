@@ -16,6 +16,9 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2SoftMpeg2Dec"
+#ifndef KEEP_THREADS_ACTIVE
+#define KEEP_THREADS_ACTIVE 0
+#endif
 #include <log/log.h>
 
 #include <media/stagefright/foundation/MediaDefs.h>
@@ -433,6 +436,7 @@ status_t C2SoftMpeg2Dec::fillMemRecords() {
 
     s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.u4_size = sizeof(ivdext_fill_mem_rec_ip_t);
     s_fill_mem_ip.u4_share_disp_buf = 0;
+    s_fill_mem_ip.u4_keep_threads_active = KEEP_THREADS_ACTIVE;
     s_fill_mem_ip.e_output_format = mIvColorformat;
     s_fill_mem_ip.u4_deinterlace = 1;
     s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.e_cmd = IV_CMD_FILL_NUM_MEM_REC;
@@ -474,6 +478,7 @@ status_t C2SoftMpeg2Dec::createDecoder() {
     s_init_ip.s_ivd_init_ip_t.u4_frm_max_ht = mHeight;
     s_init_ip.u4_share_disp_buf = 0;
     s_init_ip.u4_deinterlace = 1;
+    s_init_ip.u4_keep_threads_active = KEEP_THREADS_ACTIVE;
     s_init_ip.s_ivd_init_ip_t.u4_num_mem_rec = mNumMemRecords;
     s_init_ip.s_ivd_init_ip_t.e_output_format = mIvColorformat;
     s_init_op.s_ivd_init_op_t.u4_size = sizeof(ivdext_init_op_t);
@@ -572,7 +577,7 @@ status_t C2SoftMpeg2Dec::initDecoder() {
     if (OK != createDecoder()) return UNKNOWN_ERROR;
 
     mNumCores = MIN(getCpuCoreCount(), MAX_NUM_CORES);
-    mStride = ALIGN32(mWidth);
+    mStride = ALIGN128(mWidth);
     mSignalledError = false;
     resetPlugin();
     (void) setNumCores();
@@ -731,8 +736,10 @@ status_t C2SoftMpeg2Dec::resetDecoder() {
 
 void C2SoftMpeg2Dec::resetPlugin() {
     mSignalledOutputEos = false;
-    gettimeofday(&mTimeStart, nullptr);
-    gettimeofday(&mTimeEnd, nullptr);
+    mTimeStart = mTimeEnd = systemTime();
+    if (mOutBlock) {
+        mOutBlock.reset();
+    }
 }
 
 status_t C2SoftMpeg2Dec::deleteDecoder() {
@@ -845,20 +852,20 @@ c2_status_t C2SoftMpeg2Dec::ensureDecoderState(const std::shared_ptr<C2BlockPool
         return C2_CORRUPTED;
     }
     if (mOutBlock &&
-            (mOutBlock->width() != ALIGN32(mWidth) || mOutBlock->height() != mHeight)) {
+            (mOutBlock->width() != ALIGN128(mWidth) || mOutBlock->height() != mHeight)) {
         mOutBlock.reset();
     }
     if (!mOutBlock) {
         uint32_t format = HAL_PIXEL_FORMAT_YV12;
         C2MemoryUsage usage = { C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE };
         c2_status_t err =
-            pool->fetchGraphicBlock(ALIGN32(mWidth), mHeight, format, usage, &mOutBlock);
+            pool->fetchGraphicBlock(ALIGN128(mWidth), mHeight, format, usage, &mOutBlock);
         if (err != C2_OK) {
             ALOGE("fetchGraphicBlock for Output failed with status %d", err);
             return err;
         }
         ALOGV("provided (%dx%d) required (%dx%d)",
-              mOutBlock->width(), mOutBlock->height(), ALIGN32(mWidth), mHeight);
+              mOutBlock->width(), mOutBlock->height(), ALIGN128(mWidth), mHeight);
     }
 
     return C2_OK;
@@ -929,14 +936,12 @@ void C2SoftMpeg2Dec::process(
         }
         // If input dump is enabled, then write to file
         DUMP_TO_FILE(mInFile, s_decode_ip.pv_stream_buffer, s_decode_ip.u4_num_Bytes);
-        WORD32 delay;
-        GETTIME(&mTimeStart, nullptr);
-        TIME_DIFF(mTimeEnd, mTimeStart, delay);
+        nsecs_t delay = mTimeStart - mTimeEnd;
         (void) ivdec_api_function(mDecHandle, &s_decode_ip, &s_decode_op);
-        WORD32 decodeTime;
-        GETTIME(&mTimeEnd, nullptr);
-        TIME_DIFF(mTimeStart, mTimeEnd, decodeTime);
-        ALOGV("decodeTime=%6d delay=%6d numBytes=%6d ", decodeTime, delay,
+
+        mTimeEnd = systemTime();
+        nsecs_t decodeTime = mTimeEnd - mTimeStart;
+        ALOGV("decodeTime=%" PRId64 " delay=%" PRId64 " numBytes=%6d ", decodeTime, delay,
               s_decode_op.u4_num_bytes_consumed);
         if (IMPEG2D_UNSUPPORTED_DIMENSIONS == s_decode_op.u4_error_code) {
             ALOGV("unsupported resolution : %dx%d", s_decode_op.u4_pic_wd, s_decode_op.u4_pic_ht);

@@ -26,6 +26,9 @@
 
 namespace android {
 
+// Device id of a context associated with the default device.
+constexpr int32_t kDefaultDeviceId = 0;
+
 /**
  * CameraUtils contains utility methods that are shared between the native
  * camera client, and the camera service.
@@ -37,10 +40,13 @@ class CameraUtils {
          * metadata.  This is based on the sensor orientation and lens facing
          * attributes of the camera device.
          *
+         * If mirrorMode is not AUTO, it will be used to override the lens
+         * facing based mirror.
+         *
          * Returns OK on success, or a negative error code.
          */
         static status_t getRotationTransform(const CameraMetadata& staticInfo,
-                /*out*/int32_t* transform);
+                int mirrorMode, /*out*/int32_t* transform);
 
         /**
          * Check if the image data is VideoNativeHandleMetadata, that contains a native handle.

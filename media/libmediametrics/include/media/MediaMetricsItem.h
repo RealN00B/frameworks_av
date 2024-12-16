@@ -27,12 +27,14 @@
 #include <variant>
 
 #include <binder/Parcel.h>
+#include <log/log.h>
 #include <utils/Errors.h>
 #include <utils/Timers.h> // nsecs_t
 
 namespace android {
 
-class IMediaMetricsService;
+namespace media { class IMediaMetricsService; }
+
 class Parcel;
 
 /*
@@ -102,6 +104,36 @@ enum Type {
     kTypeCString = 4,
     kTypeRate = 5,
 };
+
+/*
+ * Helper for status conversions
+ */
+
+inline constexpr const char* statusToStatusString(status_t status) {
+    switch (status) {
+    case BAD_VALUE:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_ARGUMENT;
+    case DEAD_OBJECT:
+    case FAILED_TRANSACTION:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_IO;
+    case NO_MEMORY:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_MEMORY;
+    case PERMISSION_DENIED:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_SECURITY;
+    case NO_INIT:
+    case INVALID_OPERATION:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_STATE;
+    case WOULD_BLOCK:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_TIMEOUT;
+    default:
+        if (status >= 0) return AMEDIAMETRICS_PROP_STATUS_VALUE_OK; // non-negative values "OK"
+        [[fallthrough]];            // negative values are error.
+    case UNKNOWN_ERROR:
+        return AMEDIAMETRICS_PROP_STATUS_VALUE_UNKNOWN;
+    }
+}
+
+status_t statusStringToStatus(const char *error);
 
 /*
  * Time printing
@@ -239,7 +271,10 @@ class BaseItem {
 public:
     // are we collecting metrics data
     static bool isEnabled();
-    static sp<IMediaMetricsService> getService();
+    // returns the MediaMetrics service if active.
+    static sp<media::IMediaMetricsService> getService();
+    // submits a raw buffer directly to the MediaMetrics service - this is highly optimized.
+    static status_t submitBuffer(const char *buffer, size_t len);
 
 protected:
     static constexpr const char * const EnabledProperty = "media.metrics.enabled";
@@ -247,10 +282,9 @@ protected:
     static const int EnabledProperty_default = 1;
 
     // let's reuse a binder connection
-    static sp<IMediaMetricsService> sMediaMetricsService;
+    static sp<media::IMediaMetricsService> sMediaMetricsService;
 
     static void dropInstance();
-    static bool submitBuffer(const char *buffer, size_t len);
 
     template <typename T>
     struct is_item_type {
@@ -466,16 +500,16 @@ protected:
     template <> // static
     status_t extract(std::string *val, const char **bufferpptr, const char *bufferptrmax) {
         const char *ptr = *bufferpptr;
-        while (*ptr != 0) {
+        do {
             if (ptr >= bufferptrmax) {
                 ALOGE("%s: buffer exceeded", __func__);
+                android_errorWriteLog(0x534e4554, "204445255");
                 return BAD_VALUE;
             }
-            ++ptr;
-        }
-        const size_t size = (ptr - *bufferpptr) + 1;
+        } while (*ptr++ != 0);
+        // ptr is terminator+1, == bufferptrmax if we finished entire buffer
         *val = *bufferpptr;
-        *bufferpptr += size;
+        *bufferpptr = ptr;
         return NO_ERROR;
     }
     template <> // static
@@ -573,7 +607,7 @@ public:
 
     bool record() {
         return updateHeader()
-                && BaseItem::submitBuffer(getBuffer(), getLength());
+                && BaseItem::submitBuffer(getBuffer(), getLength()) == OK;
     }
 
     bool isValid () const {
@@ -1014,6 +1048,9 @@ public:
         }
         return true;
     }
+    bool getString(const char *key, std::string *value) const {
+        return get(key, value);
+    }
     // Caller owns the returned string
     bool getCString(const char *key, char **value) const {
         std::string s;
@@ -1022,9 +1059,6 @@ public:
             return true;
         }
         return false;
-    }
-    bool getString(const char *key, std::string *value) const {
-        return get(key, value);
     }
 
     const Prop::Elem* get(const char *key) const {

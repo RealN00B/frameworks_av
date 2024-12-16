@@ -21,7 +21,6 @@
 #include <media/AudioRecord.h>
 #include <media/AudioSystem.h>
 #include <media/stagefright/MediaSource.h>
-#include <media/MicrophoneInfo.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <utils/List.h>
 
@@ -31,22 +30,37 @@
 
 namespace android {
 
+using content::AttributionSourceState;
+
 class AudioRecord;
 
-struct AudioSource : public MediaSource, public MediaBufferObserver {
+struct AudioSource : public MediaSource,
+                     public MediaBufferObserver,
+                     public AudioRecord::IAudioRecordCallback {
     // Note that the "channels" parameter _is_ the number of channels,
     // _not_ a bitmask of audio_channels_t constants.
     AudioSource(
-            const audio_attributes_t *attr,
-            const String16 &opPackageName,
-            uint32_t sampleRate,
-            uint32_t channels,
-            uint32_t outSampleRate = 0,
-            uid_t uid = -1,
-            pid_t pid = -1,
-            audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE,
-            audio_microphone_direction_t selectedMicDirection = MIC_DIRECTION_UNSPECIFIED,
-            float selectedMicFieldDimension = MIC_FIELD_DIMENSION_NORMAL);
+        const audio_attributes_t *attr,
+        const AttributionSourceState& attributionSource,
+        uint32_t sampleRate,
+        uint32_t channels,
+        uint32_t outSampleRate = 0,
+        audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE,
+        audio_microphone_direction_t selectedMicDirection = MIC_DIRECTION_UNSPECIFIED,
+        float selectedMicFieldDimension = MIC_FIELD_DIMENSION_NORMAL);
+
+    // Legacy constructor kept for vendor dependencies
+    AudioSource(
+        const audio_attributes_t *attr,
+        const String16 &opPackageName,
+        uint32_t sampleRate,
+        uint32_t channels,
+        uint32_t outSampleRate = 0,
+        uid_t uid = -1,
+        pid_t pid = -1,
+        audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE,
+        audio_microphone_direction_t selectedMicDirection = MIC_DIRECTION_UNSPECIFIED,
+        float selectedMicFieldDimension = MIC_FIELD_DIMENSION_NORMAL);
 
     status_t initCheck() const;
 
@@ -61,7 +75,6 @@ struct AudioSource : public MediaSource, public MediaBufferObserver {
             MediaBufferBase **buffer, const ReadOptions *options = NULL);
     virtual status_t setStopTimeUs(int64_t stopTimeUs);
 
-    status_t dataCallback(const AudioRecord::Buffer& buffer);
     virtual void signalBufferReturned(MediaBufferBase *buffer);
 
     status_t setInputDevice(audio_port_handle_t deviceId);
@@ -69,7 +82,7 @@ struct AudioSource : public MediaSource, public MediaBufferObserver {
     status_t addAudioDeviceCallback(const sp<AudioSystem::AudioDeviceCallback>& callback);
     status_t removeAudioDeviceCallback(const sp<AudioSystem::AudioDeviceCallback>& callback);
 
-    status_t getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+    status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones);
     status_t setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
     status_t setPreferredMicrophoneFieldDimension(float zoom);
 
@@ -129,8 +142,22 @@ private:
     void waitOutstandingEncodingFrames_l();
     status_t reset();
 
+    // IAudioRecordCallback implementation
+    size_t onMoreData(const AudioRecord::Buffer&) override;
+    void onOverrun() override;
+
     AudioSource(const AudioSource &);
     AudioSource &operator=(const AudioSource &);
+
+    void set(
+        const audio_attributes_t *attr,
+        const AttributionSourceState& attributionSource,
+        uint32_t sampleRate,
+        uint32_t channels,
+        uint32_t outSampleRate = 0,
+        audio_port_handle_t selectedDeviceId = AUDIO_PORT_HANDLE_NONE,
+        audio_microphone_direction_t selectedMicDirection = MIC_DIRECTION_UNSPECIFIED,
+        float selectedMicFieldDimension = MIC_FIELD_DIMENSION_NORMAL);
 };
 
 }  // namespace android

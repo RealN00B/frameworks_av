@@ -24,22 +24,18 @@
 #define ALOGVV(a...) do { } while(0)
 #endif
 
+#include <math.h>
+
 #include <algorithm>
 
 #include <android-base/stringprintf.h>
 #include <media/AudioGain.h>
 #include <utils/Log.h>
 
-#include <math.h>
-
 namespace android {
 
-AudioGain::AudioGain(int index, bool useInChannelMask)
-{
-    mIndex = index;
-    mUseInChannelMask = useInChannelMask;
-    memset(&mGain, 0, sizeof(struct audio_gain));
-}
+AudioGain::AudioGain(int index, bool isInput)
+        : mIndex(index), mIsInput(isInput) {}
 
 void AudioGain::getDefaultConfig(struct audio_gain_config *config)
 {
@@ -49,12 +45,9 @@ void AudioGain::getDefaultConfig(struct audio_gain_config *config)
     if ((mGain.mode & AUDIO_GAIN_MODE_JOINT) == AUDIO_GAIN_MODE_JOINT) {
         config->values[0] = mGain.default_value;
     } else {
-        uint32_t numValues;
-        if (mUseInChannelMask) {
-            numValues = audio_channel_count_from_in_mask(mGain.channel_mask);
-        } else {
-            numValues = audio_channel_count_from_out_mask(mGain.channel_mask);
-        }
+        const uint32_t numValues = mIsInput ?
+                audio_channel_count_from_in_mask(mGain.channel_mask) :
+                audio_channel_count_from_out_mask(mGain.channel_mask);
         for (size_t i = 0; i < numValues; i++) {
             config->values[i] = mGain.default_value;
         }
@@ -78,12 +71,9 @@ status_t AudioGain::checkConfig(const struct audio_gain_config *config)
         if ((config->channel_mask & ~mGain.channel_mask) != 0) {
             return BAD_VALUE;
         }
-        uint32_t numValues;
-        if (mUseInChannelMask) {
-            numValues = audio_channel_count_from_in_mask(config->channel_mask);
-        } else {
-            numValues = audio_channel_count_from_out_mask(config->channel_mask);
-        }
+        const uint32_t numValues = mIsInput ?
+                audio_channel_count_from_in_mask(config->channel_mask) :
+                audio_channel_count_from_out_mask(config->channel_mask);
         for (size_t i = 0; i < numValues; i++) {
             if ((config->values[i] < mGain.min_value) ||
                     (config->values[i] > mGain.max_value)) {
@@ -116,7 +106,7 @@ void AudioGain::dump(std::string *dst, int spaces, int index) const
 bool AudioGain::equals(const sp<AudioGain>& other) const
 {
     return other != nullptr &&
-           mUseInChannelMask == other->mUseInChannelMask &&
+           mIsInput == other->mIsInput &&
            mUseForVolume == other->mUseForVolume &&
            // Compare audio gain
            mGain.mode == other->mGain.mode &&
@@ -129,42 +119,24 @@ bool AudioGain::equals(const sp<AudioGain>& other) const
            mGain.max_ramp_ms == other->mGain.max_ramp_ms;
 }
 
-status_t AudioGain::writeToParcel(android::Parcel *parcel) const
-{
-    status_t status = NO_ERROR;
-    if ((status = parcel->writeInt32(mIndex)) != NO_ERROR) return status;
-    if ((status = parcel->writeBool(mUseInChannelMask)) != NO_ERROR) return status;
-    if ((status = parcel->writeBool(mUseForVolume)) != NO_ERROR) return status;
-    if ((status = parcel->writeUint32(mGain.mode)) != NO_ERROR) return status;
-    if ((status = parcel->writeUint32(mGain.channel_mask)) != NO_ERROR) return status;
-    if ((status = parcel->writeInt32(mGain.min_value)) != NO_ERROR) return status;
-    if ((status = parcel->writeInt32(mGain.max_value)) != NO_ERROR) return status;
-    if ((status = parcel->writeInt32(mGain.default_value)) != NO_ERROR) return status;
-    if ((status = parcel->writeUint32(mGain.step_value)) != NO_ERROR) return status;
-    if ((status = parcel->writeUint32(mGain.min_ramp_ms)) != NO_ERROR) return status;
-    status = parcel->writeUint32(mGain.max_ramp_ms);
-    return status;
+ConversionResult<AudioGain::Aidl> AudioGain::toParcelable() const {
+    media::audio::common::AudioGain aidl = VALUE_OR_RETURN(
+            legacy2aidl_audio_gain_AudioGain(mGain, mIsInput));
+    aidl.useForVolume = mUseForVolume;
+    media::AudioGainSys aidlSys;
+    aidlSys.index = VALUE_OR_RETURN(convertIntegral<int32_t>(mIndex));
+    aidlSys.isInput = mIsInput;
+    return std::make_pair(aidl, aidlSys);
 }
 
-status_t AudioGain::readFromParcel(const android::Parcel *parcel)
-{
-    status_t status = NO_ERROR;
-    if ((status = parcel->readInt32(&mIndex)) != NO_ERROR) return status;
-    if ((status = parcel->readBool(&mUseInChannelMask)) != NO_ERROR) return status;
-    if ((status = parcel->readBool(&mUseForVolume)) != NO_ERROR) return status;
-    uint32_t rawGainMode;
-    if ((status = parcel->readUint32(&rawGainMode)) != NO_ERROR) return status;
-    mGain.mode = static_cast<audio_gain_mode_t>(rawGainMode);
-    uint32_t rawChannelMask;
-    if ((status = parcel->readUint32(&rawChannelMask)) != NO_ERROR) return status;
-    mGain.channel_mask = static_cast<audio_channel_mask_t>(rawChannelMask);
-    if ((status = parcel->readInt32(&mGain.min_value)) != NO_ERROR) return status;
-    if ((status = parcel->readInt32(&mGain.max_value)) != NO_ERROR) return status;
-    if ((status = parcel->readInt32(&mGain.default_value)) != NO_ERROR) return status;
-    if ((status = parcel->readUint32(&mGain.step_value)) != NO_ERROR) return status;
-    if ((status = parcel->readUint32(&mGain.min_ramp_ms)) != NO_ERROR) return status;
-    status = parcel->readUint32(&mGain.max_ramp_ms);
-    return status;
+ConversionResult<sp<AudioGain>> AudioGain::fromParcelable(const AudioGain::Aidl& aidl) {
+    const media::audio::common::AudioGain& hal = aidl.first;
+    const media::AudioGainSys& sys = aidl.second;
+    auto index = VALUE_OR_RETURN(convertIntegral<int>(sys.index));
+    sp<AudioGain> legacy = sp<AudioGain>::make(index, sys.isInput);
+    legacy->mGain = VALUE_OR_RETURN(aidl2legacy_AudioGain_audio_gain(hal, sys.isInput));
+    legacy->mUseForVolume = hal.useForVolume;
+    return legacy;
 }
 
 bool AudioGains::equals(const AudioGains &other) const
@@ -175,29 +147,30 @@ bool AudioGains::equals(const AudioGains &other) const
                       });
 }
 
-status_t AudioGains::writeToParcel(android::Parcel *parcel) const {
-    status_t status = NO_ERROR;
-    if ((status = parcel->writeVectorSize(*this)) != NO_ERROR) return status;
-    for (const auto &audioGain : *this) {
-        if ((status = parcel->writeParcelable(*audioGain)) != NO_ERROR) {
-            break;
-        }
-    }
-    return status;
+ConversionResult<sp<AudioGain>>
+aidl2legacy_AudioGain(const AudioGain::Aidl& aidl) {
+    return AudioGain::fromParcelable(aidl);
 }
 
-status_t AudioGains::readFromParcel(const android::Parcel *parcel) {
-    status_t status = NO_ERROR;
-    this->clear();
-    if ((status = parcel->resizeOutVector(this)) != NO_ERROR) return status;
-    for (size_t i = 0; i < this->size(); i++) {
-        this->at(i) = new AudioGain(0, false);
-        if ((status = parcel->readParcelable(this->at(i).get())) != NO_ERROR) {
-            this->clear();
-            break;
-        }
-    }
-    return status;
+ConversionResult<AudioGain::Aidl>
+legacy2aidl_AudioGain(const sp<AudioGain>& legacy) {
+    return legacy->toParcelable();
+}
+
+ConversionResult<AudioGains>
+aidl2legacy_AudioGains(const AudioGains::Aidl& aidl) {
+    return convertContainers<AudioGains>(aidl.first, aidl.second,
+            [](const media::audio::common::AudioGain& g,
+               const media::AudioGainSys& gs) {
+                return aidl2legacy_AudioGain(std::make_pair(g, gs));
+            });
+}
+
+ConversionResult<AudioGains::Aidl>
+legacy2aidl_AudioGains(const AudioGains& legacy) {
+    return convertContainerSplit<
+            std::vector<media::audio::common::AudioGain>,
+            std::vector<media::AudioGainSys>>(legacy, legacy2aidl_AudioGain);
 }
 
 } // namespace android

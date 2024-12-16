@@ -12,10 +12,8 @@ cc_library_shared {
 
     srcs: ["HTTPHelper.cpp"],
 
-    include_dirs: [
-        "frameworks/av/media/libstagefright",
-        "frameworks/native/include/media/openmax",
-        "frameworks/base/core/jni",
+    header_libs: [
+        "libstagefright_headers",
     ],
 
     shared_libs: [
@@ -38,11 +36,5 @@ cc_library_shared {
             "signed-integer-overflow",
         ],
         cfi: true,
-    },
-
-    product_variables: {
-        pdk: {
-            enabled: false,
-        },
     },
 }

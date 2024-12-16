@@ -24,7 +24,8 @@
 #include <utils/Errors.h>
 #include <media/IMediaRecorderClient.h>
 #include <media/IMediaDeathNotifier.h>
-#include <media/MicrophoneInfo.h>
+#include <android/media/MicrophoneInfoFw.h>
+#include <android/content/AttributionSourceState.h>
 
 namespace android {
 
@@ -107,7 +108,9 @@ enum video_encoder {
     VIDEO_ENCODER_MPEG_4_SP = 3,
     VIDEO_ENCODER_VP8 = 4,
     VIDEO_ENCODER_HEVC = 5,
-
+    VIDEO_ENCODER_VP9 = 6,
+    VIDEO_ENCODER_DOLBY_VISION = 7,
+    VIDEO_ENCODER_AV1 = 8,
     VIDEO_ENCODER_LIST_END // must be the last - used to validate the video encoder type
 };
 
@@ -226,7 +229,7 @@ class MediaRecorder : public BnMediaRecorderClient,
                       public virtual IMediaDeathNotifier
 {
 public:
-    MediaRecorder(const String16& opPackageName);
+    explicit MediaRecorder(const android::content::AttributionSourceState& attributionSource);
     ~MediaRecorder();
 
     void        died();
@@ -265,7 +268,7 @@ public:
     status_t    setInputDevice(audio_port_handle_t deviceId);
     status_t    getRoutedDeviceId(audio_port_handle_t *deviceId);
     status_t    enableAudioDeviceCallback(bool enabled);
-    status_t    getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+    status_t    getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones);
     status_t    setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
     status_t    setPreferredMicrophoneFieldDimension(float zoom);
 

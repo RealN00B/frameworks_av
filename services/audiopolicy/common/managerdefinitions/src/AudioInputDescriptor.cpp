@@ -17,6 +17,8 @@
 #define LOG_TAG "APM::AudioInputDescriptor"
 //#define LOG_NDEBUG 0
 
+#include <android-base/stringprintf.h>
+
 #include <audiomanager/AudioManager.h>
 #include <media/AudioPolicy.h>
 #include <policy.h>
@@ -28,15 +30,17 @@
 namespace android {
 
 AudioInputDescriptor::AudioInputDescriptor(const sp<IOProfile>& profile,
-                                           AudioPolicyClientInterface *clientInterface)
+                                           AudioPolicyClientInterface *clientInterface,
+                                           bool isPreemptor)
     : mProfile(profile)
-    ,  mClientInterface(clientInterface)
+    ,  mClientInterface(clientInterface), mIsPreemptor(isPreemptor)
 {
     if (profile != NULL) {
         profile->pickAudioProfile(mSamplingRate, mChannelMask, mFormat);
         if (profile->getGains().size() > 0) {
             profile->getGains()[0]->getDefaultConfig(&mGain);
         }
+        mFlags = (audio_input_flags_t)profile->getFlags();
     }
 }
 
@@ -62,7 +66,6 @@ status_t AudioInputDescriptor::applyAudioPortConfig(const struct audio_port_conf
     toAudioPortConfig(&localBackupConfig);
     if ((status = validationBeforeApplyConfig(config)) == NO_ERROR) {
         AudioPortConfig::applyAudioPortConfig(config, backupConfig);
-        applyPolicyAudioPortConfig(config);
     }
 
     if (backupConfig != NULL) {
@@ -76,14 +79,12 @@ void AudioInputDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig
 {
     ALOG_ASSERT(mProfile != 0,
                 "toAudioPortConfig() called on input with null profile %d", mIoHandle);
-    dstConfig->config_mask = AUDIO_PORT_CONFIG_SAMPLE_RATE|AUDIO_PORT_CONFIG_CHANNEL_MASK|
-                            AUDIO_PORT_CONFIG_FORMAT|AUDIO_PORT_CONFIG_GAIN;
+    dstConfig->config_mask = AUDIO_PORT_CONFIG_ALL;
     if (srcConfig != NULL) {
         dstConfig->config_mask |= srcConfig->config_mask;
     }
 
     AudioPortConfig::toAudioPortConfig(dstConfig, srcConfig);
-    toPolicyAudioPortConfig(dstConfig, srcConfig);
 
     dstConfig->role = AUDIO_PORT_ROLE_SINK;
     dstConfig->type = AUDIO_PORT_TYPE_MIX;
@@ -92,7 +93,7 @@ void AudioInputDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig
     dstConfig->ext.mix.usecase.source = source();
 }
 
-void AudioInputDescriptor::toAudioPort(struct audio_port *port) const
+void AudioInputDescriptor::toAudioPort(struct audio_port_v7 *port) const
 {
     ALOG_ASSERT(mProfile != 0, "toAudioPort() called on input with null profile %d", mIoHandle);
 
@@ -235,7 +236,8 @@ status_t AudioInputDescriptor::open(const audio_config_t *config,
                                                   &deviceType,
                                                   String8(mDevice->address().c_str()),
                                                   source,
-                                                  flags);
+                                                  static_cast<audio_input_flags_t>(
+                                                          flags & mProfile->getFlags()));
     LOG_ALWAYS_FATAL_IF(mDevice->type() != deviceType,
                         "%s openInput returned device %08x when given device %08x",
                         __FUNCTION__, mDevice->type(), deviceType);
@@ -274,6 +276,9 @@ void AudioInputDescriptor::stop()
                             "%s invalid profile active count %u",
                             __func__, mProfile->curActiveCount);
         mProfile->curActiveCount--;
+        // allow preemption again now that at least one client was able to
+        // capture on this input
+        mIsPreemptor = false;
     }
 }
 
@@ -510,17 +515,25 @@ void AudioInputDescriptor::checkSuspendEffects()
     }
 }
 
-void AudioInputDescriptor::dump(String8 *dst) const
+void AudioInputDescriptor::dump(String8 *dst, int spaces, const char* extraInfo) const
 {
-    dst->appendFormat(" ID: %d\n", getId());
-    dst->appendFormat(" Sampling rate: %d\n", mSamplingRate);
-    dst->appendFormat(" Format: %d\n", mFormat);
-    dst->appendFormat(" Channels: %08x\n", mChannelMask);
-    dst->appendFormat(" Devices %s\n", mDevice->toString(true /*includeSensitiveInfo*/).c_str());
-    mEnabledEffects.dump(dst, 1 /*spaces*/, false /*verbose*/);
-    dst->append(" AudioRecord Clients:\n");
-    ClientMapHandler<RecordClientDescriptor>::dump(dst);
-    dst->append("\n");
+    std::string flagsLiteral = toString(mFlags);
+    if (!flagsLiteral.empty()) {
+        flagsLiteral = " (" + flagsLiteral + ")";
+    }
+    dst->appendFormat("Port ID: %d; 0x%04x%s%s%s\n",
+            getId(), mFlags, flagsLiteral.c_str(),
+            extraInfo != nullptr ? "; " : "", extraInfo != nullptr ? extraInfo : "");
+    dst->appendFormat("%*s%s; %d; Channel mask: 0x%x\n", spaces, "",
+            audio_format_to_string(mFormat), mSamplingRate, mChannelMask);
+    dst->appendFormat("%*sDevices: %s\n", spaces, "",
+            mDevice->toString(true /*includeSensitiveInfo*/).c_str());
+    mEnabledEffects.dump(dst, spaces /*spaces*/, false /*verbose*/);
+    if (getClientCount() != 0) {
+        dst->appendFormat("%*sAudioRecord Clients (%zu):\n", spaces, "", getClientCount());
+        ClientMapHandler<RecordClientDescriptor>::dump(dst, spaces);
+        dst->append("\n");
+    }
 }
 
 bool AudioInputCollection::isSourceActive(audio_source_t source) const
@@ -608,10 +621,12 @@ void AudioInputCollection::clearSessionRoutesForDevice(
 
 void AudioInputCollection::dump(String8 *dst) const
 {
-    dst->append("\nInputs dump:\n");
+    dst->appendFormat("\n Inputs (%zu):\n", size());
     for (size_t i = 0; i < size(); i++) {
-        dst->appendFormat("- Input %d dump:\n", keyAt(i));
-        valueAt(i)->dump(dst);
+        const std::string prefix = base::StringPrintf("  %zu. ", i + 1);
+        const std::string extraInfo = base::StringPrintf("I/O handle: %d", keyAt(i));
+        dst->appendFormat("%s", prefix.c_str());
+        valueAt(i)->dump(dst, prefix.size(), extraInfo.c_str());
     }
 }
 

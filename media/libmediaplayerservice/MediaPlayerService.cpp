@@ -21,6 +21,7 @@
 #define LOG_TAG "MediaPlayerService"
 #include <utils/Log.h>
 
+#include <chrono>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -49,6 +50,7 @@
 
 #include <codec2/hidl/client.h>
 #include <datasource/HTTPBase.h>
+#include <media/AidlConversion.h>
 #include <media/IMediaHTTPService.h>
 #include <media/IRemoteDisplay.h>
 #include <media/IRemoteDisplayClient.h>
@@ -80,7 +82,7 @@
 #include "MediaPlayerFactory.h"
 
 #include "TestPlayerStub.h"
-#include "nuplayer/NuPlayerDriver.h"
+#include <nuplayer/NuPlayerDriver.h>
 
 
 static const int kDumpLockRetries = 50;
@@ -94,6 +96,7 @@ using android::BAD_VALUE;
 using android::NOT_ENOUGH_DATA;
 using android::Parcel;
 using android::media::VolumeShaper;
+using android::content::AttributionSourceState;
 
 // Max number of entries in the filter.
 const int kMaxFilterSize = 64;  // I pulled that out of thin air.
@@ -234,7 +237,7 @@ void unmarshallAudioAttributes(const Parcel& parcel, audio_attributes_t *attribu
     if (hasFlattenedTag) {
         // the tags are UTF16, convert to UTF8
         String16 tags = parcel.readString16();
-        ssize_t realTagSize = utf16_to_utf8_length(tags.string(), tags.size());
+        ssize_t realTagSize = utf16_to_utf8_length(tags.c_str(), tags.size());
         if (realTagSize <= 0) {
             strcpy(attributes->tags, "");
         } else {
@@ -242,7 +245,7 @@ void unmarshallAudioAttributes(const Parcel& parcel, audio_attributes_t *attribu
             // copying array size -1, array for tags was calloc'd, no need to NULL-terminate it
             size_t tagSize = realTagSize > AUDIO_ATTRIBUTES_TAGS_MAX_SIZE - 1 ?
                     AUDIO_ATTRIBUTES_TAGS_MAX_SIZE - 1 : realTagSize;
-            utf16_to_utf8(tags.string(), tagSize, attributes->tags,
+            utf16_to_utf8(tags.c_str(), tagSize, attributes->tags,
                     sizeof(attributes->tags) / sizeof(attributes->tags[0]));
         }
     } else {
@@ -385,7 +388,9 @@ static void dumpCodecDetails(int fd, const sp<IMediaCodecList> &codecList, bool 
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)
                             ? asString_VP9Profile(pl.mProfile) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)
-                            ? asString_AV1Profile(pl.mProfile) : "??";
+                            ? asString_AV1Profile(pl.mProfile) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_DOLBY_VISION)
+                            ? asString_DolbyVisionProfile(pl.mProfile) : "??";
                     const char *niceLevel =
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_MPEG2)
                             ? asString_MPEG2Level(pl.mLevel) :
@@ -402,7 +407,9 @@ static void dumpCodecDetails(int fd, const sp<IMediaCodecList> &codecList, bool 
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)
                             ? asString_VP9Level(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)
-                            ? asString_AV1Level(pl.mLevel) : "??";
+                            ? asString_AV1Level(pl.mLevel) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_DOLBY_VISION)
+                            ? asString_DolbyVisionLevel(pl.mLevel) : "??";
 
                     list.add(AStringPrintf("% 5u/% 5u (%s/%s)",
                             pl.mProfile, pl.mLevel, niceProfile, niceLevel));
@@ -427,7 +434,7 @@ static void dumpCodecDetails(int fd, const sp<IMediaCodecList> &codecList, bool 
         }
     }
     result.append("\n");
-    ::write(fd, result.string(), result.size());
+    ::write(fd, result.c_str(), result.size());
 }
 
 
@@ -453,14 +460,22 @@ MediaPlayerService::~MediaPlayerService()
     ALOGV("MediaPlayerService destroyed");
 }
 
-sp<IMediaRecorder> MediaPlayerService::createMediaRecorder(const String16 &opPackageName)
+sp<IMediaRecorder> MediaPlayerService::createMediaRecorder(
+        const AttributionSourceState& attributionSource)
 {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    sp<MediaRecorderClient> recorder = new MediaRecorderClient(this, pid, opPackageName);
+    // TODO b/182392769: use attribution source util
+    AttributionSourceState verifiedAttributionSource = attributionSource;
+    verifiedAttributionSource.uid = VALUE_OR_FATAL(
+      legacy2aidl_uid_t_int32_t(IPCThreadState::self()->getCallingUid()));
+    verifiedAttributionSource.pid = VALUE_OR_FATAL(
+        legacy2aidl_pid_t_int32_t(IPCThreadState::self()->getCallingPid()));
+    sp<MediaRecorderClient> recorder =
+        new MediaRecorderClient(this, verifiedAttributionSource);
     wp<MediaRecorderClient> w = recorder;
     Mutex::Autolock lock(mLock);
     mMediaRecorderClients.add(w);
-    ALOGV("Create new media recorder client from pid %d", pid);
+    ALOGV("Create new media recorder client from pid %s",
+        verifiedAttributionSource.toString().c_str());
     return recorder;
 }
 
@@ -480,17 +495,21 @@ sp<IMediaMetadataRetriever> MediaPlayerService::createMetadataRetriever()
 }
 
 sp<IMediaPlayer> MediaPlayerService::create(const sp<IMediaPlayerClient>& client,
-        audio_session_t audioSessionId, std::string opPackageName)
+        audio_session_t audioSessionId, const AttributionSourceState& attributionSource)
 {
-    pid_t pid = IPCThreadState::self()->getCallingPid();
     int32_t connId = android_atomic_inc(&mNextConnId);
+    // TODO b/182392769: use attribution source util
+    AttributionSourceState verifiedAttributionSource = attributionSource;
+    verifiedAttributionSource.pid = VALUE_OR_FATAL(
+        legacy2aidl_pid_t_int32_t(IPCThreadState::self()->getCallingPid()));
+    verifiedAttributionSource.uid = VALUE_OR_FATAL(
+        legacy2aidl_uid_t_int32_t(IPCThreadState::self()->getCallingUid()));
 
     sp<Client> c = new Client(
-            this, pid, connId, client, audioSessionId,
-            IPCThreadState::self()->getCallingUid(), opPackageName);
+            this, verifiedAttributionSource, connId, client, audioSessionId);
 
-    ALOGV("Create new client(%d) from pid %d, uid %d, ", connId, pid,
-         IPCThreadState::self()->getCallingUid());
+    ALOGV("Create new client(%d) from %s, ", connId,
+        verifiedAttributionSource.toString().c_str());
 
     wp<Client> w = c;
     {
@@ -530,7 +549,7 @@ status_t MediaPlayerService::AudioOutput::dump(int fd, const Vector<String16>& a
             mAuxEffectId, mSendLevel);
     result.append(buffer);
 
-    ::write(fd, result.string(), result.size());
+    ::write(fd, result.c_str(), result.size());
     if (mTrack != 0) {
         mTrack->dump(fd, args);
     }
@@ -543,8 +562,8 @@ status_t MediaPlayerService::Client::dump(int fd, const Vector<String16>& args)
     char buffer[SIZE];
     String8 result;
     result.append(" Client\n");
-    snprintf(buffer, 255, "  pid(%d), connId(%d), status(%d), looping(%s)\n",
-            mPid, mConnId, mStatus, mLoop?"true": "false");
+    snprintf(buffer, 255, "  AttributionSource(%s), connId(%d), status(%d), looping(%s)\n",
+        mAttributionSource.toString().c_str(), mConnId, mStatus, mLoop?"true": "false");
     result.append(buffer);
 
     sp<MediaPlayerBase> p;
@@ -565,7 +584,7 @@ status_t MediaPlayerService::Client::dump(int fd, const Vector<String16>& args)
     } else {
         result.append("  lock is taken, no dump from player and audio output\n");
     }
-    write(fd, result.string(), result.size());
+    write(fd, result.c_str(), result.size());
 
     if (p != NULL) {
         p->dump(fd, args);
@@ -596,25 +615,39 @@ status_t MediaPlayerService::dump(int fd, const Vector<String16>& args)
                 IPCThreadState::self()->getCallingUid());
         result.append(buffer);
     } else {
-        Mutex::Autolock lock(mLock);
-        for (int i = 0, n = mClients.size(); i < n; ++i) {
-            sp<Client> c = mClients[i].promote();
-            if (c != 0) c->dump(fd, args);
-            clients.add(c);
-        }
-        if (mMediaRecorderClients.size() == 0) {
-                result.append(" No media recorder client\n\n");
-        } else {
+        {
+            // capture clients under lock
+            Mutex::Autolock lock(mLock);
+            for (int i = 0, n = mClients.size(); i < n; ++i) {
+                sp<Client> c = mClients[i].promote();
+                if (c != nullptr) {
+                    clients.add(c);
+                }
+            }
+
             for (int i = 0, n = mMediaRecorderClients.size(); i < n; ++i) {
                 sp<MediaRecorderClient> c = mMediaRecorderClients[i].promote();
-                if (c != 0) {
-                    snprintf(buffer, 255, " MediaRecorderClient pid(%d)\n", c->mPid);
-                    result.append(buffer);
-                    write(fd, result.string(), result.size());
-                    result = "\n";
-                    c->dump(fd, args);
+                if (c != nullptr) {
                     mediaRecorderClients.add(c);
                 }
+            }
+        }
+
+        // dump clients outside of lock
+        for (const sp<Client> &c : clients) {
+            c->dump(fd, args);
+        }
+        if (mediaRecorderClients.size() == 0) {
+            result.append(" No media recorder client\n\n");
+        } else {
+            for (const sp<MediaRecorderClient> &c : mediaRecorderClients) {
+                snprintf(buffer, 255, " MediaRecorderClient pid(%d)\n",
+                        c->mAttributionSource.pid);
+                result.append(buffer);
+                write(fd, result.c_str(), result.size());
+                result = "\n";
+                c->dump(fd, args);
+
             }
         }
 
@@ -713,7 +746,7 @@ status_t MediaPlayerService::dump(int fd, const Vector<String16>& args)
             result.append(s.c_str(), s.size());
         }
     }
-    write(fd, result.string(), result.size());
+    write(fd, result.c_str(), result.size());
 
     return NO_ERROR;
 }
@@ -731,20 +764,18 @@ bool MediaPlayerService::hasClient(wp<Client> client)
 }
 
 MediaPlayerService::Client::Client(
-        const sp<MediaPlayerService>& service, pid_t pid,
+        const sp<MediaPlayerService>& service, const AttributionSourceState& attributionSource,
         int32_t connId, const sp<IMediaPlayerClient>& client,
-        audio_session_t audioSessionId, uid_t uid, const std::string& opPackageName)
-        : mOpPackageName(opPackageName)
+        audio_session_t audioSessionId)
+        : mAttributionSource(attributionSource)
 {
     ALOGV("Client(%d) constructor", connId);
-    mPid = pid;
     mConnId = connId;
     mService = service;
     mClient = client;
     mLoop = false;
     mStatus = NO_INIT;
     mAudioSessionId = audioSessionId;
-    mUid = uid;
     mRetransmitEndpointValid = false;
     mAudioAttributes = NULL;
     mListener = new Listener(this);
@@ -757,7 +788,8 @@ MediaPlayerService::Client::Client(
 
 MediaPlayerService::Client::~Client()
 {
-    ALOGV("Client(%d) destructor pid = %d", mConnId, mPid);
+    ALOGV("Client(%d) destructor AttributionSource = %s", mConnId,
+            mAttributionSource.toString().c_str());
     mAudioOutput.clear();
     wp<Client> client(this);
     disconnect();
@@ -770,7 +802,8 @@ MediaPlayerService::Client::~Client()
 
 void MediaPlayerService::Client::disconnect()
 {
-    ALOGV("disconnect(%d) from pid %d", mConnId, mPid);
+    ALOGV("disconnect(%d) from AttributionSource %s", mConnId,
+            mAttributionSource.toString().c_str());
     // grab local reference and clear main reference to prevent future
     // access to object
     sp<MediaPlayerBase> p;
@@ -810,11 +843,12 @@ sp<MediaPlayerBase> MediaPlayerService::Client::createPlayer(player_type playerT
         p.clear();
     }
     if (p == NULL) {
-        p = MediaPlayerFactory::createPlayer(playerType, mListener, mPid);
+        p = MediaPlayerFactory::createPlayer(playerType, mListener,
+            VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mAttributionSource.pid)));
     }
 
     if (p != NULL) {
-        p->setUID(mUid);
+        p->setUID(VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(mAttributionSource.uid)));
     }
 
     return p;
@@ -893,10 +927,10 @@ sp<MediaPlayerBase> MediaPlayerService::Client::setDataSource_pre(
         {
             for (std::shared_ptr<Codec2Client> const& client :
                     Codec2Client::CreateFromAllServices()) {
-                sp<IBase> base = client->getBase();
-                deathNotifiers.emplace_back(
-                        base, [l = wp<MediaPlayerBase>(p),
-                               name = std::string(client->getServiceName())]() {
+                sp<IBase> hidlBase = client->getHidlBase();
+                ::ndk::SpAIBinder aidlBase = client->getAidlBase();
+                auto onBinderDied = [l = wp<MediaPlayerBase>(p),
+                                     name = std::string(client->getServiceName())]() {
                     sp<MediaPlayerBase> listener = l.promote();
                     if (listener) {
                         ALOGI("Codec2 service \"%s\" died. "
@@ -910,7 +944,12 @@ sp<MediaPlayerBase> MediaPlayerService::Client::setDataSource_pre(
                               "without a death handler.",
                               name.c_str());
                     }
-                });
+                };
+                if (hidlBase) {
+                    deathNotifiers.emplace_back(hidlBase, onBinderDied);
+                } else if (aidlBase.get() != nullptr) {
+                    deathNotifiers.emplace_back(aidlBase, onBinderDied);
+                }
             }
         }
     }
@@ -922,8 +961,8 @@ sp<MediaPlayerBase> MediaPlayerService::Client::setDataSource_pre(
     mAudioDeviceUpdatedListener = new AudioDeviceUpdatedNotifier(p);
 
     if (!p->hardwareOutput()) {
-        mAudioOutput = new AudioOutput(mAudioSessionId, IPCThreadState::self()->getCallingUid(),
-                mPid, mAudioAttributes, mAudioDeviceUpdatedListener, mOpPackageName);
+        mAudioOutput = new AudioOutput(mAudioSessionId, mAttributionSource,
+                mAudioAttributes, mAudioDeviceUpdatedListener);
         static_cast<MediaPlayerInterface*>(p.get())->setAudioSink(mAudioOutput);
     }
 
@@ -1215,7 +1254,7 @@ status_t MediaPlayerService::Client::setBufferingSettings(
         const BufferingSettings& buffering)
 {
     ALOGV("[%d] setBufferingSettings{%s}",
-            mConnId, buffering.toString().string());
+            mConnId, buffering.toString().c_str());
     sp<MediaPlayerBase> p = getPlayer();
     if (p == 0) return UNKNOWN_ERROR;
     return p->setBufferingSettings(buffering);
@@ -1230,7 +1269,7 @@ status_t MediaPlayerService::Client::getBufferingSettings(
     status_t ret = p->getBufferingSettings(buffering);
     if (ret == NO_ERROR) {
         ALOGV("[%d] getBufferingSettings{%s}",
-                mConnId, buffering->toString().string());
+                mConnId, buffering->toString().c_str());
     } else {
         ALOGE("[%d] getBufferingSettings returned %d", mConnId, ret);
     }
@@ -1772,10 +1811,11 @@ int Antagonizer::callbackThread(void* user)
 
 #undef LOG_TAG
 #define LOG_TAG "AudioSink"
-MediaPlayerService::AudioOutput::AudioOutput(audio_session_t sessionId, uid_t uid, int pid,
-        const audio_attributes_t* attr, const sp<AudioSystem::AudioDeviceCallback>& deviceCallback,
-        const std::string& opPackageName)
-    : mCallback(NULL),
+MediaPlayerService::AudioOutput::AudioOutput(audio_session_t sessionId,
+        const AttributionSourceState& attributionSource, const audio_attributes_t* attr,
+        const sp<AudioSystem::AudioDeviceCallback>& deviceCallback)
+    : mCachedPlayerIId(PLAYER_PIID_INVALID),
+      mCallback(NULL),
       mCallbackCookie(NULL),
       mCallbackData(NULL),
       mStreamType(AUDIO_STREAM_MUSIC),
@@ -1786,8 +1826,7 @@ MediaPlayerService::AudioOutput::AudioOutput(audio_session_t sessionId, uid_t ui
       mMsecsPerFrame(0),
       mFrameSize(0),
       mSessionId(sessionId),
-      mUid(uid),
-      mPid(pid),
+      mAttributionSource(attributionSource),
       mSendLevel(0.0),
       mAuxEffectId(0),
       mFlags(AUDIO_OUTPUT_FLAG_NONE),
@@ -1795,8 +1834,7 @@ MediaPlayerService::AudioOutput::AudioOutput(audio_session_t sessionId, uid_t ui
       mSelectedDeviceId(AUDIO_PORT_HANDLE_NONE),
       mRoutedDeviceId(AUDIO_PORT_HANDLE_NONE),
       mDeviceCallbackEnabled(false),
-      mDeviceCallback(deviceCallback),
-      mOpPackageName(opPackageName)
+      mDeviceCallback(deviceCallback)
 {
     ALOGV("AudioOutput(%d)", sessionId);
     if (attr != NULL) {
@@ -1808,7 +1846,6 @@ MediaPlayerService::AudioOutput::AudioOutput(audio_session_t sessionId, uid_t ui
     } else {
         mAttributes = NULL;
     }
-
     setMinBufferCount();
 }
 
@@ -1816,7 +1853,6 @@ MediaPlayerService::AudioOutput::~AudioOutput()
 {
     close();
     free(mAttributes);
-    delete mCallbackData;
 }
 
 //static
@@ -1977,7 +2013,7 @@ status_t MediaPlayerService::AudioOutput::setParameters(const String8& keyValueP
 String8  MediaPlayerService::AudioOutput::getParameters(const String8& keys)
 {
     Mutex::Autolock lock(mLock);
-    if (mTrack == 0) return String8::empty();
+    if (mTrack == 0) return String8();
     return mTrack->getParameters(keys);
 }
 
@@ -2037,8 +2073,7 @@ void MediaPlayerService::AudioOutput::deleteRecycledTrack_l()
 
         mRecycledTrack.clear();
         close_l();
-        delete mCallbackData;
-        mCallbackData = NULL;
+        mCallbackData.clear();
     }
 }
 
@@ -2159,7 +2194,7 @@ status_t MediaPlayerService::AudioOutput::open(
     }
 
     sp<AudioTrack> t;
-    CallbackData *newcbd = NULL;
+    sp<CallbackData> newcbd;
 
     // We don't attempt to create a new track if we are recycling an
     // offloaded track. But, if we are recycling a non-offloaded or we
@@ -2169,8 +2204,8 @@ status_t MediaPlayerService::AudioOutput::open(
     if (!(reuse && bothOffloaded)) {
         ALOGV("creating new AudioTrack");
 
-        if (mCallback != NULL) {
-            newcbd = new CallbackData(this);
+        if (mCallback != nullptr) {
+            newcbd = sp<CallbackData>::make(wp<AudioOutput>::fromExisting(this));
             t = new AudioTrack(
                     mStreamType,
                     sampleRate,
@@ -2178,19 +2213,16 @@ status_t MediaPlayerService::AudioOutput::open(
                     channelMask,
                     frameCount,
                     flags,
-                    CallbackWrapper,
                     newcbd,
                     0,  // notification frames
                     mSessionId,
                     AudioTrack::TRANSFER_CALLBACK,
                     offloadInfo,
-                    mUid,
-                    mPid,
+                    mAttributionSource,
                     mAttributes,
                     doNotReconnect,
                     1.0f,  // default value for maxRequiredSpeed
-                    mSelectedDeviceId,
-                    mOpPackageName);
+                    mSelectedDeviceId);
         } else {
             // TODO: Due to buffer memory concerns, we use a max target playback speed
             // based on mPlaybackRate at the time of open (instead of kMaxRequiredSpeed),
@@ -2207,27 +2239,23 @@ status_t MediaPlayerService::AudioOutput::open(
                     channelMask,
                     frameCount,
                     flags,
-                    NULL, // callback
-                    NULL, // user data
+                    nullptr, // callback
                     0, // notification frames
                     mSessionId,
                     AudioTrack::TRANSFER_DEFAULT,
                     NULL, // offload info
-                    mUid,
-                    mPid,
+                    mAttributionSource,
                     mAttributes,
                     doNotReconnect,
                     targetSpeed,
-                    mSelectedDeviceId,
-                    mOpPackageName);
+                    mSelectedDeviceId);
         }
         // Set caller name so it can be logged in destructor.
         // MediaMetricsConstants.h: AMEDIAMETRICS_PROP_CALLERNAME_VALUE_MEDIA
         t->setCallerName("media");
         if ((t == 0) || (t->initCheck() != NO_ERROR)) {
             ALOGE("Unable to create audio track");
-            delete newcbd;
-            // t goes out of scope, so reference count drops to zero
+            // t, newcbd goes out of scope, so reference count drops to zero
             return NO_INIT;
         } else {
             // successful AudioTrack initialization implies a legacy stream type was generated
@@ -2245,6 +2273,12 @@ status_t MediaPlayerService::AudioOutput::open(
                       mRecycledTrack->frameCount(), t->frameCount());
                 reuse = false;
             }
+            // If recycled and new tracks are not on the same output,
+            // don't reuse the recycled one.
+            if (mRecycledTrack->getOutput() != t->getOutput()) {
+                ALOGV("output has changed, don't reuse track");
+                reuse = false;
+            }
         }
 
         if (reuse) {
@@ -2255,7 +2289,6 @@ status_t MediaPlayerService::AudioOutput::open(
             if (mCallbackData != NULL) {
                 mCallbackData->setOutput(this);
             }
-            delete newcbd;
             return updateTrack();
         }
     }
@@ -2289,6 +2322,10 @@ status_t MediaPlayerService::AudioOutput::open(
         }
         return t->applyVolumeShaper(shaper.mConfiguration, operationToEnd);
     });
+
+    if (mCachedPlayerIId != PLAYER_PIID_INVALID) {
+        t->setPlayerIId(mCachedPlayerIId);
+    }
 
     mSampleRateHz = sampleRate;
     mFlags = flags;
@@ -2342,6 +2379,17 @@ status_t MediaPlayerService::AudioOutput::start()
     return NO_INIT;
 }
 
+void MediaPlayerService::AudioOutput::setPlayerIId(int32_t playerIId)
+{
+    ALOGV("setPlayerIId(%d)", playerIId);
+    Mutex::Autolock lock(mLock);
+    mCachedPlayerIId = playerIId;
+
+    if (mTrack != nullptr) {
+        mTrack->setPlayerIId(mCachedPlayerIId);
+    }
+}
+
 void MediaPlayerService::AudioOutput::setNextOutput(const sp<AudioOutput>& nextOutput) {
     Mutex::Autolock lock(mLock);
     mNextOutput = nextOutput;
@@ -2361,7 +2409,7 @@ void MediaPlayerService::AudioOutput::switchToNextOutput() {
             if (mCallbackData != NULL) {
                 // two alternative approaches
 #if 1
-                CallbackData *callbackData = mCallbackData;
+                sp<CallbackData> callbackData = mCallbackData;
                 mLock.unlock();
                 // proper acquisition sequence
                 callbackData->lock();
@@ -2398,9 +2446,8 @@ void MediaPlayerService::AudioOutput::switchToNextOutput() {
             // for example, the next player could be prepared and seeked.
             //
             // Presuming it isn't advisable to force the track over.
-             if (mNextOutput->mTrack == NULL) {
+             if (mNextOutput->mTrack == nullptr) {
                 ALOGD("Recycling track for gapless playback");
-                delete mNextOutput->mCallbackData;
                 mNextOutput->mCallbackData = mCallbackData;
                 mNextOutput->mRecycledTrack = mTrack;
                 mNextOutput->mSampleRateHz = mSampleRateHz;
@@ -2408,11 +2455,11 @@ void MediaPlayerService::AudioOutput::switchToNextOutput() {
                 mNextOutput->mFlags = mFlags;
                 mNextOutput->mFrameSize = mFrameSize;
                 close_l();
-                mCallbackData = NULL;  // destruction handled by mNextOutput
+                mCallbackData.clear();
             } else {
                 ALOGW("Ignoring gapless playback because next player has already started");
                 // remove track in case resource needed for future players.
-                if (mCallbackData != NULL) {
+                if (mCallbackData != nullptr) {
                     mCallbackData->endTrackSwitch();  // release lock for callbacks before close.
                 }
                 close_l();
@@ -2451,8 +2498,13 @@ void MediaPlayerService::AudioOutput::flush()
 void MediaPlayerService::AudioOutput::pause()
 {
     ALOGV("pause");
+    // We use pauseAndWait() instead of pause() to ensure tracks ramp to silence before
+    // any flush. We choose 40 ms timeout to allow 1 deep buffer mixer period
+    // to occur.  Often waiting is 0 - 20 ms.
+    using namespace std::chrono_literals;
+    constexpr auto TIMEOUT_MS = 40ms;
     Mutex::Autolock lock(mLock);
-    if (mTrack != 0) mTrack->pause();
+    if (mTrack != 0) mTrack->pauseAndWait(TIMEOUT_MS);
 }
 
 void MediaPlayerService::AudioOutput::close()
@@ -2580,6 +2632,16 @@ VolumeShaper::Status MediaPlayerService::AudioOutput::applyVolumeShaper(
     Mutex::Autolock lock(mLock);
     ALOGV("AudioOutput::applyVolumeShaper");
 
+    if (configuration == nullptr) {
+        ALOGE("AudioOutput::applyVolumeShaper Null configuration parameter");
+        return VolumeShaper::Status(BAD_VALUE);
+    }
+
+    if (operation == nullptr) {
+        ALOGE("AudioOutput::applyVolumeShaper Null operation parameter");
+        return VolumeShaper::Status(BAD_VALUE);
+    }
+
     mVolumeHandler->setIdIfNecessary(configuration);
 
     VolumeShaper::Status status;
@@ -2634,76 +2696,71 @@ sp<VolumeShaper::State> MediaPlayerService::AudioOutput::getVolumeShaperState(in
     }
 }
 
-// static
-void MediaPlayerService::AudioOutput::CallbackWrapper(
-        int event, void *cookie, void *info) {
-    //ALOGV("callbackwrapper");
-    CallbackData *data = (CallbackData*)cookie;
-    // lock to ensure we aren't caught in the middle of a track switch.
-    data->lock();
-    AudioOutput *me = data->getOutput();
-    AudioTrack::Buffer *buffer = (AudioTrack::Buffer *)info;
-    if (me == NULL) {
-        // no output set, likely because the track was scheduled to be reused
-        // by another player, but the format turned out to be incompatible.
-        data->unlock();
-        if (buffer != NULL) {
-            buffer->size = 0;
-        }
+size_t MediaPlayerService::AudioOutput::CallbackData::onMoreData(const AudioTrack::Buffer& buffer) {
+    ALOGD("data callback");
+    lock();
+    sp<AudioOutput> me = getOutput();
+    if (me == nullptr) {
+        unlock();
+        return 0;
+    }
+    size_t actualSize = (*me->mCallback)(
+            me.get(), buffer.data(), buffer.size(), me->mCallbackCookie,
+            CB_EVENT_FILL_BUFFER);
+
+    // Log when no data is returned from the callback.
+    // (1) We may have no data (especially with network streaming sources).
+    // (2) We may have reached the EOS and the audio track is not stopped yet.
+    // Note that AwesomePlayer/AudioPlayer will only return zero size when it reaches the EOS.
+    // NuPlayerRenderer will return zero when it doesn't have data (it doesn't block to fill).
+    //
+    // This is a benign busy-wait, with the next data request generated 10 ms or more later;
+    // nevertheless for power reasons, we don't want to see too many of these.
+
+    ALOGV_IF(actualSize == 0 && buffer.size() > 0, "callbackwrapper: empty buffer returned");
+    unlock();
+    return actualSize;
+}
+
+void MediaPlayerService::AudioOutput::CallbackData::onStreamEnd() {
+    lock();
+    sp<AudioOutput> me = getOutput();
+    if (me == nullptr) {
+        unlock();
         return;
     }
+    ALOGV("callbackwrapper: deliver EVENT_STREAM_END");
+    (*me->mCallback)(me.get(), NULL /* buffer */, 0 /* size */,
+            me->mCallbackCookie, CB_EVENT_STREAM_END);
+    unlock();
+}
 
-    switch(event) {
-    case AudioTrack::EVENT_MORE_DATA: {
-        size_t actualSize = (*me->mCallback)(
-                me, buffer->raw, buffer->size, me->mCallbackCookie,
-                CB_EVENT_FILL_BUFFER);
 
-        // Log when no data is returned from the callback.
-        // (1) We may have no data (especially with network streaming sources).
-        // (2) We may have reached the EOS and the audio track is not stopped yet.
-        // Note that AwesomePlayer/AudioPlayer will only return zero size when it reaches the EOS.
-        // NuPlayerRenderer will return zero when it doesn't have data (it doesn't block to fill).
-        //
-        // This is a benign busy-wait, with the next data request generated 10 ms or more later;
-        // nevertheless for power reasons, we don't want to see too many of these.
-
-        ALOGV_IF(actualSize == 0 && buffer->size > 0, "callbackwrapper: empty buffer returned");
-
-        buffer->size = actualSize;
-        } break;
-
-    case AudioTrack::EVENT_STREAM_END:
-        // currently only occurs for offloaded callbacks
-        ALOGV("callbackwrapper: deliver EVENT_STREAM_END");
-        (*me->mCallback)(me, NULL /* buffer */, 0 /* size */,
-                me->mCallbackCookie, CB_EVENT_STREAM_END);
-        break;
-
-    case AudioTrack::EVENT_NEW_IAUDIOTRACK :
-        ALOGV("callbackwrapper: deliver EVENT_TEAR_DOWN");
-        (*me->mCallback)(me,  NULL /* buffer */, 0 /* size */,
-                me->mCallbackCookie, CB_EVENT_TEAR_DOWN);
-        break;
-
-    case AudioTrack::EVENT_UNDERRUN:
-        // This occurs when there is no data available, typically
-        // when there is a failure to supply data to the AudioTrack.  It can also
-        // occur in non-offloaded mode when the audio device comes out of standby.
-        //
-        // If an AudioTrack underruns it outputs silence. Since this happens suddenly
-        // it may sound like an audible pop or glitch.
-        //
-        // The underrun event is sent once per track underrun; the condition is reset
-        // when more data is sent to the AudioTrack.
-        ALOGD("callbackwrapper: EVENT_UNDERRUN (discarded)");
-        break;
-
-    default:
-        ALOGE("received unknown event type: %d inside CallbackWrapper !", event);
+void MediaPlayerService::AudioOutput::CallbackData::onNewIAudioTrack() {
+    lock();
+    sp<AudioOutput> me = getOutput();
+    if (me == nullptr) {
+        unlock();
+        return;
     }
+    ALOGV("callbackwrapper: deliver EVENT_TEAR_DOWN");
+    (*me->mCallback)(me.get(),  NULL /* buffer */, 0 /* size */,
+            me->mCallbackCookie, CB_EVENT_TEAR_DOWN);
+    unlock();
+}
 
-    data->unlock();
+void MediaPlayerService::AudioOutput::CallbackData::onUnderrun() {
+    // This occurs when there is no data available, typically
+    // when there is a failure to supply data to the AudioTrack.  It can also
+    // occur in non-offloaded mode when the audio device comes out of standby.
+    //
+    // If an AudioTrack underruns it outputs silence. Since this happens suddenly
+    // it may sound like an audible pop or glitch.
+    //
+    // The underrun event is sent once per track underrun; the condition is reset
+    // when more data is sent to the AudioTrack.
+    ALOGD("callbackwrapper: EVENT_UNDERRUN (discarded)");
+
 }
 
 audio_session_t MediaPlayerService::AudioOutput::getSessionId() const
@@ -3011,4 +3068,11 @@ status_t MediaPlayerService::BatteryTracker::pullBatteryData(Parcel* reply) {
     }
     return NO_ERROR;
 }
+
+#ifdef FUZZ_MODE_MEDIA_PLAYER_SERVICE
+sp<MediaPlayerService> MediaPlayerService::createForFuzzTesting() {
+    return sp<MediaPlayerService>::make();
+}
+#endif // FUZZ_MODE_MEDIA_PLAYER_SERVICE
+
 } // namespace android

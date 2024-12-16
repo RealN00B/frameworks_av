@@ -17,7 +17,7 @@
 #define LOG_TAG "JitterCalc"
 #include <utils/Log.h>
 
-#include "JitterCalculator.h"
+#include <media/stagefright/rtsp/JitterCalculator.h>
 
 #include <stdlib.h>
 
@@ -38,33 +38,34 @@ void JitterCalc::init(uint32_t rtpTime, int64_t arrivalTimeUs, int32_t base, int
     mInterArrivalJitterUs = inter;
 }
 
-void JitterCalc::putBaseData(int64_t rtpTime, int64_t arrivalTimeUs) {
-    // A RTP time wraps around after UINT32_MAX. We must consider this case.
-    const int64_t UINT32_MSB = 0x80000000;
-    int64_t overflowMask = (mFirstTimeStamp & UINT32_MSB & ~rtpTime) << 1;
-    int64_t tempRtpTime = overflowMask | rtpTime;
+void JitterCalc::putBaseData(uint32_t rtpTime, int64_t arrivalTimeUs) {
+    // A RTP time wraps around after UINT32_MAX. Overflow can present.
+    uint32_t diff = 0;
+    __builtin_usub_overflow(rtpTime, mFirstTimeStamp, &diff);
 
     // Base jitter implementation can be various
-    int64_t scheduledTimeUs = (tempRtpTime - (int64_t)mFirstTimeStamp) * 1000000ll / mClockRate;
+    int64_t scheduledTimeUs = ((int32_t)diff) * 1000000ll / mClockRate;
     int64_t elapsedTimeUs = arrivalTimeUs - mFirstArrivalTimeUs;
     int64_t correctionTimeUs = elapsedTimeUs - scheduledTimeUs; // additional propagation delay;
-    mBaseJitterUs = (mBaseJitterUs * 15 + correctionTimeUs) / 16;
+
+    // We want to approximate correctionTimeUs by slowly (1:15) averaging into jitter base, but
+    // both correction time and base jitter can roll over. Adjust correctionTime to be close to
+    // base jitter. Accomplish this by calculating the closest 32-bit delta (positive or
+    // negative) and applying 1/16th of it to the base jitter.
+    int32_t correctionDiff;
+    (void)__builtin_sub_overflow(correctionTimeUs, mBaseJitterUs, &correctionDiff);
+    mBaseJitterUs = int32_t(int64_t(mBaseJitterUs) + correctionDiff / 16);
     ALOGV("BaseJitterUs : %lld \t\t correctionTimeUs : %lld",
             (long long)mBaseJitterUs, (long long)correctionTimeUs);
 }
 
-void JitterCalc::putInterArrivalData(int64_t rtpTime, int64_t arrivalTimeUs) {
-    const int64_t UINT32_MSB = 0x80000000;
-    int64_t tempRtpTime = rtpTime;
-    int64_t tempLastTimeStamp = mLastTimeStamp;
-
-    // A RTP time wraps around after UINT32_MAX. We must consider this case.
-    int64_t overflowMask = (mLastTimeStamp ^ rtpTime) & UINT32_MSB;
-    tempRtpTime |= ((overflowMask & ~rtpTime) << 1);
-    tempLastTimeStamp |= ((overflowMask & ~mLastTimeStamp) << 1);
+void JitterCalc::putInterArrivalData(uint32_t rtpTime, int64_t arrivalTimeUs) {
+    // A RTP time wraps around after UINT32_MAX. Overflow can present.
+    uint32_t diff = 0;
+    __builtin_usub_overflow(rtpTime, mLastTimeStamp, &diff);
 
     // 6.4.1 of RFC3550 defines this interarrival jitter value.
-    int64_t diffTimeStampUs = abs(tempRtpTime - tempLastTimeStamp) * 1000000ll / mClockRate;
+    int64_t diffTimeStampUs = abs((int32_t)diff) * 1000000ll / mClockRate;
     int64_t diffArrivalUs = arrivalTimeUs - mLastArrivalTimeUs; // Can't be minus
     ALOGV("diffTimeStampUs %lld \t\t diffArrivalUs %lld",
             (long long)diffTimeStampUs, (long long)diffArrivalUs);
@@ -72,7 +73,7 @@ void JitterCalc::putInterArrivalData(int64_t rtpTime, int64_t arrivalTimeUs) {
     int64_t varianceUs = diffArrivalUs - diffTimeStampUs;
     mInterArrivalJitterUs = (mInterArrivalJitterUs * 15 + abs(varianceUs)) / 16;
 
-    mLastTimeStamp = (uint32_t)rtpTime;
+    mLastTimeStamp = rtpTime;
     mLastArrivalTimeUs = arrivalTimeUs;
 }
 

@@ -16,39 +16,51 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "FrameDecoder"
-
+#define ATRACE_TAG  ATRACE_TAG_VIDEO
 #include "include/FrameDecoder.h"
-#include "include/FrameCaptureLayer.h"
+#include <android_media_codec.h>
 #include <binder/MemoryBase.h>
 #include <binder/MemoryHeapBase.h>
 #include <gui/Surface.h>
 #include <inttypes.h>
-#include <mediadrm/ICrypto.h>
 #include <media/IMediaSource.h>
 #include <media/MediaCodecBuffer.h>
-#include <media/stagefright/foundation/avc_utils.h>
-#include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/foundation/ColorUtils.h>
+#include <media/stagefright/CodecBase.h>
 #include <media/stagefright/ColorConverter.h>
 #include <media/stagefright/FrameCaptureProcessor.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/MediaCodec.h>
+#include <media/stagefright/MediaCodecConstants.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/Utils.h>
+#include <media/stagefright/foundation/ADebug.h>
+#include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/ColorUtils.h>
+#include <media/stagefright/foundation/avc_utils.h>
+#include <mediadrm/ICrypto.h>
 #include <private/media/VideoFrame.h>
 #include <utils/Log.h>
+#include <utils/Trace.h>
+#include "include/FrameCaptureLayer.h"
+#include "include/HevcUtils.h"
+
+#include <C2Buffer.h>
+#include <Codec2BufferUtils.h>
 
 namespace android {
 
 static const int64_t kBufferTimeOutUs = 10000LL; // 10 msec
+static const int64_t kAsyncBufferTimeOutUs = 2000000LL; // 2000 msec
 static const size_t kRetryCount = 100; // must be >0
 static const int64_t kDefaultSampleDurationUs = 33333LL; // 33ms
+// For codec, 0 is the highest importance; higher the number lesser important.
+// To make codec for thumbnail less important, give it a value more than 0.
+static const int kThumbnailImportance = 1;
 
 sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
         int32_t width, int32_t height, int32_t tileWidth, int32_t tileHeight,
-        int32_t dstBpp, bool allocRotated, bool metaOnly) {
+        int32_t dstBpp, uint32_t bitDepth, bool allocRotated, bool metaOnly) {
     int32_t rotationAngle;
     if (!trackMeta->findInt32(kKeyRotation, &rotationAngle)) {
         rotationAngle = 0;  // By default, no rotation
@@ -66,6 +78,12 @@ sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
     if (trackMeta->findInt32(kKeySARWidth, &sarWidth)
             && trackMeta->findInt32(kKeySARHeight, &sarHeight)
             && sarHeight != 0) {
+        int32_t multVal;
+        if (width < 0 || sarWidth < 0 ||
+            __builtin_mul_overflow(width, sarWidth, &multVal)) {
+            ALOGE("displayWidth overflow %dx%d", width, sarWidth);
+            return NULL;
+        }
         displayWidth = (width * sarWidth) / sarHeight;
         displayHeight = height;
     } else if (trackMeta->findInt32(kKeyDisplayWidth, &displayWidth)
@@ -77,17 +95,46 @@ sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
         displayWidth = width;
         displayHeight = height;
     }
+    int32_t displayLeft = 0;
+    int32_t displayTop = 0;
+    int32_t displayRight;
+    int32_t displayBottom;
+    if (trackMeta->findRect(kKeyCropRect, &displayLeft, &displayTop, &displayRight,
+                            &displayBottom)) {
+        if (displayLeft >= 0 && displayTop >= 0 && displayRight < width && displayBottom < height &&
+            displayLeft <= displayRight && displayTop <= displayBottom) {
+            displayWidth = displayRight - displayLeft + 1;
+            displayHeight = displayBottom - displayTop + 1;
+        } else {
+            // Crop rectangle is invalid, use the whole frame.
+            displayLeft = 0;
+            displayTop = 0;
+        }
+    }
 
-    if (allocRotated && (rotationAngle == 90 || rotationAngle == 270)) {
-        int32_t tmp;
-        tmp = width; width = height; height = tmp;
-        tmp = displayWidth; displayWidth = displayHeight; displayHeight = tmp;
-        tmp = tileWidth; tileWidth = tileHeight; tileHeight = tmp;
+    if (allocRotated) {
+        if (rotationAngle == 90 || rotationAngle == 270) {
+            // swap width and height for 90 & 270 degrees rotation
+            std::swap(width, height);
+            std::swap(displayWidth, displayHeight);
+            std::swap(tileWidth, tileHeight);
+        }
+        // Rotation is already applied.
         rotationAngle = 0;
     }
 
-    VideoFrame frame(width, height, displayWidth, displayHeight,
-            tileWidth, tileHeight, rotationAngle, dstBpp, !metaOnly, iccSize);
+    if (!metaOnly) {
+        int32_t multVal;
+        if (width < 0 || height < 0 || dstBpp < 0 ||
+            __builtin_mul_overflow(dstBpp, width, &multVal) ||
+            __builtin_mul_overflow(multVal, height, &multVal)) {
+            ALOGE("Frame size overflow %dx%d bpp %d", width, height, dstBpp);
+            return NULL;
+        }
+    }
+
+    VideoFrame frame(width, height, displayWidth, displayHeight, displayLeft, displayTop, tileWidth,
+                     tileHeight, rotationAngle, dstBpp, bitDepth, !metaOnly, iccSize);
 
     size_t size = frame.getFlattenedSize();
     sp<MemoryHeapBase> heap = new MemoryHeapBase(size, 0, "MetadataRetrieverClient");
@@ -96,7 +143,7 @@ sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
         return NULL;
     }
     sp<IMemory> frameMem = new MemoryBase(heap, 0, size);
-    if (frameMem == NULL) {
+    if (frameMem == NULL || frameMem->unsecurePointer() == NULL) {
         ALOGE("not enough memory for VideoFrame size=%zu", size);
         return NULL;
     }
@@ -108,16 +155,23 @@ sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
 
 sp<IMemory> allocVideoFrame(const sp<MetaData>& trackMeta,
         int32_t width, int32_t height, int32_t tileWidth, int32_t tileHeight,
-        int32_t dstBpp, bool allocRotated = false) {
-    return allocVideoFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp,
+        int32_t dstBpp, uint8_t bitDepth, bool allocRotated = false) {
+    return allocVideoFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp, bitDepth,
             allocRotated, false /*metaOnly*/);
 }
 
 sp<IMemory> allocMetaFrame(const sp<MetaData>& trackMeta,
         int32_t width, int32_t height, int32_t tileWidth, int32_t tileHeight,
-        int32_t dstBpp) {
-    return allocVideoFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp,
+        int32_t dstBpp, uint8_t bitDepth) {
+    return allocVideoFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp, bitDepth,
             false /*allocRotated*/, true /*metaOnly*/);
+}
+
+bool isAvif(const sp<MetaData> &trackMeta) {
+    const char *mime;
+    return trackMeta->findCString(kKeyMIMEType, &mime)
+        && (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AV1)
+            || !strcasecmp(mime, MEDIA_MIMETYPE_IMAGE_AVIF));
 }
 
 bool findThumbnailInfo(
@@ -126,9 +180,10 @@ bool findThumbnailInfo(
     uint32_t dummyType;
     const void *dummyData;
     size_t dummySize;
+    int codecConfigKey = isAvif(trackMeta) ? kKeyThumbnailAV1C : kKeyThumbnailHVCC;
     return trackMeta->findInt32(kKeyThumbnailWidth, width)
         && trackMeta->findInt32(kKeyThumbnailHeight, height)
-        && trackMeta->findData(kKeyThumbnailHVCC,
+        && trackMeta->findData(codecConfigKey,
                 type ?: &dummyType, data ?: &dummyData, size ?: &dummySize);
 }
 
@@ -167,6 +222,13 @@ bool getDstColorFormat(
             *dstBpp = 4;
             return true;
         }
+        case HAL_PIXEL_FORMAT_RGBA_1010102:
+        {
+            *dstFormat = (OMX_COLOR_FORMATTYPE)COLOR_Format32bitABGR2101010;
+            *captureFormat = ui::PixelFormat::RGBA_1010102;
+            *dstBpp = 4;
+            return true;
+        }
         default:
         {
             ALOGE("Unsupported color format: %d", colorFormat);
@@ -176,9 +238,107 @@ bool getDstColorFormat(
     return false;
 }
 
+AsyncCodecHandler::AsyncCodecHandler(const wp<FrameDecoder>& frameDecoder) {
+    mFrameDecoder = frameDecoder;
+}
+
+void AsyncCodecHandler::onMessageReceived(const sp<AMessage>& msg) {
+    switch (msg->what()) {
+        case FrameDecoder::kWhatCallbackNotify:
+            int32_t callbackId;
+            if (!msg->findInt32("callbackID", &callbackId)) {
+                ALOGE("kWhatCallbackNotify: callbackID is expected.");
+                break;
+            }
+            switch (callbackId) {
+                case MediaCodec::CB_INPUT_AVAILABLE: {
+                    int32_t index;
+                    if (!msg->findInt32("index", &index)) {
+                        ALOGE("CB_INPUT_AVAILABLE: index is expected.");
+                        break;
+                    }
+                    ALOGD("CB_INPUT_AVAILABLE received, index is %d", index);
+                    sp<FrameDecoder> frameDecoder = mFrameDecoder.promote();
+                    if (frameDecoder != nullptr) {
+                        frameDecoder->handleInputBufferAsync(index);
+                    }
+                    break;
+                }
+                case MediaCodec::CB_OUTPUT_AVAILABLE: {
+                    int32_t index;
+                    int64_t timeUs;
+                    CHECK(msg->findInt32("index", &index));
+                    CHECK(msg->findInt64("timeUs", &timeUs));
+                    ALOGD("CB_OUTPUT_AVAILABLE received, index is %d", index);
+                    sp<FrameDecoder> frameDecoder = mFrameDecoder.promote();
+                    if (frameDecoder != nullptr) {
+                        frameDecoder->handleOutputBufferAsync(index, timeUs);
+                    }
+                    break;
+                }
+                case MediaCodec::CB_OUTPUT_FORMAT_CHANGED: {
+                    ALOGD("CB_OUTPUT_FORMAT_CHANGED received");
+                    sp<AMessage> format;
+                    if (!msg->findMessage("format", &format) || format == nullptr) {
+                        ALOGE("CB_OUTPUT_FORMAT_CHANGED: format is expected.");
+                        break;
+                    }
+                    sp<FrameDecoder> frameDecoder = mFrameDecoder.promote();
+                    if (frameDecoder != nullptr) {
+                        frameDecoder->handleOutputFormatChangeAsync(format);
+                    }
+                    break;
+                }
+                case MediaCodec::CB_ERROR: {
+                    status_t err;
+                    int32_t actionCode;
+                    AString detail;
+                    if (!msg->findInt32("err", &err)) {
+                        ALOGE("CB_ERROR: err is expected.");
+                        break;
+                    }
+                    if (!msg->findInt32("actionCode", &actionCode)) {
+                        ALOGE("CB_ERROR: actionCode is expected.");
+                        break;
+                    }
+                    msg->findString("detail", &detail);
+                    ALOGE("Codec reported error(0x%x/%s), actionCode(%d), detail(%s)", err,
+                          StrMediaError(err).c_str(), actionCode, detail.c_str());
+                    break;
+                }
+                default:
+                    ALOGE("kWhatCallbackNotify: callbackID(%d) is unexpected.", callbackId);
+                    break;
+            }
+            break;
+        default:
+            ALOGE("unexpected message received: %s", msg->debugString().c_str());
+            break;
+    }
+}
+
+void InputBufferIndexQueue::enqueue(int32_t index) {
+    std::scoped_lock<std::mutex> lock(mMutex);
+    mQueue.push(index);
+    mCondition.notify_one();
+}
+
+bool InputBufferIndexQueue::dequeue(int32_t* index, int32_t timeOutUs) {
+    std::unique_lock<std::mutex> lock(mMutex);
+    bool hasAvailableIndex = mCondition.wait_for(lock, std::chrono::microseconds(timeOutUs),
+                                                 [this] { return !mQueue.empty(); });
+    if (hasAvailableIndex) {
+        *index = mQueue.front();
+        mQueue.pop();
+        return true;
+    } else {
+        return false;
+    }
+}
+
 //static
 sp<IMemory> FrameDecoder::getMetadataOnly(
-        const sp<MetaData> &trackMeta, int colorFormat, bool thumbnail) {
+        const sp<MetaData> &trackMeta, int colorFormat, bool thumbnail, uint32_t bitDepth) {
     OMX_COLOR_FORMATTYPE dstFormat;
     ui::PixelFormat captureFormat;
     int32_t dstBpp;
@@ -202,7 +362,11 @@ sp<IMemory> FrameDecoder::getMetadataOnly(
         }
     }
 
-    sp<IMemory> metaMem = allocMetaFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp);
+    sp<IMemory> metaMem =
+            allocMetaFrame(trackMeta, width, height, tileWidth, tileHeight, dstBpp, bitDepth);
+    if (metaMem == nullptr) {
+        return NULL;
+    }
 
     // try to fill sequence meta's duration based on average frame rate,
     // default to 33ms if frame rate is unavailable.
@@ -221,6 +385,7 @@ FrameDecoder::FrameDecoder(
         const sp<MetaData> &trackMeta,
         const sp<IMediaSource> &source)
     : mComponentName(componentName),
+      mUseBlockModel(false),
       mTrackMeta(trackMeta),
       mSource(source),
       mDstFormat(OMX_COLOR_Format16bitRGB565),
@@ -230,6 +395,10 @@ FrameDecoder::FrameDecoder(
 }
 
 FrameDecoder::~FrameDecoder() {
+    if (mHandler != NULL) {
+        mAsyncLooper->stop();
+        mAsyncLooper->unregisterHandler(mHandler->id());
+    }
     if (mDecoder != NULL) {
         mDecoder->release();
         mSource->stop();
@@ -273,8 +442,18 @@ status_t FrameDecoder::init(
         return (decoder.get() == NULL) ? NO_MEMORY : err;
     }
 
+    if (mUseBlockModel) {
+        mAsyncLooper = new ALooper;
+        mAsyncLooper->start();
+        mHandler = new AsyncCodecHandler(wp<FrameDecoder>(this));
+        mAsyncLooper->registerHandler(mHandler);
+        sp<AMessage> callbackMsg = new AMessage(kWhatCallbackNotify, mHandler);
+        decoder->setCallback(callbackMsg);
+    }
+
     err = decoder->configure(
-            videoFormat, mSurface, NULL /* crypto */, 0 /* flags */);
+            videoFormat, mSurface, NULL /* crypto */,
+            mUseBlockModel ? MediaCodec::CONFIGURE_FLAG_USE_BLOCK_MODEL : 0 /* flags */);
     if (err != OK) {
         ALOGW("configure returned error %d (%s)", err, asString(err));
         decoder->release();
@@ -300,11 +479,20 @@ status_t FrameDecoder::init(
 }
 
 sp<IMemory> FrameDecoder::extractFrame(FrameRect *rect) {
+    ScopedTrace trace(ATRACE_TAG, "FrameDecoder::ExtractFrame");
     status_t err = onExtractRect(rect);
-    if (err == OK) {
+    if (err != OK) {
+        ALOGE("onExtractRect error %d", err);
+        return NULL;
+    }
+
+    if (!mUseBlockModel) {
         err = extractInternal();
+    } else {
+        err = extractInternalUsingBlockModel();
     }
     if (err != OK) {
+        ALOGE("extractInternal error %d", err);
         return NULL;
     }
 
@@ -315,6 +503,11 @@ status_t FrameDecoder::extractInternal() {
     status_t err = OK;
     bool done = false;
     size_t retriesLeft = kRetryCount;
+    if (!mDecoder) {
+        ALOGE("decoder is not initialized");
+        return NO_INIT;
+    }
+
     do {
         size_t index;
         int64_t ptsUs = 0LL;
@@ -368,7 +561,8 @@ status_t FrameDecoder::extractInternal() {
                         (const uint8_t*)mediaBuffer->data() + mediaBuffer->range_offset(),
                         mediaBuffer->range_length());
 
-                onInputReceived(codecBuffer, mediaBuffer->meta_data(), mFirstSample, &flags);
+                onInputReceived(codecBuffer->data(), codecBuffer->size(), mediaBuffer->meta_data(),
+                                mFirstSample, &flags);
                 mFirstSample = false;
             }
 
@@ -422,11 +616,14 @@ status_t FrameDecoder::extractInternal() {
                         ALOGE("failed to get output buffer %zu", index);
                         break;
                     }
+                    uint8_t* frameData = videoFrameBuffer->data();
+                    sp<ABuffer> imageData;
+                    videoFrameBuffer->meta()->findBuffer("image-data", &imageData);
                     if (mSurface != nullptr) {
                         mDecoder->renderOutputBufferAndRelease(index);
-                        err = onOutputReceived(videoFrameBuffer, mOutputFormat, ptsUs, &done);
+                        err = onOutputReceived(frameData, imageData, mOutputFormat, ptsUs, &done);
                     } else {
-                        err = onOutputReceived(videoFrameBuffer, mOutputFormat, ptsUs, &done);
+                        err = onOutputReceived(frameData, imageData, mOutputFormat, ptsUs, &done);
                         mDecoder->releaseOutputBuffer(index);
                     }
                 } else {
@@ -445,6 +642,75 @@ status_t FrameDecoder::extractInternal() {
     return err;
 }
 
+status_t FrameDecoder::extractInternalUsingBlockModel() {
+    status_t err = OK;
+    MediaBufferBase* mediaBuffer = NULL;
+    int64_t ptsUs = 0LL;
+    uint32_t flags = 0;
+    int32_t index;
+    mHandleOutputBufferAsyncDone = false;
+
+    err = mSource->read(&mediaBuffer, &mReadOptions);
+    mReadOptions.clearSeekTo();
+    if (err != OK) {
+        ALOGW("Input Error: err=%d", err);
+        if (mediaBuffer) {
+            mediaBuffer->release();
+        }
+        return err;
+    }
+
+    size_t inputSize = mediaBuffer->range_length();
+    std::shared_ptr<C2LinearBlock> block =
+            MediaCodec::FetchLinearBlock(inputSize, {std::string{mComponentName.c_str()}});
+    C2WriteView view{block->map().get()};
+    if (view.error() != C2_OK) {
+        ALOGE("Fatal error: failed to allocate and map a block");
+        mediaBuffer->release();
+        return NO_MEMORY;
+    }
+    if (inputSize > view.capacity()) {
+        ALOGE("Fatal error: allocated block is too small "
+              "(input size %zu; block cap %u)",
+              inputSize, view.capacity());
+        mediaBuffer->release();
+        return BAD_VALUE;
+    }
+    CHECK(mediaBuffer->meta_data().findInt64(kKeyTime, &ptsUs));
+    memcpy(view.base(), (const uint8_t*)mediaBuffer->data() + mediaBuffer->range_offset(),
+           inputSize);
+    std::shared_ptr<C2Buffer> c2Buffer =
+            C2Buffer::CreateLinearBuffer(block->share(0, inputSize, C2Fence{}));
+    onInputReceived(view.base(), inputSize, mediaBuffer->meta_data(), true /* firstSample */,
+                    &flags);
+    flags |= MediaCodec::BUFFER_FLAG_EOS;
+    mediaBuffer->release();
+
+    std::vector<AccessUnitInfo> infoVec;
+    infoVec.emplace_back(flags, inputSize, ptsUs);
+    sp<BufferInfosWrapper> infos = new BufferInfosWrapper{std::move(infoVec)};
+
+    if (!mInputBufferIndexQueue.dequeue(&index, kAsyncBufferTimeOutUs)) {
+        ALOGE("No available input buffer index for async mode.");
+        return TIMED_OUT;
+    }
+
+    AString errorDetailMsg;
+    ALOGD("QueueLinearBlock: index=%d size=%zu ts=%" PRId64 " us flags=%x",
+            index, inputSize, ptsUs,flags);
+    err = mDecoder->queueBuffer(index, c2Buffer, infos, nullptr, &errorDetailMsg);
+    if (err != OK) {
+        ALOGE("failed to queueBuffer (err %d): %s", err, errorDetailMsg.c_str());
+        return err;
+    }
+
+    // wait for handleOutputBufferAsync() to finish
+    std::unique_lock _lk(mMutex);
+    mOutputFramePending.wait_for(_lk, std::chrono::microseconds(kAsyncBufferTimeOutUs),
+                                 [this] { return mHandleOutputBufferAsyncDone; });
+    return mHandleOutputBufferAsyncDone ? OK : TIMED_OUT;
+}
+
 //////////////////////////////////////////////////////////////////////
 
 VideoFrameDecoder::VideoFrameDecoder(
@@ -453,10 +719,86 @@ VideoFrameDecoder::VideoFrameDecoder(
         const sp<IMediaSource> &source)
     : FrameDecoder(componentName, trackMeta, source),
       mFrame(NULL),
-      mIsAvcOrHevc(false),
+      mIsAvc(false),
+      mIsHevc(false),
       mSeekMode(MediaSource::ReadOptions::SEEK_PREVIOUS_SYNC),
       mTargetTimeUs(-1LL),
       mDefaultSampleDurationUs(0) {
+}
+
+status_t FrameDecoder::handleOutputFormatChangeAsync(sp<AMessage> format) {
+    // Here format is MediaCodec's internal copy of output format.
+    // Make a copy since the client might modify it.
+    mOutputFormat = format->dup();
+    ALOGD("receive output format in async mode: %s", mOutputFormat->debugString().c_str());
+    return OK;
+}
+
+status_t FrameDecoder::handleInputBufferAsync(int32_t index) {
+    mInputBufferIndexQueue.enqueue(index);
+    return OK;
+}
+
+status_t FrameDecoder::handleOutputBufferAsync(int32_t index, int64_t timeUs) {
+    if (mHandleOutputBufferAsyncDone) {
+        // we have already processed an output buffer, skip others
+        return OK;
+    }
+
+    status_t err = OK;
+    sp<MediaCodecBuffer> videoFrameBuffer;
+    err = mDecoder->getOutputBuffer(index, &videoFrameBuffer);
+    if (err != OK || videoFrameBuffer == nullptr) {
+        ALOGE("failed to get output buffer %d", index);
+        return err;
+    }
+
+    bool onOutputReceivedDone = false;
+    if (mSurface != nullptr) {
+        mDecoder->renderOutputBufferAndRelease(index);
+        // frameData and imgObj will be fetched by captureSurface() inside onOutputReceived()
+        // explicitly pass null here
+        err = onOutputReceived(nullptr, nullptr, mOutputFormat, timeUs, &onOutputReceivedDone);
+    } else {
+        // get stride and frame data for block model buffer
+        std::shared_ptr<C2Buffer> c2buffer = videoFrameBuffer->asC2Buffer();
+        if (!c2buffer
+                || c2buffer->data().type() != C2BufferData::GRAPHIC
+                || c2buffer->data().graphicBlocks().size() == 0u) {
+            ALOGE("C2Buffer precond fail");
+            return ERROR_MALFORMED;
+        }
+
+        std::unique_ptr<const C2GraphicView> view(std::make_unique<const C2GraphicView>(
+            c2buffer->data().graphicBlocks()[0].map().get()));
+        GraphicView2MediaImageConverter converter(*view, mOutputFormat, false /* copy */);
+        if (converter.initCheck() != OK) {
+            ALOGE("Converter init failed: %d", converter.initCheck());
+            return NO_INIT;
+        }
+
+        uint8_t* frameData = converter.wrap()->data();
+        sp<ABuffer> imageData = converter.imageData();
+        if (imageData != nullptr) {
+            mOutputFormat->setBuffer("image-data", imageData);
+            MediaImage2 *img = (MediaImage2*) imageData->data();
+            if (img->mNumPlanes > 0 && img->mType != img->MEDIA_IMAGE_TYPE_UNKNOWN) {
+                int32_t stride = img->mPlane[0].mRowInc;
+                mOutputFormat->setInt32(KEY_STRIDE, stride);
+                ALOGD("updating stride = %d", stride);
+            }
+        }
+
+        err = onOutputReceived(frameData, imageData, mOutputFormat, timeUs, &onOutputReceivedDone);
+        mDecoder->releaseOutputBuffer(index);
+    }
+
+    if (err == OK && onOutputReceivedDone) {
+        std::lock_guard _lm(mMutex);
+        mHandleOutputBufferAsyncDone = true;
+        mOutputFramePending.notify_one();
+    }
+    return err;
 }
 
 sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
@@ -476,8 +818,8 @@ sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
         return NULL;
     }
 
-    mIsAvcOrHevc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)
-            || !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC);
+    mIsAvc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
+    mIsHevc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC);
 
     if (frameTimeUs < 0) {
         int64_t thumbNailTime = -1ll;
@@ -497,8 +839,11 @@ sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
         return NULL;
     }
 
-    // TODO: Use Flexible color instead
-    videoFormat->setInt32("color-format", OMX_COLOR_FormatYUV420Planar);
+    if (dstFormat() == COLOR_Format32bitABGR2101010) {
+        videoFormat->setInt32("color-format", COLOR_FormatYUVP010);
+    } else {
+        videoFormat->setInt32("color-format", COLOR_FormatYUV420Flexible);
+    }
 
     // For the thumbnail extraction case, try to allocate single buffer in both
     // input and output ports, if seeking to a sync frame. NOTE: This request may
@@ -506,8 +851,13 @@ sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
     bool isSeekingClosest = (mSeekMode == MediaSource::ReadOptions::SEEK_CLOSEST)
             || (mSeekMode == MediaSource::ReadOptions::SEEK_FRAME_INDEX);
     if (!isSeekingClosest) {
-        videoFormat->setInt32("android._num-input-buffers", 1);
-        videoFormat->setInt32("android._num-output-buffers", 1);
+        if (mComponentName.startsWithIgnoreCase("c2.")) {
+            mUseBlockModel = android::media::codec::provider_->thumbnail_block_model();
+        } else {
+            // OMX Codec
+            videoFormat->setInt32("android._num-input-buffers", 1);
+            videoFormat->setInt32("android._num-output-buffers", 1);
+        }
     }
 
     if (isHDR(videoFormat)) {
@@ -519,6 +869,9 @@ sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
         }
     }
 
+    // Set the importance for thumbnail.
+    videoFormat->setInt32(KEY_IMPORTANCE, kThumbnailImportance);
+
     int32_t frameRate;
     if (trackMeta()->findInt32(kKeyFrameRate, &frameRate) && frameRate > 0) {
         mDefaultSampleDurationUs = 1000000LL / frameRate;
@@ -529,9 +882,8 @@ sp<AMessage> VideoFrameDecoder::onGetFormatAndSeekOptions(
     return videoFormat;
 }
 
-status_t VideoFrameDecoder::onInputReceived(
-        const sp<MediaCodecBuffer> &codecBuffer,
-        MetaDataBase &sampleMeta, bool firstSample, uint32_t *flags) {
+status_t VideoFrameDecoder::onInputReceived(uint8_t* data, size_t size, MetaDataBase& sampleMeta,
+                                            bool firstSample, uint32_t* flags) {
     bool isSeekingClosest = (mSeekMode == MediaSource::ReadOptions::SEEK_CLOSEST)
             || (mSeekMode == MediaSource::ReadOptions::SEEK_FRAME_INDEX);
 
@@ -540,8 +892,7 @@ status_t VideoFrameDecoder::onInputReceived(
         ALOGV("Seeking closest: targetTimeUs=%lld", (long long)mTargetTimeUs);
     }
 
-    if (mIsAvcOrHevc && !isSeekingClosest
-            && IsIDR(codecBuffer->data(), codecBuffer->size())) {
+    if (!isSeekingClosest && ((mIsAvc && IsIDR(data, size)) || (mIsHevc && IsIDR(data, size)))) {
         // Only need to decode one IDR frame, unless we're seeking with CLOSEST
         // option, in which case we need to actually decode to targetTimeUs.
         *flags |= MediaCodec::BUFFER_FLAG_EOS;
@@ -556,7 +907,8 @@ status_t VideoFrameDecoder::onInputReceived(
 }
 
 status_t VideoFrameDecoder::onOutputReceived(
-        const sp<MediaCodecBuffer> &videoFrameBuffer,
+        uint8_t* frameData,
+        sp<ABuffer> imgObj,
         const sp<AMessage> &outputFormat,
         int64_t timeUs, bool *done) {
     int64_t durationUs = mDefaultSampleDurationUs;
@@ -604,6 +956,16 @@ status_t VideoFrameDecoder::onOutputReceived(
         crop_bottom = height - 1;
     }
 
+    int32_t slice_height;
+    if (outputFormat->findInt32("slice-height", &slice_height) && slice_height > 0) {
+        height = slice_height;
+    }
+
+    uint32_t bitDepth = 8;
+    if (COLOR_FormatYUVP010 == srcFormat) {
+        bitDepth = 10;
+    }
+
     if (mFrame == NULL) {
         sp<IMemory> frameMem = allocVideoFrame(
                 trackMeta(),
@@ -612,9 +974,13 @@ status_t VideoFrameDecoder::onOutputReceived(
                 0,
                 0,
                 dstBpp(),
+                bitDepth,
                 mCaptureLayer != nullptr /*allocRotated*/);
-        mFrame = static_cast<VideoFrame*>(frameMem->unsecurePointer());
+        if (frameMem == nullptr) {
+            return NO_MEMORY;
+        }
 
+        mFrame = static_cast<VideoFrame*>(frameMem->unsecurePointer());
         setFrame(frameMem);
     }
 
@@ -623,8 +989,7 @@ status_t VideoFrameDecoder::onOutputReceived(
     if (mCaptureLayer != nullptr) {
         return captureSurface();
     }
-
-    ColorConverter converter((OMX_COLOR_FORMATTYPE)srcFormat, dstFormat());
+    ColorConverter colorConverter((OMX_COLOR_FORMATTYPE)srcFormat, dstFormat());
 
     uint32_t standard, range, transfer;
     if (!outputFormat->findInt32("color-standard", (int32_t*)&standard)) {
@@ -636,11 +1001,25 @@ status_t VideoFrameDecoder::onOutputReceived(
     if (!outputFormat->findInt32("color-transfer", (int32_t*)&transfer)) {
         transfer = 0;
     }
-    converter.setSrcColorSpace(standard, range, transfer);
 
-    if (converter.isValid()) {
-        converter.convert(
-                (const uint8_t *)videoFrameBuffer->data(),
+    if (imgObj != nullptr) {
+        MediaImage2 *imageData = nullptr;
+        imageData = (MediaImage2 *)(imgObj.get()->data());
+        if (imageData != nullptr) {
+            colorConverter.setSrcMediaImage2(*imageData);
+        }
+    }
+    if (srcFormat == COLOR_FormatYUV420Flexible && imgObj.get() == nullptr) {
+        return ERROR_UNSUPPORTED;
+    }
+    colorConverter.setSrcColorSpace(standard, range, transfer);
+    if (colorConverter.isValid()) {
+        ScopedTrace trace(ATRACE_TAG, "FrameDecoder::ColorConverter");
+        if (frameData == nullptr) {
+            ALOGD("frameData is null for ColorConverter");
+        }
+        colorConverter.convert(
+                (const uint8_t *)frameData,
                 width, height, stride,
                 crop_left, crop_top, crop_right, crop_bottom,
                 mFrame->getFlattenedData(),
@@ -709,7 +1088,7 @@ status_t VideoFrameDecoder::captureSurface() {
 
 ////////////////////////////////////////////////////////////////////////
 
-ImageDecoder::ImageDecoder(
+MediaImageDecoder::MediaImageDecoder(
         const AString &componentName,
         const sp<MetaData> &trackMeta,
         const sp<IMediaSource> &source)
@@ -725,7 +1104,7 @@ ImageDecoder::ImageDecoder(
       mTargetTiles(0) {
 }
 
-sp<AMessage> ImageDecoder::onGetFormatAndSeekOptions(
+sp<AMessage> MediaImageDecoder::onGetFormatAndSeekOptions(
         int64_t frameTimeUs, int /*seekMode*/,
         MediaSource::ReadOptions *options, sp<Surface> * /*window*/) {
     sp<MetaData> overrideMeta;
@@ -745,7 +1124,10 @@ sp<AMessage> ImageDecoder::onGetFormatAndSeekOptions(
         overrideMeta->remove(kKeyDisplayHeight);
         overrideMeta->setInt32(kKeyWidth, mWidth);
         overrideMeta->setInt32(kKeyHeight, mHeight);
-        overrideMeta->setData(kKeyHVCC, type, data, size);
+        // The AV1 codec configuration data is passed via CSD0 to the AV1
+        // decoder.
+        const int codecConfigKey = isAvif(trackMeta()) ? kKeyOpaqueCSD0 : kKeyHVCC;
+        overrideMeta->setData(codecConfigKey, type, data, size);
         options->setSeekTo(-1);
     } else {
         CHECK(trackMeta()->findInt32(kKeyWidth, &mWidth));
@@ -758,8 +1140,16 @@ sp<AMessage> ImageDecoder::onGetFormatAndSeekOptions(
     if (overrideMeta == NULL) {
         // check if we're dealing with a tiled heif
         int32_t tileWidth, tileHeight, gridRows, gridCols;
+        int32_t widthColsProduct = 0;
+        int32_t heightRowsProduct = 0;
         if (findGridInfo(trackMeta(), &tileWidth, &tileHeight, &gridRows, &gridCols)) {
-            if (mWidth <= tileWidth * gridCols && mHeight <= tileHeight * gridRows) {
+            if (__builtin_mul_overflow(tileWidth, gridCols, &widthColsProduct) ||
+                    __builtin_mul_overflow(tileHeight, gridRows, &heightRowsProduct)) {
+                ALOGE("Multiplication overflowed Grid size: %dx%d, Picture size: %dx%d",
+                        gridCols, gridRows, tileWidth, tileHeight);
+                return nullptr;
+            }
+            if (mWidth <= widthColsProduct && mHeight <= heightRowsProduct) {
                 ALOGV("grid: %dx%d, tile size: %dx%d, picture size: %dx%d",
                         gridCols, gridRows, tileWidth, tileHeight, mWidth, mHeight);
 
@@ -788,17 +1178,24 @@ sp<AMessage> ImageDecoder::onGetFormatAndSeekOptions(
         return NULL;
     }
 
-    // TODO: Use Flexible color instead
-    videoFormat->setInt32("color-format", OMX_COLOR_FormatYUV420Planar);
+    if (dstFormat() == COLOR_Format32bitABGR2101010) {
+        videoFormat->setInt32("color-format", COLOR_FormatYUVP010);
+    } else {
+        videoFormat->setInt32("color-format", COLOR_FormatYUV420Flexible);
+    }
 
     if ((mGridRows == 1) && (mGridCols == 1)) {
         videoFormat->setInt32("android._num-input-buffers", 1);
         videoFormat->setInt32("android._num-output-buffers", 1);
     }
+
+    /// Set the importance for thumbnail.
+    videoFormat->setInt32(KEY_IMPORTANCE, kThumbnailImportance);
+
     return videoFormat;
 }
 
-status_t ImageDecoder::onExtractRect(FrameRect *rect) {
+status_t MediaImageDecoder::onExtractRect(FrameRect *rect) {
     // TODO:
     // This callback is for verifying whether we can decode the rect,
     // and if so, set up the internal variables for decoding.
@@ -837,28 +1234,48 @@ status_t ImageDecoder::onExtractRect(FrameRect *rect) {
     return OK;
 }
 
-status_t ImageDecoder::onOutputReceived(
-        const sp<MediaCodecBuffer> &videoFrameBuffer,
+status_t MediaImageDecoder::onOutputReceived(
+        uint8_t* frameData,
+        sp<ABuffer> imgObj,
         const sp<AMessage> &outputFormat, int64_t /*timeUs*/, bool *done) {
     if (outputFormat == NULL) {
         return ERROR_MALFORMED;
     }
 
     int32_t width, height, stride;
-    CHECK(outputFormat->findInt32("width", &width));
-    CHECK(outputFormat->findInt32("height", &height));
-    CHECK(outputFormat->findInt32("stride", &stride));
-
-    if (mFrame == NULL) {
-        sp<IMemory> frameMem = allocVideoFrame(
-                trackMeta(), mWidth, mHeight, mTileWidth, mTileHeight, dstBpp());
-        mFrame = static_cast<VideoFrame*>(frameMem->unsecurePointer());
-
-        setFrame(frameMem);
+    if (outputFormat->findInt32("width", &width) == false) {
+        ALOGE("MediaImageDecoder::onOutputReceived:width is missing in outputFormat");
+        return ERROR_MALFORMED;
+    }
+    if (outputFormat->findInt32("height", &height) == false) {
+        ALOGE("MediaImageDecoder::onOutputReceived:height is missing in outputFormat");
+        return ERROR_MALFORMED;
+    }
+    if (outputFormat->findInt32("stride", &stride) == false) {
+        ALOGE("MediaImageDecoder::onOutputReceived:stride is missing in outputFormat");
+        return ERROR_MALFORMED;
     }
 
     int32_t srcFormat;
     CHECK(outputFormat->findInt32("color-format", &srcFormat));
+
+    uint32_t bitDepth = 8;
+    if (COLOR_FormatYUVP010 == srcFormat) {
+        bitDepth = 10;
+    }
+
+    if (mFrame == NULL) {
+        sp<IMemory> frameMem = allocVideoFrame(
+                trackMeta(), mWidth, mHeight, mTileWidth, mTileHeight, dstBpp(), bitDepth);
+
+        if (frameMem == nullptr) {
+            return NO_MEMORY;
+        }
+
+        mFrame = static_cast<VideoFrame*>(frameMem->unsecurePointer());
+
+        setFrame(frameMem);
+    }
 
     ColorConverter converter((OMX_COLOR_FORMATTYPE)srcFormat, dstFormat());
 
@@ -872,6 +1289,17 @@ status_t ImageDecoder::onOutputReceived(
     if (!outputFormat->findInt32("color-transfer", (int32_t*)&transfer)) {
         transfer = 0;
     }
+
+    if (imgObj != nullptr) {
+        MediaImage2 *imageData = nullptr;
+        imageData = (MediaImage2 *)(imgObj.get()->data());
+        if (imageData != nullptr) {
+            converter.setSrcMediaImage2(*imageData);
+        }
+    }
+    if (srcFormat == COLOR_FormatYUV420Flexible && imgObj.get() == nullptr) {
+        return ERROR_UNSUPPORTED;
+    }
     converter.setSrcColorSpace(standard, range, transfer);
 
     int32_t crop_left, crop_top, crop_right, crop_bottom;
@@ -879,6 +1307,11 @@ status_t ImageDecoder::onOutputReceived(
         crop_left = crop_top = 0;
         crop_right = width - 1;
         crop_bottom = height - 1;
+    }
+
+    int32_t slice_height;
+    if (outputFormat->findInt32("slice-height", &slice_height) && slice_height > 0) {
+        height = slice_height;
     }
 
     int32_t crop_width, crop_height;
@@ -906,7 +1339,7 @@ status_t ImageDecoder::onOutputReceived(
 
     if (converter.isValid()) {
         converter.convert(
-                (const uint8_t *)videoFrameBuffer->data(),
+                (const uint8_t *)frameData,
                 width, height, stride,
                 crop_left, crop_top, crop_right, crop_bottom,
                 mFrame->getFlattenedData(),

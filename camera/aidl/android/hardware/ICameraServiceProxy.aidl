@@ -16,10 +16,12 @@
 
 package android.hardware;
 
+import android.hardware.CameraFeatureCombinationStats;
+import android.hardware.CameraSessionStats;
+import android.hardware.CameraExtensionSessionStats;
+
 /**
  * Binder interface for the camera service proxy running in system_server.
- *
- * Keep in sync with frameworks/av/include/camera/ICameraServiceProxy.h
  *
  * @hide
  */
@@ -30,30 +32,36 @@ interface ICameraServiceProxy
      */
     oneway void pingForUserUpdate();
 
-    /**
-     * Values for notifyCameraState newCameraState
-     */
-    const int CAMERA_STATE_OPEN = 0;
-    const int CAMERA_STATE_ACTIVE = 1;
-    const int CAMERA_STATE_IDLE = 2;
-    const int CAMERA_STATE_CLOSED = 3;
-
-    /**
-     * Values for notifyCameraState facing
-     */
-    const int CAMERA_FACING_BACK = 0;
-    const int CAMERA_FACING_FRONT = 1;
-    const int CAMERA_FACING_EXTERNAL = 2;
-
-    /**
-     * Values for notifyCameraState api level
-     */
-     const int CAMERA_API_LEVEL_1 = 1;
-     const int CAMERA_API_LEVEL_2 = 2;
 
     /**
      * Update the status of a camera device.
      */
-    oneway void notifyCameraState(String cameraId, int facing, int newCameraState,
-            String clientName, int apiLevel);
+    oneway void notifyCameraState(in CameraSessionStats cameraSessionStats);
+
+    /**
+     * Notify feature combination query for a camera device.
+     */
+    oneway void notifyFeatureCombinationStats(
+            in CameraFeatureCombinationStats cameraFeatureCombinationStats);
+
+    /**
+     * Returns the necessary rotate and crop override for the top activity which
+     * will be one of ({@link android.hardware.camera2.CameraMetadata#SCALER_ROTATE_AND_CROP_NONE},
+     * {@link android.hardware.camera2.CameraMetadata#SCALER_ROTATE_AND_CROP_90},
+     * {@link android.hardware.camera2.CameraMetadata#SCALER_ROTATE_AND_CROP_180},
+     * {@link android.hardware.camera2.CameraMetadata#SCALER_ROTATE_AND_CROP_270}).
+     */
+    int getRotateAndCropOverride(@utf8InCpp String packageName, int lensFacing, int userId);
+
+    /**
+     * Returns the necessary autoframing override for the top activity which
+     * will be one of ({@link android.hardware.camera2.CameraMetadata#AUTOFRAMING_FALSE},
+     * {@link android.hardware.camera2.CameraMetadata#AUTOFRAMING_TRUE}).
+     */
+    int getAutoframingOverride(@utf8InCpp String packageName);
+
+    /**
+     * Checks if the camera has been disabled via device policy.
+     */
+    boolean isCameraDisabled(int userId);
 }

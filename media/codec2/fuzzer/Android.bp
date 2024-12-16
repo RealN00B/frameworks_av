@@ -28,47 +28,31 @@ package {
 cc_defaults {
     name: "C2Fuzzer-defaults",
 
+    defaults: [ "libcodec2-static-defaults" ],
+
     srcs: [
         "C2Fuzzer.cpp",
-    ],
-
-    static_libs: [
-        "liblog",
-        "libion",
-        "libfmq",
-        "libbase",
-        "libutils",
-        "libcutils",
-        "libcodec2",
-        "libhidlbase",
-        "libdmabufheap",
-        "libcodec2_vndk",
-        "libnativewindow",
-        "libcodec2_soft_common",
-        "libsfplugin_ccodec_utils",
-        "libstagefright_foundation",
-        "libstagefright_bufferpool@2.0.1",
-        "android.hardware.graphics.mapper@2.0",
-        "android.hardware.graphics.mapper@3.0",
-        "android.hardware.media.bufferpool@2.0",
-        "android.hardware.graphics.allocator@2.0",
-        "android.hardware.graphics.allocator@3.0",
-        "android.hardware.graphics.bufferqueue@2.0",
-    ],
-
-    shared_libs: [
-        "libui",
-        "libdl",
-        "libbinder",
-        "libhardware",
-        "libvndksupport",
-        "libprocessgroup",
     ],
 
     cflags: [
         "-Wall",
         "-Werror",
     ],
+
+    fuzz_config: {
+        cc: [
+            "android-fwk-video@google.com",
+        ],
+        componentid: 1344,
+        hotlists: [
+            "4593311",
+        ],
+        description: "The fuzzer targets the APIs of libcodec2",
+        vector: "remote",
+        service_privilege: "constrained",
+        users: "multi_user",
+        fuzzed_code_usage: "shipped",
+    },
 }
 
 cc_fuzz {
@@ -166,6 +150,21 @@ cc_fuzz {
     static_libs: [
         "libvpx",
         "libcodec2_soft_vp9dec",
+    ],
+}
+
+cc_fuzz {
+    name: "C2FuzzerAV1Dec",
+    defaults: ["C2Fuzzer-defaults"],
+
+    cflags: [
+        "-DC2COMPONENTNAME=\"c2.android.av1.decoder\"",
+    ],
+
+    static_libs: [
+        "libgav1",
+        "libyuv",
+        "libcodec2_soft_av1dec_gav1",
     ],
 }
 

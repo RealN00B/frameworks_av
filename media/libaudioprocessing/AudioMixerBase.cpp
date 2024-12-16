@@ -18,6 +18,7 @@
 #define LOG_TAG "AudioMixer"
 //#define LOG_NDEBUG 0
 
+#include <array>
 #include <sstream>
 #include <string.h>
 
@@ -142,6 +143,7 @@ status_t AudioMixerBase::create(
         // setParameter(name, TRACK, MAIN_BUFFER, mixBuffer) is required before enable(name)
         t->mainBuffer = NULL;
         t->auxBuffer = NULL;
+        t->teeBuffer = nullptr;
         t->mMixerFormat = AUDIO_FORMAT_PCM_16_BIT;
         t->mFormat = format;
         t->mMixerInFormat = kUseFloat && kUseNewMixer ?
@@ -149,6 +151,8 @@ status_t AudioMixerBase::create(
         t->mMixerChannelMask = audio_channel_mask_from_representation_and_bits(
                 AUDIO_CHANNEL_REPRESENTATION_POSITION, AUDIO_CHANNEL_OUT_STEREO);
         t->mMixerChannelCount = audio_channel_count_from_out_mask(t->mMixerChannelMask);
+        t->mTeeBufferFrameCount = 0;
+        t->mInputFrameSize = audio_bytes_per_frame(t->channelCount, t->mFormat);
         status_t status = postCreateTrack(t.get());
         if (status != OK) return status;
         mTracks[name] = t;
@@ -175,6 +179,7 @@ bool AudioMixerBase::setChannelMasks(int name,
     track->channelCount = trackChannelCount;
     track->mMixerChannelMask = mixerChannelMask;
     track->mMixerChannelCount = mixerChannelCount;
+    track->mInputFrameSize = audio_bytes_per_frame(track->channelCount, track->mFormat);
 
     // Resampler channels may have changed.
     track->recreateResampler(mSampleRate);
@@ -400,6 +405,20 @@ void AudioMixerBase::setParameter(int name, int target, int param, void *value)
                 invalidate();
             }
             } break;
+        case TEE_BUFFER:
+            if (track->teeBuffer != valueBuf) {
+                track->teeBuffer = valueBuf;
+                ALOGV("setParameter(TRACK, TEE_BUFFER, %p)", valueBuf);
+                invalidate();
+            }
+            break;
+        case TEE_BUFFER_FRAME_COUNT:
+            if (track->mTeeBufferFrameCount != valueInt) {
+                track->mTeeBufferFrameCount = valueInt;
+                ALOGV("setParameter(TRACK, TEE_BUFFER_FRAME_COUNT, %i)", valueInt);
+                invalidate();
+            }
+            break;
         default:
             LOG_ALWAYS_FATAL("setParameter track: bad param %d", param);
         }
@@ -452,9 +471,9 @@ void AudioMixerBase::setParameter(int name, int target, int param, void *value)
                         &track->mVolume[param - VOLUME0],
                         &track->mPrevVolume[param - VOLUME0],
                         &track->mVolumeInc[param - VOLUME0])) {
-                    ALOGV("setParameter(%s, VOLUME%d: %04x)",
-                            target == VOLUME ? "VOLUME" : "RAMP_VOLUME", param - VOLUME0,
-                                    track->volume[param - VOLUME0]);
+                    ALOGV("setParameter(%s, VOLUME%d: %f)",
+                          target == VOLUME ? "VOLUME" : "RAMP_VOLUME", param - VOLUME0,
+                          track->mVolume[param - VOLUME0]);
                     invalidate();
                 }
             } else {
@@ -629,7 +648,7 @@ void AudioMixerBase::process__validate()
 
         if (t->volumeInc[0]|t->volumeInc[1]) {
             volumeRamp = true;
-        } else if (!t->doesResample() && t->volumeRL == 0) {
+        } else if (!t->doesResample() && t->isVolumeMuted()) {
             n |= NEEDS_MUTE;
         }
         t->needs = n;
@@ -729,7 +748,7 @@ void AudioMixerBase::process__validate()
 
         for (const int name : mEnabled) {
             const std::shared_ptr<TrackBase> &t = mTracks[name];
-            if (!t->doesResample() && t->volumeRL == 0) {
+            if (!t->doesResample() && t->isVolumeMuted()) {
                 t->needs |= NEEDS_MUTE;
                 t->hook = &TrackBase::track__nop;
             } else {
@@ -1103,7 +1122,7 @@ void AudioMixerBase::process__genericNoResampling()
                     aux = t->auxBuffer + numFrames;
                 }
                 for (int outFrames = frameCount; outFrames > 0; ) {
-                    // t->in == nullptr can happen if the track was flushed just after having
+                    // t->mIn == nullptr can happen if the track was flushed just after having
                     // been enabled for mixing.
                     if (t->mIn == nullptr) {
                         break;
@@ -1295,8 +1314,29 @@ void AudioMixerBase::process__oneTrack16BitsStereoNoResampling()
 
 // Needs to derive a compile time constant (constexpr).  Could be targeted to go
 // to a MONOVOL mixtype based on MAX_NUM_VOLUMES, but that's an unnecessary complication.
-#define MIXTYPE_MONOVOL(mixtype) ((mixtype) == MIXTYPE_MULTI ? MIXTYPE_MULTI_MONOVOL : \
-        (mixtype) == MIXTYPE_MULTI_SAVEONLY ? MIXTYPE_MULTI_SAVEONLY_MONOVOL : (mixtype))
+
+constexpr int MIXTYPE_MONOVOL(int mixtype, int channels) {
+    if (channels <= FCC_2) {
+        return mixtype;
+    } else if (mixtype == MIXTYPE_MULTI) {
+        return MIXTYPE_MULTI_MONOVOL;
+    } else if (mixtype == MIXTYPE_MULTI_SAVEONLY) {
+        return MIXTYPE_MULTI_SAVEONLY_MONOVOL;
+    } else {
+        return mixtype;
+    }
+}
+
+// Helper to make a functional array from volumeRampMulti.
+template <int MIXTYPE, typename TO, typename TI, typename TV, typename TA, typename TAV,
+          std::size_t ... Is>
+static constexpr auto makeVRMArray(std::index_sequence<Is...>)
+{
+    using F = void(*)(TO*, size_t, const TI*, TA*, TV*, const TV*, TAV*, TAV);
+    return std::array<F, sizeof...(Is)>{
+            { &volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE, Is + 1), Is + 1, TO, TI, TV, TA, TAV> ...}
+        };
+}
 
 /* MIXTYPE     (see AudioMixerOps.h MIXTYPE_* enumeration)
  * TO: int32_t (Q4.27) or float
@@ -1308,38 +1348,24 @@ template <int MIXTYPE,
 static void volumeRampMulti(uint32_t channels, TO* out, size_t frameCount,
         const TI* in, TA* aux, TV *vol, const TV *volinc, TAV *vola, TAV volainc)
 {
-    switch (channels) {
-    case 1:
-        volumeRampMulti<MIXTYPE, 1>(out, frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 2:
-        volumeRampMulti<MIXTYPE, 2>(out, frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 3:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 3>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 4:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 4>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 5:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 5>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 6:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 6>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 7:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 7>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
-    case 8:
-        volumeRampMulti<MIXTYPE_MONOVOL(MIXTYPE), 8>(out,
-                frameCount, in, aux, vol, volinc, vola, volainc);
-        break;
+    static constexpr auto volumeRampMultiArray =
+            makeVRMArray<MIXTYPE, TO, TI, TV, TA, TAV>(std::make_index_sequence<FCC_LIMIT>());
+    if (channels > 0 && channels <= volumeRampMultiArray.size()) {
+        volumeRampMultiArray[channels - 1](out, frameCount, in, aux, vol, volinc, vola, volainc);
+    } else {
+        ALOGE("%s: invalid channel count:%d", __func__, channels);
     }
+}
+
+// Helper to make a functional array from volumeMulti.
+template <int MIXTYPE, typename TO, typename TI, typename TV, typename TA, typename TAV,
+          std::size_t ... Is>
+static constexpr auto makeVMArray(std::index_sequence<Is...>)
+{
+    using F = void(*)(TO*, size_t, const TI*, TA*, const TV*, TAV);
+    return std::array<F, sizeof...(Is)>{
+            { &volumeMulti<MIXTYPE_MONOVOL(MIXTYPE, Is + 1), Is + 1, TO, TI, TV, TA, TAV> ... }
+        };
 }
 
 /* MIXTYPE     (see AudioMixerOps.h MIXTYPE_* enumeration)
@@ -1352,31 +1378,12 @@ template <int MIXTYPE,
 static void volumeMulti(uint32_t channels, TO* out, size_t frameCount,
         const TI* in, TA* aux, const TV *vol, TAV vola)
 {
-    switch (channels) {
-    case 1:
-        volumeMulti<MIXTYPE, 1>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 2:
-        volumeMulti<MIXTYPE, 2>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 3:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 3>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 4:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 4>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 5:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 5>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 6:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 6>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 7:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 7>(out, frameCount, in, aux, vol, vola);
-        break;
-    case 8:
-        volumeMulti<MIXTYPE_MONOVOL(MIXTYPE), 8>(out, frameCount, in, aux, vol, vola);
-        break;
+    static constexpr auto volumeMultiArray =
+            makeVMArray<MIXTYPE, TO, TI, TV, TA, TAV>(std::make_index_sequence<FCC_LIMIT>());
+    if (channels > 0 && channels <= volumeMultiArray.size()) {
+        volumeMultiArray[channels - 1](out, frameCount, in, aux, vol, vola);
+    } else {
+        ALOGE("%s: invalid channel count:%d", __func__, channels);
     }
 }
 

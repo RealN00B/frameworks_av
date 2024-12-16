@@ -20,11 +20,15 @@
 
 #include <netinet/in.h>
 
+#include <aidl/android/hardware/camera/device/CameraBlob.h>
+#include <aidl/android/hardware/camera/device/CameraBlobId.h>
+
 #include <binder/MemoryBase.h>
 #include <binder/MemoryHeapBase.h>
+#include <com_android_graphics_libgui_flags.h>
+#include <gui/Surface.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
-#include <gui/Surface.h>
 
 #include "common/CameraDeviceBase.h"
 #include "api1/Camera2Client.h"
@@ -34,6 +38,10 @@
 
 namespace android {
 namespace camera2 {
+
+using android::camera3::CAMERA_STREAM_ROTATION_0;
+using aidl::android::hardware::camera::device::CameraBlob;
+using aidl::android::hardware::camera::device::CameraBlobId;
 
 JpegProcessor::JpegProcessor(
     sp<Camera2Client> client,
@@ -76,7 +84,8 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
     }
 
     // Find out buffer size for JPEG
-    ssize_t maxJpegSize = device->getJpegBufferSize(params.pictureWidth, params.pictureHeight);
+    ssize_t maxJpegSize = device->getJpegBufferSize(device->infoPhysical(""),
+            params.pictureWidth, params.pictureHeight);
     if (maxJpegSize <= 0) {
         ALOGE("%s: Camera %d: Jpeg buffer size (%zu) is invalid ",
                 __FUNCTION__, mId, maxJpegSize);
@@ -85,6 +94,12 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
 
     if (mCaptureConsumer == 0) {
         // Create CPU buffer queue endpoint
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mCaptureConsumer = new CpuConsumer(1);
+        mCaptureConsumer->setFrameAvailableListener(this);
+        mCaptureConsumer->setName(String8("Camera2-JpegConsumer"));
+        mCaptureWindow = mCaptureConsumer->getSurface();
+#else
         sp<IGraphicBufferProducer> producer;
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&producer, &consumer);
@@ -92,6 +107,7 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
         mCaptureConsumer->setFrameAvailableListener(this);
         mCaptureConsumer->setName(String8("Camera2-JpegConsumer"));
         mCaptureWindow = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     }
 
     // Since ashmem heaps are rounded up to page size, don't reallocate if
@@ -148,8 +164,8 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
         res = device->createStream(mCaptureWindow,
                 params.pictureWidth, params.pictureHeight,
                 HAL_PIXEL_FORMAT_BLOB, HAL_DATASPACE_V0_JFIF,
-                CAMERA3_STREAM_ROTATION_0, &mCaptureStreamId,
-                String8());
+                CAMERA_STREAM_ROTATION_0, &mCaptureStreamId,
+                std::string(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create output stream for capture: "
                     "%s (%d)", __FUNCTION__, mId,
@@ -347,11 +363,11 @@ size_t JpegProcessor::findJpegSize(uint8_t* jpegBuffer, size_t maxSize) {
     size_t size;
 
     // First check for JPEG transport header at the end of the buffer
-    uint8_t *header = jpegBuffer + (maxSize - sizeof(struct camera2_jpeg_blob));
-    struct camera2_jpeg_blob *blob = (struct camera2_jpeg_blob*)(header);
-    if (blob->jpeg_blob_id == CAMERA2_JPEG_BLOB_ID) {
-        size = blob->jpeg_size;
-        if (size > 0 && size <= maxSize - sizeof(struct camera2_jpeg_blob)) {
+    uint8_t *header = jpegBuffer + (maxSize - sizeof(CameraBlob));
+    CameraBlob *blob = (CameraBlob*)(header);
+    if (blob->blobId == CameraBlobId::JPEG) {
+        size = blob->blobSizeBytes;
+        if (size > 0 && size <= maxSize - sizeof(CameraBlob)) {
             // Verify SOI and EOI markers
             size_t offset = size - MARKER_LENGTH;
             uint8_t *end = jpegBuffer + offset;

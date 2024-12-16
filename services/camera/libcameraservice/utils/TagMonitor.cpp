@@ -18,12 +18,17 @@
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
 
+#include <iostream>
+#include <sstream>
+
 #include "TagMonitor.h"
 
 #include <inttypes.h>
 #include <utils/Log.h>
 #include <camera/VendorTagDescriptor.h>
+#include <camera/StringUtils.h>
 #include <camera_metadata_hidden.h>
+#include <device3/Camera3Stream.h>
 
 namespace android {
 
@@ -43,7 +48,7 @@ TagMonitor::TagMonitor(const TagMonitor& other):
         mMonitoringEvents(other.mMonitoringEvents),
         mVendorTagId(other.mVendorTagId) {}
 
-const String16 TagMonitor::kMonitorOption = String16("-m");
+const std::string TagMonitor::kMonitorOption("-m");
 
 const char* TagMonitor::k3aTags =
         "android.control.aeMode, android.control.afMode, android.control.awbMode,"
@@ -55,17 +60,17 @@ const char* TagMonitor::k3aTags =
         "android.control.effectMode, android.control.mode, android.control.sceneMode,"
         "android.control.videoStabilizationMode";
 
-void TagMonitor::parseTagsToMonitor(String8 tagNames) {
+void TagMonitor::parseTagsToMonitor(std::string tagNames) {
     std::lock_guard<std::mutex> lock(mMonitorMutex);
 
     // Expand shorthands
     ssize_t idx = tagNames.find("3a");
     if (idx != -1) {
         ssize_t end = tagNames.find(",", idx);
-        char* start = tagNames.lockBuffer(tagNames.size());
-        start[idx] = '\0';
-        char* rest = (end != -1) ? (start + end) : (start + tagNames.size());
-        tagNames = String8::format("%s%s%s", start, k3aTags, rest);
+        tagNames = tagNames.substr(0, idx) + k3aTags;
+        if (end != -1) {
+            tagNames += tagNames.substr(end);
+        }
     }
 
     sp<VendorTagDescriptor> vTags =
@@ -80,14 +85,13 @@ void TagMonitor::parseTagsToMonitor(String8 tagNames) {
 
     bool gotTag = false;
 
-    char *tokenized = tagNames.lockBuffer(tagNames.size());
-    char *savePtr;
-    char *nextTagName = strtok_r(tokenized, ", ", &savePtr);
-    while (nextTagName != nullptr) {
+    std::istringstream iss(tagNames);
+    std::string nextTagName;
+    while (std::getline(iss, nextTagName, ',')) {
         uint32_t tag;
-        status_t res = CameraMetadata::getTagFromName(nextTagName, vTags.get(), &tag);
+        status_t res = CameraMetadata::getTagFromName(nextTagName.c_str(), vTags.get(), &tag);
         if (res != OK) {
-            ALOGW("%s: Unknown tag %s, ignoring", __FUNCTION__, nextTagName);
+            ALOGW("%s: Unknown tag %s, ignoring", __FUNCTION__, nextTagName.c_str());
         } else {
             if (!gotTag) {
                 mMonitoredTagList.clear();
@@ -95,10 +99,8 @@ void TagMonitor::parseTagsToMonitor(String8 tagNames) {
             }
             mMonitoredTagList.push_back(tag);
         }
-        nextTagName = strtok_r(nullptr, ", ", &savePtr);
+        iss >> std::ws;
     }
-
-    tagNames.unlockBuffer();
 
     if (gotTag) {
         // Got at least one new tag
@@ -112,11 +114,15 @@ void TagMonitor::disableMonitoring() {
     mLastMonitoredResultValues.clear();
     mLastMonitoredPhysicalRequestKeys.clear();
     mLastMonitoredPhysicalResultKeys.clear();
+    mLastStreamIds.clear();
+    mLastInputStreamId = -1;
 }
 
 void TagMonitor::monitorMetadata(eventSource source, int64_t frameNumber, nsecs_t timestamp,
         const CameraMetadata& metadata,
-        const std::unordered_map<std::string, CameraMetadata>& physicalMetadata) {
+        const std::unordered_map<std::string, CameraMetadata>& physicalMetadata,
+        const camera3::camera_stream_buffer_t *outputBuffers, uint32_t numOutputBuffers,
+        int32_t inputStreamId) {
     if (!mMonitoringEnabled) return;
 
     std::lock_guard<std::mutex> lock(mMonitorMutex);
@@ -124,19 +130,27 @@ void TagMonitor::monitorMetadata(eventSource source, int64_t frameNumber, nsecs_
     if (timestamp == 0) {
         timestamp = systemTime(SYSTEM_TIME_BOOTTIME);
     }
-
+    std::unordered_set<int32_t> outputStreamIds;
+    for (size_t i = 0; i < numOutputBuffers; i++) {
+        const camera3::camera_stream_buffer_t *src = outputBuffers + i;
+        int32_t streamId = camera3::Camera3Stream::cast(src->stream)->getId();
+        outputStreamIds.emplace(streamId);
+    }
     std::string emptyId;
     for (auto tag : mMonitoredTagList) {
-        monitorSingleMetadata(source, frameNumber, timestamp, emptyId, tag, metadata);
+        monitorSingleMetadata(source, frameNumber, timestamp, emptyId, tag, metadata,
+                outputStreamIds, inputStreamId);
 
         for (auto& m : physicalMetadata) {
-            monitorSingleMetadata(source, frameNumber, timestamp, m.first, tag, m.second);
+            monitorSingleMetadata(source, frameNumber, timestamp, m.first, tag, m.second,
+                    outputStreamIds, inputStreamId);
         }
     }
 }
 
 void TagMonitor::monitorSingleMetadata(eventSource source, int64_t frameNumber, nsecs_t timestamp,
-        const std::string& cameraId, uint32_t tag, const CameraMetadata& metadata) {
+        const std::string& cameraId, uint32_t tag, const CameraMetadata& metadata,
+        const std::unordered_set<int32_t> &outputStreamIds, int32_t inputStreamId) {
 
     CameraMetadata &lastValues = (source == REQUEST) ?
             (cameraId.empty() ? mLastMonitoredRequestValues :
@@ -156,6 +170,22 @@ void TagMonitor::monitorSingleMetadata(eventSource source, int64_t frameNumber, 
 
     camera_metadata_entry lastEntry = lastValues.find(tag);
 
+    // Monitor when the stream ids change, this helps visually see what
+    // monitored metadata values are for capture requests with different
+    // stream ids.
+    if (source == REQUEST) {
+        if (inputStreamId != mLastInputStreamId) {
+            mMonitoringEvents.emplace(source, frameNumber, timestamp, camera_metadata_ro_entry_t{},
+                                      cameraId, std::unordered_set<int>(), inputStreamId);
+            mLastInputStreamId = inputStreamId;
+        }
+
+        if (outputStreamIds != mLastStreamIds) {
+            mMonitoringEvents.emplace(source, frameNumber, timestamp, camera_metadata_ro_entry_t{},
+                                      cameraId, outputStreamIds, -1);
+            mLastStreamIds = outputStreamIds;
+        }
+    }
     if (entry.count > 0) {
         bool isDifferent = false;
         if (lastEntry.count > 0) {
@@ -183,7 +213,8 @@ void TagMonitor::monitorSingleMetadata(eventSource source, int64_t frameNumber, 
                   get_local_camera_metadata_tag_name_vendor_id(
                           tag, mVendorTagId));
             lastValues.update(entry);
-            mMonitoringEvents.emplace(source, frameNumber, timestamp, entry, cameraId);
+            mMonitoringEvents.emplace(source, frameNumber, timestamp, entry, cameraId,
+                                      std::unordered_set<int>(), -1);
         }
     } else if (lastEntry.count > 0) {
         // Value has been removed
@@ -195,7 +226,10 @@ void TagMonitor::monitorSingleMetadata(eventSource source, int64_t frameNumber, 
         entry.type = get_local_camera_metadata_tag_type_vendor_id(tag,
                 mVendorTagId);
         entry.count = 0;
-        mMonitoringEvents.emplace(source, frameNumber, timestamp, entry, cameraId);
+        mLastInputStreamId = inputStreamId;
+        mLastStreamIds = outputStreamIds;
+        mMonitoringEvents.emplace(source, frameNumber, timestamp, entry, cameraId,
+                                  std::unordered_set<int>(), -1);
     }
 }
 
@@ -214,37 +248,70 @@ void TagMonitor::dumpMonitoredMetadata(int fd) {
     } else {
         dprintf(fd, "     Tag monitoring disabled (enable with -m <name1,..,nameN>)\n");
     }
-    if (mMonitoringEvents.size() > 0) {
-        dprintf(fd, "     Monitored tag event log:\n");
-        for (const auto& event : mMonitoringEvents) {
-            int indentation = (event.source == REQUEST) ? 15 : 30;
-            dprintf(fd, "        f%d:%" PRId64 "ns:%*s%*s%s.%s: ",
-                    event.frameNumber, event.timestamp,
-                    2, event.cameraId.c_str(),
-                    indentation,
-                    event.source == REQUEST ? "REQ:" : "RES:",
-                    get_local_camera_metadata_section_name_vendor_id(event.tag,
-                            mVendorTagId),
-                    get_local_camera_metadata_tag_name_vendor_id(event.tag,
-                            mVendorTagId));
-            if (event.newData.size() == 0) {
-                dprintf(fd, " (Removed)\n");
-            } else {
-                printData(fd, event.newData.data(), event.tag,
-                        event.type, event.newData.size() / camera_metadata_type_size[event.type],
-                        indentation + 18);
-            }
-        }
-    }
 
+    if (mMonitoringEvents.size() == 0) { return; }
+
+    dprintf(fd, "     Monitored tag event log:\n");
+
+    std::vector<std::string> eventStrs;
+    dumpMonitoredTagEventsToVectorLocked(eventStrs);
+    for (const std::string &eventStr : eventStrs) {
+        dprintf(fd, "        %s", eventStr.c_str());
+    }
 }
 
-// TODO: Consolidate with printData from camera_metadata.h
+void TagMonitor::getLatestMonitoredTagEvents(std::vector<std::string> &out) {
+    std::lock_guard<std::mutex> lock(mMonitorMutex);
+    dumpMonitoredTagEventsToVectorLocked(out);
+}
+
+void TagMonitor::dumpMonitoredTagEventsToVectorLocked(std::vector<std::string> &vec) {
+    if (mMonitoringEvents.size() == 0) { return; }
+
+    for (const auto& event : mMonitoringEvents) {
+        int indentation = (event.source == REQUEST) ? 15 : 30;
+        std::string eventString = fmt::sprintf("f%d:%" PRId64 "ns:%*s%*s",
+                event.frameNumber, event.timestamp,
+                2, event.cameraId.c_str(),
+                indentation,
+                event.source == REQUEST ? "REQ:" : "RES:");
+
+        if (!event.outputStreamIds.empty()) {
+            eventString += " output stream ids:";
+            for (const auto& id : event.outputStreamIds) {
+                eventString += fmt::sprintf(" %d", id);
+            }
+            eventString += "\n";
+            vec.emplace_back(eventString);
+            continue;
+        }
+
+        if (event.inputStreamId != -1) {
+            eventString += fmt::sprintf(" input stream id: %d\n", event.inputStreamId);
+            vec.emplace_back(eventString);
+            continue;
+        }
+
+        eventString += fmt::sprintf(
+                "%s.%s: ",
+                get_local_camera_metadata_section_name_vendor_id(event.tag, mVendorTagId),
+                get_local_camera_metadata_tag_name_vendor_id(event.tag, mVendorTagId));
+
+        if (event.newData.empty()) {
+            eventString += " (Removed)\n";
+        } else {
+            eventString += getEventDataString(
+                    event.newData.data(), event.tag, event.type,
+                    event.newData.size() / camera_metadata_type_size[event.type], indentation + 18);
+        }
+        vec.emplace_back(eventString);
+    }
+}
 
 #define CAMERA_METADATA_ENUM_STRING_MAX_SIZE 29
 
-void TagMonitor::printData(int fd, const uint8_t *data_ptr, uint32_t tag,
-        int type, int count, int indentation) {
+std::string TagMonitor::getEventDataString(const uint8_t* data_ptr, uint32_t tag, int type,
+        int count, int indentation) {
     static int values_per_line[NUM_TYPES] = {
         [TYPE_BYTE]     = 16,
         [TYPE_INT32]    = 8,
@@ -253,6 +320,7 @@ void TagMonitor::printData(int fd, const uint8_t *data_ptr, uint32_t tag,
         [TYPE_DOUBLE]   = 4,
         [TYPE_RATIONAL] = 4,
     };
+
     size_t type_size = camera_metadata_type_size[type];
     char value_string_tmp[CAMERA_METADATA_ENUM_STRING_MAX_SIZE];
     uint32_t value;
@@ -260,10 +328,11 @@ void TagMonitor::printData(int fd, const uint8_t *data_ptr, uint32_t tag,
     int lines = count / values_per_line[type];
     if (count % values_per_line[type] != 0) lines++;
 
+    std::ostringstream returnStr;
     int index = 0;
     int j, k;
     for (j = 0; j < lines; j++) {
-        dprintf(fd, "%*s[", (j != 0) ? indentation + 4 : 0, "");
+        returnStr << fmt::sprintf("%*s[", (j != 0) ? indentation + 4 : 0, "");
         for (k = 0;
              k < values_per_line[type] && count > 0;
              k++, count--, index += type_size) {
@@ -276,10 +345,9 @@ void TagMonitor::printData(int fd, const uint8_t *data_ptr, uint32_t tag,
                                                      value_string_tmp,
                                                      sizeof(value_string_tmp))
                         == OK) {
-                        dprintf(fd, "%s ", value_string_tmp);
+                        returnStr << value_string_tmp;
                     } else {
-                        dprintf(fd, "%hhu ",
-                                *(data_ptr + index));
+                        returnStr << fmt::sprintf("%hhu ", *(data_ptr + index));
                     }
                     break;
                 case TYPE_INT32:
@@ -290,50 +358,49 @@ void TagMonitor::printData(int fd, const uint8_t *data_ptr, uint32_t tag,
                                                      value_string_tmp,
                                                      sizeof(value_string_tmp))
                         == OK) {
-                        dprintf(fd, "%s ", value_string_tmp);
+                        returnStr << value_string_tmp;
                     } else {
-                        dprintf(fd, "%" PRId32 " ",
-                                *(int32_t*)(data_ptr + index));
+                        returnStr << fmt::sprintf("%" PRId32 " ", *(int32_t*)(data_ptr + index));
                     }
                     break;
                 case TYPE_FLOAT:
-                    dprintf(fd, "%0.8f ",
-                            *(float*)(data_ptr + index));
+                    returnStr << fmt::sprintf("%0.8f ", *(float*)(data_ptr + index));
                     break;
                 case TYPE_INT64:
-                    dprintf(fd, "%" PRId64 " ",
-                            *(int64_t*)(data_ptr + index));
+                    returnStr << fmt::sprintf("%" PRId64 " ", *(int64_t*)(data_ptr + index));
                     break;
                 case TYPE_DOUBLE:
-                    dprintf(fd, "%0.8f ",
-                            *(double*)(data_ptr + index));
+                    returnStr << fmt::sprintf("%0.8f ", *(double*)(data_ptr + index));
                     break;
                 case TYPE_RATIONAL: {
                     int32_t numerator = *(int32_t*)(data_ptr + index);
                     int32_t denominator = *(int32_t*)(data_ptr + index + 4);
-                    dprintf(fd, "(%d / %d) ",
-                            numerator, denominator);
+                    returnStr << fmt::sprintf("(%d / %d) ", numerator, denominator);
                     break;
                 }
                 default:
-                    dprintf(fd, "??? ");
+                    returnStr << "??? ";
             }
         }
-        dprintf(fd, "]\n");
+        returnStr << "]\n";
     }
+    return returnStr.str();
 }
 
 template<typename T>
 TagMonitor::MonitorEvent::MonitorEvent(eventSource src, uint32_t frameNumber, nsecs_t timestamp,
-        const T &value, const std::string& cameraId) :
+        const T &value, const std::string& cameraId,
+        const std::unordered_set<int32_t> &outputStreamIds,
+        int32_t inputStreamId) :
         source(src),
         frameNumber(frameNumber),
         timestamp(timestamp),
+        cameraId(cameraId),
         tag(value.tag),
         type(value.type),
         newData(value.data.u8, value.data.u8 + camera_metadata_type_size[value.type] * value.count),
-        cameraId(cameraId) {
-}
+        outputStreamIds(outputStreamIds),
+        inputStreamId(inputStreamId) {}
 
 TagMonitor::MonitorEvent::~MonitorEvent() {
 }

@@ -19,6 +19,7 @@ cc_binary {
     name: "mediaswcodec",
     vendor_available: true,
     min_sdk_version: "29",
+    apex_available: ["com.android.media.swcodec"],
 
     srcs: [
         "main_swcodecservice.cpp",
@@ -36,8 +37,6 @@ cc_binary {
         "libmedia_headers",
     ],
 
-    init_rc: ["mediaswcodec.rc"],
-
     cflags: [
         "-Werror",
         "-Wall",
@@ -54,6 +53,9 @@ prebuilt_etc {
         },
         arm64: {
             src: "seccomp_policy/mediaswcodec-arm64.policy",
+        },
+        riscv64: {
+            src: "seccomp_policy/mediaswcodec-riscv64.policy",
         },
         x86: {
             src: "seccomp_policy/mediaswcodec-x86.policy",
@@ -93,31 +95,6 @@ cc_binary {
         "android.hidl.memory@1.0",
     ],
 
-    runtime_libs: [
-        "libstagefright_soft_aacdec",
-        "libstagefright_soft_aacenc",
-        "libstagefright_soft_amrdec",
-        "libstagefright_soft_amrnbenc",
-        "libstagefright_soft_amrwbenc",
-        "libstagefright_soft_avcdec",
-        "libstagefright_soft_avcenc",
-        "libstagefright_soft_flacdec",
-        "libstagefright_soft_flacenc",
-        "libstagefright_soft_g711dec",
-        "libstagefright_soft_gsmdec",
-        "libstagefright_soft_hevcdec",
-        "libstagefright_soft_mp3dec",
-        "libstagefright_soft_mpeg2dec",
-        "libstagefright_soft_mpeg4dec",
-        "libstagefright_soft_mpeg4enc",
-        "libstagefright_soft_opusdec",
-        "libstagefright_soft_rawdec",
-        "libstagefright_soft_vorbisdec",
-        "libstagefright_soft_vpxdec",
-        "libstagefright_soft_vpxenc",
-        "libstagefright_softomx_plugin",
-    ],
-
     // OMX interfaces force this to stay in 32-bit mode;
     compile_multilib: "32",
 
@@ -144,6 +121,9 @@ prebuilt_etc {
         },
         arm64: {
             src: "seccomp_policy/mediacodec-arm64.policy",
+        },
+        riscv64: {
+            enabled: false,
         },
         x86: {
             src: "seccomp_policy/mediacodec-x86.policy",

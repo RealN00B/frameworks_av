@@ -33,6 +33,8 @@
 
 namespace android {
 
+using content::AttributionSourceState;
+
 status_t MediaRecorder::setCamera(const sp<hardware::ICamera>& camera,
         const sp<ICameraRecordingProxy>& proxy)
 {
@@ -470,7 +472,7 @@ status_t MediaRecorder::setVideoFrameRate(int frames_per_second)
 }
 
 status_t MediaRecorder::setParameters(const String8& params) {
-    ALOGV("setParameters(%s)", params.string());
+    ALOGV("setParameters(%s)", params.c_str());
     if (mMediaRecorder == NULL) {
         ALOGE("media recorder is not initialized yet");
         return INVALID_OPERATION;
@@ -494,7 +496,7 @@ status_t MediaRecorder::setParameters(const String8& params) {
 
     status_t ret = mMediaRecorder->setParameters(params);
     if (OK != ret) {
-        ALOGE("setParameters(%s) failed: %d", params.string(), ret);
+        ALOGE("setParameters(%s) failed: %d", params.c_str(), ret);
         // Do not change our current state to MEDIA_RECORDER_ERROR, failures
         // of the only currently supported parameters, "max-duration" and
         // "max-filesize" are _not_ fatal.
@@ -758,13 +760,14 @@ status_t MediaRecorder::release()
     return INVALID_OPERATION;
 }
 
-MediaRecorder::MediaRecorder(const String16& opPackageName) : mSurfaceMediaSource(NULL)
+MediaRecorder::MediaRecorder(const AttributionSourceState &attributionSource)
+        : mSurfaceMediaSource(NULL)
 {
     ALOGV("constructor");
 
     const sp<IMediaPlayerService> service(getMediaPlayerService());
     if (service != NULL) {
-        mMediaRecorder = service->createMediaRecorder(opPackageName);
+        mMediaRecorder = service->createMediaRecorder(attributionSource);
     }
     if (mMediaRecorder != NULL) {
         mCurrentState = MEDIA_RECORDER_IDLE;
@@ -881,7 +884,8 @@ status_t MediaRecorder::enableAudioDeviceCallback(bool enabled)
     return mMediaRecorder->enableAudioDeviceCallback(enabled);
 }
 
-status_t MediaRecorder::getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones)
+status_t MediaRecorder::getActiveMicrophones(
+        std::vector<media::MicrophoneInfoFw>* activeMicrophones)
 {
     ALOGV("getActiveMicrophones");
 

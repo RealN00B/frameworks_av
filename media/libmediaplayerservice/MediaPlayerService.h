@@ -27,18 +27,22 @@
 #include <utils/String8.h>
 #include <utils/Vector.h>
 
+#include <media/AidlConversion.h>
 #include <media/AudioResamplerPublic.h>
 #include <media/AudioSystem.h>
+#include <media/AudioTrack.h>
 #include <media/MediaPlayerInterface.h>
 #include <media/Metadata.h>
 #include <media/stagefright/foundation/ABase.h>
-
+#include <mediautils/Synchronization.h>
+#include <android/content/AttributionSourceState.h>
 
 #include <system/audio.h>
 
 namespace android {
 
-class AudioTrack;
+using content::AttributionSourceState;
+
 struct AVSyncSettings;
 class DeathNotifier;
 class IDataSource;
@@ -79,11 +83,9 @@ class MediaPlayerService : public BnMediaPlayerService
      public:
                                 AudioOutput(
                                         audio_session_t sessionId,
-                                        uid_t uid,
-                                        int pid,
+                                        const AttributionSourceState& attributionSource,
                                         const audio_attributes_t * attr,
-                                        const sp<AudioSystem::AudioDeviceCallback>& deviceCallback,
-                                        const std::string& opPackageName);
+                                        const sp<AudioSystem::AudioDeviceCallback>& deviceCallback);
         virtual                 ~AudioOutput();
 
         virtual bool            ready() const { return mTrack != 0; }
@@ -100,6 +102,7 @@ class MediaPlayerService : public BnMediaPlayerService
         virtual audio_session_t getSessionId() const;
         virtual uint32_t        getSampleRate() const;
         virtual int64_t         getBufferDurationInUs() const;
+        virtual audio_output_flags_t getFlags() const { return mFlags; }
 
         virtual status_t        open(
                 uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
@@ -109,6 +112,8 @@ class MediaPlayerService : public BnMediaPlayerService
                 const audio_offload_info_t *offloadInfo = NULL,
                 bool doNotReconnect = false,
                 uint32_t suggestedFrameCount = 0);
+
+        virtual void            setPlayerIId(int32_t playerIId);
 
         virtual status_t        start();
         virtual ssize_t         write(const void* buffer, size_t size, bool blocking = true);
@@ -157,9 +162,10 @@ class MediaPlayerService : public BnMediaPlayerService
         sp<AudioTrack>          mTrack;
         sp<AudioTrack>          mRecycledTrack;
         sp<AudioOutput>         mNextOutput;
+        int                     mCachedPlayerIId;
         AudioCallback           mCallback;
         void *                  mCallbackCookie;
-        CallbackData *          mCallbackData;
+        sp<CallbackData>        mCallbackData;
         audio_stream_type_t     mStreamType;
         audio_attributes_t *    mAttributes;
         float                   mLeftVolume;
@@ -169,8 +175,7 @@ class MediaPlayerService : public BnMediaPlayerService
         float                   mMsecsPerFrame;
         size_t                  mFrameSize;
         audio_session_t         mSessionId;
-        uid_t                   mUid;
-        int                     mPid;
+        AttributionSourceState  mAttributionSource;
         float                   mSendLevel;
         int                     mAuxEffectId;
         audio_output_flags_t    mFlags;
@@ -180,7 +185,6 @@ class MediaPlayerService : public BnMediaPlayerService
         bool                    mDeviceCallbackEnabled;
         wp<AudioSystem::AudioDeviceCallback>        mDeviceCallback;
         mutable Mutex           mLock;
-        const std::string       mOpPackageName;
 
         // static variables below not protected by mutex
         static bool             mIsOnEmulator;
@@ -189,15 +193,15 @@ class MediaPlayerService : public BnMediaPlayerService
         // CallbackData is what is passed to the AudioTrack as the "user" data.
         // We need to be able to target this to a different Output on the fly,
         // so we can't use the Output itself for this.
-        class CallbackData {
+        class CallbackData : public AudioTrack::IAudioTrackCallback {
             friend AudioOutput;
         public:
-            explicit CallbackData(AudioOutput *cookie) {
+            explicit CallbackData(const wp<AudioOutput>& cookie) {
                 mData = cookie;
                 mSwitching = false;
             }
-            AudioOutput *   getOutput() const { return mData; }
-            void            setOutput(AudioOutput* newcookie) { mData = newcookie; }
+            sp<AudioOutput> getOutput() const { return mData.load().promote(); }
+            void            setOutput(const wp<AudioOutput>& newcookie) { mData.store(newcookie); }
             // lock/unlock are used by the callback before accessing the payload of this object
             void            lock() const { mLock.lock(); }
             void            unlock() const { mLock.unlock(); }
@@ -220,8 +224,13 @@ class MediaPlayerService : public BnMediaPlayerService
                 }
                 mSwitching = false;
             }
+        protected:
+            size_t onMoreData(const AudioTrack::Buffer& buffer) override;
+            void onUnderrun() override;
+            void onStreamEnd() override;
+            void onNewIAudioTrack() override;
         private:
-            AudioOutput *   mData;
+            mediautils::atomic_wp<AudioOutput> mData;
             mutable Mutex   mLock; // a recursive mutex might make this unnecessary.
             bool            mSwitching;
             DISALLOW_EVIL_CONSTRUCTORS(CallbackData);
@@ -233,13 +242,13 @@ public:
     static  void                instantiate();
 
     // IMediaPlayerService interface
-    virtual sp<IMediaRecorder>  createMediaRecorder(const String16 &opPackageName);
+    virtual sp<IMediaRecorder> createMediaRecorder(const AttributionSourceState &attributionSource);
     void    removeMediaRecorderClient(const wp<MediaRecorderClient>& client);
     virtual sp<IMediaMetadataRetriever> createMetadataRetriever();
 
     virtual sp<IMediaPlayer>    create(const sp<IMediaPlayerClient>& client,
                                        audio_session_t audioSessionId,
-                                       const std::string opPackageName);
+                                       const AttributionSourceState& attributionSource);
 
     virtual sp<IMediaCodecList> getCodecList() const;
 
@@ -381,7 +390,9 @@ private:
 
                 void            notify(int msg, int ext1, int ext2, const Parcel *obj);
 
-                pid_t           pid() const { return mPid; }
+                pid_t           pid() const {
+                    return VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mAttributionSource.pid));
+                }
         virtual status_t        dump(int fd, const Vector<String16>& args);
 
                 audio_session_t getAudioSessionId() { return mAudioSessionId; }
@@ -411,12 +422,10 @@ private:
 
         friend class MediaPlayerService;
                                 Client( const sp<MediaPlayerService>& service,
-                                        pid_t pid,
+                                        const AttributionSourceState& attributionSource,
                                         int32_t connId,
                                         const sp<IMediaPlayerClient>& client,
-                                        audio_session_t audioSessionId,
-                                        uid_t uid,
-                                        const std::string& opPackageName);
+                                        audio_session_t audioSessionId);
                                 Client();
         virtual                 ~Client();
 
@@ -460,20 +469,18 @@ private:
                     sp<MediaPlayerService>        mService;
                     sp<IMediaPlayerClient>        mClient;
                     sp<AudioOutput>               mAudioOutput;
-                    pid_t                         mPid;
+                    const AttributionSourceState  mAttributionSource;
                     status_t                      mStatus;
                     bool                          mLoop;
                     int32_t                       mConnId;
                     audio_session_t               mAudioSessionId;
                     audio_attributes_t *          mAudioAttributes;
-                    uid_t                         mUid;
                     sp<ANativeWindow>             mConnectedWindow;
                     sp<IBinder>                   mConnectedWindowBinder;
                     struct sockaddr_in            mRetransmitEndpoint;
                     bool                          mRetransmitEndpointValid;
                     sp<Client>                    mNextClient;
                     sp<MediaPlayerBase::Listener> mListener;
-                    const std::string             mOpPackageName;
 
         // Metadata filters.
         media::Metadata::Filter mMetadataAllow;  // protected by mLock
@@ -501,6 +508,12 @@ private:
                 SortedVector< wp<Client> >  mClients;
                 SortedVector< wp<MediaRecorderClient> > mMediaRecorderClients;
                 int32_t                     mNextConnId;
+
+#ifdef FUZZ_MODE_MEDIA_PLAYER_SERVICE
+public:
+    friend class sp<MediaPlayerService>;
+    static sp<MediaPlayerService> createForFuzzTesting();
+#endif // FUZZ_MODE_MEDIA_PLAYER_SERVICE
 };
 
 // ----------------------------------------------------------------------------

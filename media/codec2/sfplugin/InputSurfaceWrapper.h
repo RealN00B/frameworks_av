@@ -28,7 +28,8 @@ namespace android {
 class InputSurfaceWrapper {
 public:
     InputSurfaceWrapper()
-        : mDataSpace(HAL_DATASPACE_UNKNOWN) {
+        : mDataSpace(HAL_DATASPACE_UNKNOWN),
+          mPixelFormat(PIXEL_FORMAT_UNKNOWN) {
     }
 
     virtual ~InputSurfaceWrapper() = default;
@@ -79,6 +80,7 @@ public:
         float mFixedAdjustedFps = 0.0; // fixed fps via PTS manipulation
         float mMinAdjustedFps = 0.0; // minimum fps via PTS manipulation
         uint64_t mUsage = 0; // consumer usage
+        int mPriority = INT_MAX; // priority of queue thread (if any); INT_MAX for no-op
     };
 
     /**
@@ -100,6 +102,7 @@ public:
     }
 
     /**
+     * Notify that the input buffer reference is no longer needed.
      * Clean up C2Work related references if necessary. No-op by default.
      *
      * \param index index of input work.
@@ -107,12 +110,24 @@ public:
     virtual void onInputBufferDone(c2_cntr64_t /* index */) {}
 
     /**
+     * Signal one input buffer as emptied.
+     * No-op by default.
+     */
+    virtual void onInputBufferEmptied() {}
+
+    /**
      * Returns dataspace information from GraphicBufferSource.
      */
     virtual android_dataspace getDataspace() { return mDataSpace; }
 
+    /**
+     * Returns pixel format information from GraphicBufferSource.
+     */
+    virtual uint32_t getPixelFormat() { return mPixelFormat; }
+
 protected:
     android_dataspace mDataSpace;
+    uint32_t mPixelFormat;
 };
 
 }  // namespace android

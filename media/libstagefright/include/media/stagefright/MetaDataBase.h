@@ -60,8 +60,11 @@ enum {
     kKeyAVCC              = 'avcc',  // raw data
     kKeyHVCC              = 'hvcc',  // raw data
     kKeyDVCC              = 'dvcc',  // raw data
+    kKeyDVVC              = 'dvvc',  // raw data
+    kKeyDVWC              = 'dvwc',  // raw data
     kKeyAV1C              = 'av1c',  // raw data
     kKeyThumbnailHVCC     = 'thvc',  // raw data
+    kKeyThumbnailAV1C     = 'tav1',  // raw data
     kKeyD263              = 'd263',  // raw data
     kKeyOpusHeader        = 'ohdr',  // raw data
     kKeyOpusCodecDelay    = 'ocod',  // uint64_t (codec delay in ns)
@@ -114,6 +117,12 @@ enum {
     kKeyVideoProfile      = 'vprf',  // int32_t
     kKeyVideoLevel        = 'vlev',  // int32_t
 
+    // audio profile and level
+    // The codec framework doesn't distinguish between video and audio profiles,
+    // so there is no need to define a separate key
+    kKeyAudioProfile      = 'vprf',  // int32_t
+    kKeyAudioLevel        = 'vlev',  // int32_t
+
     kKey2ByteNalLength    = '2NAL',  // int32_t (bool)
 
     // Identify the file output format for authoring
@@ -126,6 +135,8 @@ enum {
     kKeyTrackTimeStatus   = 'tktm',  // int64_t
 
     kKeyRealTimeRecording = 'rtrc',  // bool (int32_t)
+    kKeyBackgroundMode = 'bkmd',  // bool (int32_t)
+
     kKeyNumBuffers        = 'nbbf',  // int32_t
 
     // Ogg files can be tagged to be automatically looping...
@@ -228,6 +239,8 @@ enum {
     kKeyExifSize         = 'exsz', // int64_t, Exif data size
     kKeyExifTiffOffset   = 'thdr', // int32_t, if > 0, buffer contains exif data block with
                                    // tiff hdr at specified offset
+    kKeyXmpOffset        = 'xmof', // int64_t, XMP data offset
+    kKeyXmpSize          = 'xmsz', // int64_t, XMP data size
     kKeyPcmBigEndian     = 'pcmb', // bool (int32_t)
 
     // Key for ALAC Magic Cookie
@@ -251,6 +264,7 @@ enum {
 
     // Treat empty track as malformed for MediaRecorder.
     kKeyEmptyTrackMalFormed = 'nemt', // bool (int32_t)
+
     kKeyVps              = 'sVps', // int32_t, indicates that a buffer has vps.
     kKeySps              = 'sSps', // int32_t, indicates that a buffer has sps.
     kKeyPps              = 'sPps', // int32_t, indicates that a buffer has pps.
@@ -259,7 +273,29 @@ enum {
     kKeyRtpExtMap        = 'extm', // int32_t, rtp extension ID for cvo on RTP protocol.
     kKeyRtpCvoDegrees    = 'cvod', // int32_t, rtp cvo degrees as per 3GPP 26.114.
     kKeyRtpDscp          = 'dscp', // int32_t, DSCP(Differentiated services codepoint) of RFC 2474.
+    kKeyRtpEcn           = 'sEcn', // int32_t, ECN (Explicit Congestion Notification) of RFC 3168
     kKeySocketNetwork    = 'sNet', // int64_t, socket will be bound to network handle.
+
+    // Slow-motion markers
+    kKeySlowMotionMarkers = 'slmo', // raw data, byte array following spec for
+                                    // MediaFormat#KEY_SLOW_MOTION_MARKERS
+
+    kKeySampleFileOffset = 'sfof', // int64_t, sample's offset in a media file.
+    kKeyLastSampleIndexInChunk = 'lsic',  //int64_t, index of last sample in a chunk.
+    kKeySampleTimeBeforeAppend = 'lsba', // int64_t, timestamp of last sample of a track.
+
+    // DVB component tag
+    kKeyDvbComponentTag = 'copt', // int32_t, component tag for DVB video/audio/subtitle
+
+    // DVB audio description
+    kKeyDvbAudioDescription = 'addt', // bool (int32_t), DVB audio description only defined for
+                                      // audio component
+
+    // DVB teletext magazine number
+    kKeyDvbTeletextMagazineNumber = 'ttxm', // int32_t, DVB teletext magazine number
+
+    // DVB teletext page number
+    kKeyDvbTeletextPageNumber = 'ttxp', // int32_t, DVB teletext page number
 };
 
 enum {
@@ -268,6 +304,8 @@ enum {
     kTypeHVCC        = 'hvcc',
     kTypeAV1C        = 'av1c',
     kTypeDVCC        = 'dvcc',
+    kTypeDVVC        = 'dvvc',
+    kTypeDVWC        = 'dvwc',
     kTypeD263        = 'd263',
     kTypeHCOS        = 'hcos',
 };

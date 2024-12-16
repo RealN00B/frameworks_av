@@ -24,6 +24,7 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_av_media_libstagefright_license"],
+    default_team: "trendy_team_android_media_solutions_editing",
 }
 
 cc_defaults {
@@ -35,14 +36,17 @@ cc_defaults {
         "include",
     ],
     static_libs: [
+        "com.android.media.flags.editing-aconfig-cc",
         "liblog",
-        "libstagefright_foundation",
         "libstagefright",
+        "libstagefright_foundation",
     ],
     shared_libs: [
+        "libaconfig_storage_read_api_cc",
         "libbinder",
         "libcutils",
         "libutils",
+        "server_configurable_flags",
     ],
 }
 
@@ -57,6 +61,14 @@ cc_defaults {
             "android-media-fuzzing-reports@google.com",
         ],
         componentid: 155276,
+        hotlists: [
+            "4593311",
+        ],
+        description: "The fuzzers target the APIs of all the various writers",
+        vector: "local_no_privileges_required",
+        service_privilege: "constrained",
+        users: "multi_user",
+        fuzzed_code_usage: "shipped",
     },
 }
 
@@ -88,9 +100,9 @@ cc_fuzz {
 }
 
 cc_fuzz {
-    name : "mpeg4_writer_fuzzer",
-    defaults : ["writer-fuzzer-defaults"],
-    srcs : [
+    name: "mpeg4_writer_fuzzer",
+    defaults: ["writer-fuzzer-defaults"],
+    srcs: [
         "mpeg4_writer_fuzzer.cpp",
     ],
     static_libs: [
@@ -99,9 +111,9 @@ cc_fuzz {
 }
 
 cc_fuzz {
-    name : "ogg_writer_fuzzer",
-    defaults : ["writer-fuzzer-defaults"],
-    srcs : [
+    name: "ogg_writer_fuzzer",
+    defaults: ["writer-fuzzer-defaults"],
+    srcs: [
         "ogg_writer_fuzzer.cpp",
     ],
     static_libs: [
@@ -110,16 +122,16 @@ cc_fuzz {
 }
 
 cc_fuzz {
-    name : "webm_writer_fuzzer",
-    defaults : ["writer-fuzzer-defaults"],
-    srcs : [
+    name: "webm_writer_fuzzer",
+    defaults: ["writer-fuzzer-defaults"],
+    srcs: [
         "webm_writer_fuzzer.cpp",
     ],
     static_libs: [
         "libstagefright_webm",
         "libdatasource",
     ],
-    include_dirs: [
-        "frameworks/av/media/libstagefright",
+    header_libs: [
+        "libstagefright_headers",
     ],
 }

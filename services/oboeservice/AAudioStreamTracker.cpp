@@ -78,7 +78,8 @@ aaudio_handle_t AAudioStreamTracker::bumpHandle(aaudio_handle_t handle) {
     return handle;
 }
 
-aaudio_handle_t AAudioStreamTracker::addStreamForHandle(sp<AAudioServiceStreamBase> serviceStream) {
+aaudio_handle_t AAudioStreamTracker::addStreamForHandle(
+        const sp<AAudioServiceStreamBase>& serviceStream) {
     std::lock_guard<std::mutex> lock(mHandleLock);
     aaudio_handle_t handle = mPreviousHandle;
     // Assign a unique handle.
@@ -96,7 +97,7 @@ aaudio_handle_t AAudioStreamTracker::addStreamForHandle(sp<AAudioServiceStreamBa
     return handle;
 }
 
-std::string AAudioStreamTracker::dump() const {
+std::string AAudioStreamTracker::dump() const NO_THREAD_SAFETY_ANALYSIS {
     std::stringstream result;
     const bool isLocked = AAudio_tryUntilTrue(
             [this]()->bool { return mHandleLock.try_lock(); } /* f */,

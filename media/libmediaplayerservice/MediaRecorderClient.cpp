@@ -22,6 +22,7 @@
 #include "MediaPlayerService.h"
 #include "StagefrightRecorder.h"
 
+#include <android/binder_auto_utils.h>
 #include <android/hardware/media/omx/1.0/IOmx.h>
 #include <android/hardware/media/c2/1.0/IComponentStore.h>
 #include <binder/IPCThreadState.h>
@@ -124,11 +125,16 @@ status_t MediaRecorderClient::setAudioSource(int as)
         ALOGE("Invalid audio source: %d", as);
         return BAD_VALUE;
     }
-    pid_t pid = IPCThreadState::self()->getCallingPid();
-    uid_t uid = IPCThreadState::self()->getCallingUid();
 
-    if ((as == AUDIO_SOURCE_FM_TUNER && !captureAudioOutputAllowed(pid, uid))
-            || !recordingAllowed(String16(""), pid, uid)) {
+    if ((as == AUDIO_SOURCE_FM_TUNER
+                && !(captureAudioOutputAllowed(mAttributionSource)
+                    || captureTunerAudioInputAllowed(mAttributionSource)))
+            || (as == AUDIO_SOURCE_REMOTE_SUBMIX
+                && !(captureAudioOutputAllowed(mAttributionSource)
+                    || modifyAudioRoutingAllowed(mAttributionSource)))
+            || (as == AUDIO_SOURCE_ECHO_REFERENCE
+                && !captureAudioOutputAllowed(mAttributionSource))
+            || !recordingAllowed(mAttributionSource, (audio_source_t)as)) {
         return PERMISSION_DENIED;
     }
     Mutex::Autolock lock(mLock);
@@ -240,7 +246,7 @@ status_t MediaRecorderClient::setVideoFrameRate(int frames_per_second)
 }
 
 status_t MediaRecorderClient::setParameters(const String8& params) {
-    ALOGV("setParameters(%s)", params.string());
+    ALOGV("setParameters(%s)", params.c_str());
     Mutex::Autolock lock(mLock);
     if (mRecorder == NULL) {
         ALOGE("recorder is not initialized");
@@ -377,12 +383,13 @@ status_t MediaRecorderClient::release()
     return NO_ERROR;
 }
 
-MediaRecorderClient::MediaRecorderClient(const sp<MediaPlayerService>& service, pid_t pid,
-        const String16& opPackageName)
+MediaRecorderClient::MediaRecorderClient(const sp<MediaPlayerService>& service,
+        const AttributionSourceState& attributionSource)
 {
     ALOGV("Client constructor");
-    mPid = pid;
-    mRecorder = new StagefrightRecorder(opPackageName);
+    // attribution source already validated in createMediaRecorder
+    mAttributionSource = attributionSource;
+    mRecorder = new StagefrightRecorder(attributionSource);
     mMediaPlayerService = service;
 }
 
@@ -484,9 +491,9 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
         {
             for (std::shared_ptr<Codec2Client> const& client :
                     Codec2Client::CreateFromAllServices()) {
-                sp<IBase> base = client->getBase();
-                mDeathNotifiers.emplace_back(
-                        base, [l = wp<IMediaRecorderClient>(listener),
+                sp<IBase> hidlBase = client->getHidlBase();
+                ::ndk::SpAIBinder aidlBase = client->getAidlBase();
+                auto onBinderDied = [l = wp<IMediaRecorderClient>(listener),
                                name = std::string(client->getServiceName())]() {
                     sp<IMediaRecorderClient> listener = l.promote();
                     if (listener) {
@@ -501,7 +508,12 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
                               "without a death handler",
                               name.c_str());
                     }
-                });
+                };
+                if (hidlBase) {
+                    mDeathNotifiers.emplace_back(hidlBase, onBinderDied);
+                } else if (aidlBase.get() != nullptr) {
+                    mDeathNotifiers.emplace_back(aidlBase, onBinderDied);
+                }
             }
         }
     }
@@ -513,7 +525,7 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
 }
 
 status_t MediaRecorderClient::setClientName(const String16& clientName) {
-    ALOGV("setClientName(%s)", String8(clientName).string());
+    ALOGV("setClientName(%s)", String8(clientName).c_str());
     Mutex::Autolock lock(mLock);
     if (mRecorder == NULL) {
         ALOGE("recorder is not initialized");
@@ -557,7 +569,7 @@ status_t MediaRecorderClient::enableAudioDeviceCallback(bool enabled) {
 }
 
 status_t MediaRecorderClient::getActiveMicrophones(
-        std::vector<media::MicrophoneInfo>* activeMicrophones) {
+        std::vector<media::MicrophoneInfoFw>* activeMicrophones) {
     ALOGV("getActiveMicrophones");
     Mutex::Autolock lock(mLock);
     if (mRecorder != NULL) {

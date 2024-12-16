@@ -188,11 +188,11 @@ void MediaExtractorFactory::RegisterExtractor(const sp<ExtractorPlugin> &plugin,
     // sanity check check struct version, uuid, name
     if (plugin->def.def_version != EXTRACTORDEF_VERSION_NDK_V1 &&
             plugin->def.def_version != EXTRACTORDEF_VERSION_NDK_V2) {
-        ALOGE("don't understand extractor format %u, ignoring.", plugin->def.def_version);
+        ALOGW("don't understand extractor format %u, ignoring.", plugin->def.def_version);
         return;
     }
     if (memcmp(&plugin->def.extractor_uuid, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0) {
-        ALOGE("invalid UUID, ignoring");
+        ALOGW("invalid UUID, ignoring");
         return;
     }
     if (plugin->def.extractor_name == NULL || strlen(plugin->def.extractor_name) == 0) {
@@ -242,23 +242,28 @@ void MediaExtractorFactory::RegisterExtractors(
                 continue;
             }
             void *libHandle = android_dlopen_ext(
-                    libPath.string(),
+                    libPath.c_str(),
                     RTLD_NOW | RTLD_LOCAL, dlextinfo);
-            CHECK(libHandle != nullptr)
-                    << "couldn't dlopen(" << libPath.string() << ") " << strerror(errno);
+            if (libHandle == nullptr) {
+                ALOGI("dlopen(%s) reported error %s", libPath.c_str(), strerror(errno));
+                continue;
+            }
 
             GetExtractorDef getDef =
                 (GetExtractorDef) dlsym(libHandle, "GETEXTRACTORDEF");
-            CHECK(getDef != nullptr)
-                    << libPath.string() << " does not contain sniffer";
+            if (getDef == nullptr) {
+                ALOGI("no sniffer found in %s", libPath.c_str());
+                dlclose(libHandle);
+                continue;
+            }
 
-            ALOGV("registering sniffer for %s", libPath.string());
+            ALOGV("registering sniffer for %s", libPath.c_str());
             RegisterExtractor(
                     new ExtractorPlugin(getDef(), libHandle, libPath), pluginList);
         }
         closedir(libDir);
     } else {
-        ALOGE("couldn't opendir(%s)", libDirPath);
+        ALOGI("plugin directory not present (%s)", libDirPath);
     }
 }
 
@@ -382,7 +387,7 @@ status_t MediaExtractorFactory::dump(int fd, const Vector<String16>&) {
             out.append("  (no plugins registered)\n");
         }
     }
-    write(fd, out.string(), out.size());
+    write(fd, out.c_str(), out.size());
     return OK;
 }
 

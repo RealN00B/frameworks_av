@@ -17,6 +17,7 @@
 #include <cutils/native_handle.h>
 #include <media/hardware/CryptoAPI.h>
 #include <media/stagefright/foundation/ABase.h>
+#include <mediadrm/DrmStatus.h>
 #include <utils/RefBase.h>
 #include <utils/StrongPointer.h>
 
@@ -32,6 +33,10 @@ namespace V1_0 {
 struct SharedBuffer;
 struct DestinationBuffer;
 }  // namespace V1_0
+
+namespace V1_4 {
+struct LogMessage;
+}  // namespace V1_4
 }  // namespace drm
 }  // namespace hardware
 }  // namespace android
@@ -61,7 +66,7 @@ struct ICrypto : public RefBase {
 
     virtual void notifyResolution(uint32_t width, uint32_t height) = 0;
 
-    virtual status_t setMediaDrmSession(const Vector<uint8_t> &sessionId) = 0;
+    virtual DrmStatus setMediaDrmSession(const Vector<uint8_t> &sessionId) = 0;
 
     enum DestinationType {
         kDestinationTypeSharedMemory, // non-secure
@@ -82,6 +87,8 @@ struct ICrypto : public RefBase {
      */
     virtual int32_t setHeap(const sp<hardware::HidlMemory>& heap) = 0;
     virtual void unsetHeap(int32_t seqNum) = 0;
+
+    virtual status_t getLogMessages(Vector<drm::V1_4::LogMessage> &logs) const = 0;
 
 protected:
     ICrypto() {}

@@ -20,26 +20,42 @@
 
 #include "AAudioFlowGraph.h"
 
-#include <flowgraph/ClipToRange.h>
+#include <flowgraph/Limiter.h>
+#include <flowgraph/ManyToMultiConverter.h>
+#include <flowgraph/MonoBlend.h>
 #include <flowgraph/MonoToMultiConverter.h>
+#include <flowgraph/MultiToManyConverter.h>
 #include <flowgraph/RampLinear.h>
 #include <flowgraph/SinkFloat.h>
 #include <flowgraph/SinkI16.h>
 #include <flowgraph/SinkI24.h>
+#include <flowgraph/SinkI32.h>
+#include <flowgraph/SinkI8_24.h>
 #include <flowgraph/SourceFloat.h>
 #include <flowgraph/SourceI16.h>
 #include <flowgraph/SourceI24.h>
+#include <flowgraph/SourceI32.h>
+#include <flowgraph/SourceI8_24.h>
 
-using namespace flowgraph;
+using namespace FLOWGRAPH_OUTER_NAMESPACE::flowgraph;
 
 aaudio_result_t AAudioFlowGraph::configure(audio_format_t sourceFormat,
                           int32_t sourceChannelCount,
+                          int32_t sourceSampleRate,
                           audio_format_t sinkFormat,
-                          int32_t sinkChannelCount) {
-    AudioFloatOutputPort *lastOutput = nullptr;
+                          int32_t sinkChannelCount,
+                          int32_t sinkSampleRate,
+                          bool useMonoBlend,
+                          bool useVolumeRamps,
+                          float audioBalance,
+                          aaudio::resampler::MultiChannelResampler::Quality resamplerQuality) {
+    FlowGraphPortFloatOutput *lastOutput = nullptr;
 
-    ALOGV("%s() source format = 0x%08x, channels = %d, sink format = 0x%08x, channels = %d",
-          __func__, sourceFormat, sourceChannelCount, sinkFormat, sinkChannelCount);
+    ALOGD("%s() source format = 0x%08x, channels = %d, sample rate = %d, "
+          "sink format = 0x%08x, channels = %d, sample rate = %d, "
+          "useMonoBlend = %d, audioBalance = %f, useVolumeRamps %d",
+          __func__, sourceFormat, sourceChannelCount, sourceSampleRate, sinkFormat,
+          sinkChannelCount, sinkSampleRate, useMonoBlend, audioBalance, useVolumeRamps);
 
     switch (sourceFormat) {
         case AUDIO_FORMAT_PCM_FLOAT:
@@ -51,23 +67,39 @@ aaudio_result_t AAudioFlowGraph::configure(audio_format_t sourceFormat,
         case AUDIO_FORMAT_PCM_24_BIT_PACKED:
             mSource = std::make_unique<SourceI24>(sourceChannelCount);
             break;
-        default: // TODO add I32
+        case AUDIO_FORMAT_PCM_32_BIT:
+            mSource = std::make_unique<SourceI32>(sourceChannelCount);
+            break;
+        case AUDIO_FORMAT_PCM_8_24_BIT:
+            mSource = std::make_unique<SourceI8_24>(sourceChannelCount);
+            break;
+        default:
             ALOGE("%s() Unsupported source format = %d", __func__, sourceFormat);
             return AAUDIO_ERROR_UNIMPLEMENTED;
     }
     lastOutput = &mSource->output;
 
-    // Apply volume as a ramp to avoid pops.
-    mVolumeRamp = std::make_unique<RampLinear>(sourceChannelCount);
-    lastOutput->connect(&mVolumeRamp->input);
-    lastOutput = &mVolumeRamp->output;
+    if (useMonoBlend) {
+        mMonoBlend = std::make_unique<MonoBlend>(sourceChannelCount);
+        lastOutput->connect(&mMonoBlend->input);
+        lastOutput = &mMonoBlend->output;
+    }
 
     // For a pure float graph, there is chance that the data range may be very large.
-    // So we should clip to a reasonable value that allows a little headroom.
+    // So we should limit to a reasonable value that allows a little headroom.
     if (sourceFormat == AUDIO_FORMAT_PCM_FLOAT && sinkFormat == AUDIO_FORMAT_PCM_FLOAT) {
-        mClipper = std::make_unique<ClipToRange>(sourceChannelCount);
-        lastOutput->connect(&mClipper->input);
-        lastOutput = &mClipper->output;
+        mLimiter = std::make_unique<Limiter>(sourceChannelCount);
+        lastOutput->connect(&mLimiter->input);
+        lastOutput = &mLimiter->output;
+    }
+
+    if (sourceSampleRate != sinkSampleRate) {
+        mResampler.reset(aaudio::resampler::MultiChannelResampler::make(sourceChannelCount,
+                sourceSampleRate, sinkSampleRate, resamplerQuality));
+        mRateConverter = std::make_unique<SampleRateConverter>(sourceChannelCount,
+                                                               *mResampler);
+        lastOutput->connect(&mRateConverter->input);
+        lastOutput = &mRateConverter->output;
     }
 
     // Expand the number of channels if required.
@@ -80,6 +112,25 @@ aaudio_result_t AAudioFlowGraph::configure(audio_format_t sourceFormat,
         return AAUDIO_ERROR_UNIMPLEMENTED;
     }
 
+    if (useVolumeRamps) {
+        // Apply volume ramps to set the left/right audio balance and target volumes.
+        // The signals will be decoupled, volume ramps will be applied, before the signals are
+        // combined again.
+        mMultiToManyConverter = std::make_unique<MultiToManyConverter>(sinkChannelCount);
+        mManyToMultiConverter = std::make_unique<ManyToMultiConverter>(sinkChannelCount);
+        lastOutput->connect(&mMultiToManyConverter->input);
+        for (int i = 0; i < sinkChannelCount; i++) {
+            mVolumeRamps.emplace_back(std::make_unique<RampLinear>(1));
+            mPanningVolumes.emplace_back(1.0f);
+            lastOutput = mMultiToManyConverter->outputs[i].get();
+            lastOutput->connect(&(mVolumeRamps[i].get()->input));
+            lastOutput = &(mVolumeRamps[i].get()->output);
+            lastOutput->connect(mManyToMultiConverter->inputs[i].get());
+        }
+        lastOutput = &mManyToMultiConverter->output;
+        setAudioBalance(audioBalance);
+    }
+
     switch (sinkFormat) {
         case AUDIO_FORMAT_PCM_FLOAT:
             mSink = std::make_unique<SinkFloat>(sinkChannelCount);
@@ -90,7 +141,13 @@ aaudio_result_t AAudioFlowGraph::configure(audio_format_t sourceFormat,
         case AUDIO_FORMAT_PCM_24_BIT_PACKED:
             mSink = std::make_unique<SinkI24>(sinkChannelCount);
             break;
-        default: // TODO add I32
+        case AUDIO_FORMAT_PCM_32_BIT:
+            mSink = std::make_unique<SinkI32>(sinkChannelCount);
+            break;
+        case AUDIO_FORMAT_PCM_8_24_BIT:
+            mSink = std::make_unique<SinkI8_24>(sinkChannelCount);
+            break;
+        default:
             ALOGE("%s() Unsupported sink format = %d", __func__, sinkFormat);
             return AAUDIO_ERROR_UNIMPLEMENTED;
     }
@@ -99,18 +156,46 @@ aaudio_result_t AAudioFlowGraph::configure(audio_format_t sourceFormat,
     return AAUDIO_OK;
 }
 
-void AAudioFlowGraph::process(const void *source, void *destination, int32_t numFrames) {
-    mSource->setData(source, numFrames);
-    mSink->read(destination, numFrames);
+int32_t AAudioFlowGraph::pull(void *destination, int32_t targetFramesToRead) {
+    return mSink->read(destination, targetFramesToRead);
+}
+
+int32_t AAudioFlowGraph::process(const void *source, int32_t numFramesToWrite, void *destination,
+                    int32_t targetFramesToRead) {
+    mSource->setData(source, numFramesToWrite);
+    return mSink->read(destination, targetFramesToRead);
 }
 
 /**
  * @param volume between 0.0 and 1.0
  */
 void AAudioFlowGraph::setTargetVolume(float volume) {
-    mVolumeRamp->setTarget(volume);
+    for (int i = 0; i < mVolumeRamps.size(); i++) {
+        mVolumeRamps[i]->setTarget(volume * mPanningVolumes[i]);
+    }
+    mTargetVolume = volume;
 }
 
+/**
+ * @param audioBalance between -1.0 and 1.0
+ */
+void AAudioFlowGraph::setAudioBalance(float audioBalance) {
+    if (mPanningVolumes.size() >= 2) {
+        float leftMultiplier = 0;
+        float rightMultiplier = 0;
+        mBalance.computeStereoBalance(audioBalance, &leftMultiplier, &rightMultiplier);
+        mPanningVolumes[0] = leftMultiplier;
+        mPanningVolumes[1] = rightMultiplier;
+        mVolumeRamps[0]->setTarget(mTargetVolume * leftMultiplier);
+        mVolumeRamps[1]->setTarget(mTargetVolume * rightMultiplier);
+    }
+}
+
+/**
+ * @param numFrames to slowly adjust for volume changes
+ */
 void AAudioFlowGraph::setRampLengthInFrames(int32_t numFrames) {
-    mVolumeRamp->setLengthInFrames(numFrames);
+    for (auto& ramp : mVolumeRamps) {
+        ramp->setLengthInFrames(numFrames);
+    }
 }

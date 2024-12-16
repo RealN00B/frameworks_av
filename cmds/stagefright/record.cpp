@@ -32,7 +32,6 @@
 #include <media/stagefright/SimpleDecodingSource.h>
 #include <media/MediaPlayerInterface.h>
 
-#include "AudioPlayer.h"
 
 using namespace android;
 
@@ -89,6 +88,9 @@ public:
         status_t err = mGroup.acquire_buffer(buffer);
         if (err != OK) {
             return err;
+        }
+        if (buffer == nullptr) {
+            return AMEDIA_ERROR_UNKNOWN;
         }
 
         char x = (char)((double)rand() / RAND_MAX * 255);
@@ -259,31 +261,6 @@ int main(int argc, char **argv) {
     printf("$\n");
 #endif
 
-#if 0
-    CameraSource *source = CameraSource::Create(
-            String16(argv[0], strlen(argv[0])));
-    source->start();
-
-    printf("source = %p\n", source);
-
-    for (int i = 0; i < 100; ++i) {
-        MediaBuffer *buffer;
-        status_t err = source->read(&buffer);
-        CHECK_EQ(err, (status_t)OK);
-
-        printf("got a frame, data=%p, size=%d\n",
-               buffer->data(), buffer->range_length());
-
-        buffer->release();
-        buffer = NULL;
-    }
-
-    err = source->stop();
-
-    delete source;
-    source = NULL;
-#endif
-
     if (err != OK && err != ERROR_END_OF_STREAM) {
         fprintf(stderr, "record failed: %d\n", err);
         return 1;
@@ -298,17 +275,6 @@ int main(int /* argc */, char ** /* argv */) {
     const int32_t kSampleRate = 22050;
     const int32_t kNumChannels = 2;
     sp<MediaSource> audioSource = new SineSource(kSampleRate, kNumChannels);
-
-#if 0
-    sp<MediaPlayerBase::AudioSink> audioSink;
-    AudioPlayer *player = new AudioPlayer(audioSink);
-    player->setSource(audioSource);
-    player->start();
-
-    sleep(10);
-
-    player->stop();
-#endif
 
     sp<AMessage> encMeta = new AMessage;
     encMeta->setString("mime",

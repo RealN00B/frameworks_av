@@ -30,7 +30,6 @@
 using ::android::hardware::audio::CPP_VERSION::IDevicesFactory;
 
 namespace android {
-namespace CPP_VERSION {
 
 class DevicesFactoryHalHidl : public DevicesFactoryHalInterface
 {
@@ -38,13 +37,19 @@ class DevicesFactoryHalHidl : public DevicesFactoryHalInterface
     explicit DevicesFactoryHalHidl(sp<IDevicesFactory> devicesFactory);
     void onFirstRef() override;
 
+    status_t getDeviceNames(std::vector<std::string> *names) override;
+
     // Opens a device with the specified name. To close the device, it is
     // necessary to release references to the returned object.
     status_t openDevice(const char *name, sp<DeviceHalInterface> *device) override;
 
-    status_t getHalPids(std::vector<pid_t> *pids) override;
-
     status_t setCallbackOnce(sp<DevicesFactoryHalCallback> callback) override;
+
+    android::detail::AudioHalVersionInfo getHalVersion() const override;
+
+    status_t getSurroundSoundConfig(media::SurroundSoundConfig *config) override;
+
+    status_t getEngineConfig(media::audio::common::AudioHalEngineConfig *config) override;
 
   private:
     friend class ServiceNotificationListener;
@@ -59,7 +64,6 @@ class DevicesFactoryHalHidl : public DevicesFactoryHalInterface
     virtual ~DevicesFactoryHalHidl() = default;
 };
 
-} // namespace CPP_VERSION
 } // namespace android
 
 #endif // ANDROID_HARDWARE_DEVICES_FACTORY_HAL_HIDL_H

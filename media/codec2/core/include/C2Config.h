@@ -59,6 +59,8 @@ struct C2Config {
     enum drc_compression_mode_t : int32_t;  ///< DRC compression mode
     enum drc_effect_type_t : int32_t;       ///< DRC effect type
     enum drc_album_mode_t : int32_t;        ///< DRC album mode
+    enum hdr_dynamic_metadata_type_t : uint32_t;  ///< HDR dynamic metadata type
+    enum hdr_format_t : uint32_t;           ///< HDR format
     enum intra_refresh_mode_t : uint32_t;   ///< intra refresh modes
     enum level_t : uint32_t;                ///< coding level
     enum ordinal_key_t : uint32_t;          ///< work ordering keys
@@ -77,6 +79,7 @@ struct C2Config {
 
 struct C2PlatformConfig {
     enum encoding_quality_level_t : uint32_t; ///< encoding quality level
+    enum tunnel_peek_mode_t: uint32_t;      ///< tunnel peek mode
 };
 
 namespace {
@@ -157,6 +160,13 @@ enum C2ParamIndexKind : C2Param::type_index_t {
     kParamIndexSecureMode,
     kParamIndexEncryptedBuffer, // info-buffer, used with SM_READ_PROTECTED_WITH_ENCRYPTED
 
+    /* multiple access unit support */
+    kParamIndexLargeFrame,
+    kParamIndexAccessUnitInfos, // struct
+
+    /* Region of Interest Encoding parameters */
+    kParamIndexQpOffsetMapBuffer, // info-buffer, used to signal qp-offset map for a frame
+
     // deprecated
     kParamIndexDelayRequest = kParamIndexDelay | C2Param::CoreIndex::IS_REQUEST_FLAG,
 
@@ -189,9 +199,13 @@ enum C2ParamIndexKind : C2Param::type_index_t {
 
     kParamIndexPictureTypeMask,
     kParamIndexPictureType,
+    // deprecated
     kParamIndexHdr10PlusMetadata,
-
     kParamIndexPictureQuantization,
+    kParamIndexHdrDynamicMetadata,
+    kParamIndexHdrFormat,
+    kParamIndexQpOffsetRect,
+    kParamIndexQpOffsetRects,
 
     /* ------------------------------------ video components ------------------------------------ */
 
@@ -270,6 +284,15 @@ enum C2ParamIndexKind : C2Param::type_index_t {
 
     // encoding quality requirements
     kParamIndexEncodingQualityLevel, // encoders, enum
+
+    // encoding statistics, average block qp of a frame
+    kParamIndexAverageBlockQuantization, // int32
+
+    // channel mask for decoded audio
+    kParamIndexAndroidChannelMask, // uint32
+
+    // allow tunnel peek behavior to be unspecified for app compatibility
+    kParamIndexTunnelPeekMode, // tunnel mode, enum
 };
 
 }
@@ -680,6 +703,9 @@ enum C2Config::level_t : uint32_t {
     LEVEL_DV_MAIN_UHD_30,                       ///< Dolby Vision main tier uhd30
     LEVEL_DV_MAIN_UHD_48,                       ///< Dolby Vision main tier uhd48
     LEVEL_DV_MAIN_UHD_60,                       ///< Dolby Vision main tier uhd60
+    LEVEL_DV_MAIN_UHD_120,                      ///< Dolby Vision main tier uhd120
+    LEVEL_DV_MAIN_8K_30,                        ///< Dolby Vision main tier 8k30
+    LEVEL_DV_MAIN_8K_60,                        ///< Dolby Vision main tier 8k60
 
     LEVEL_DV_HIGH_HD_24 = _C2_PL_DV_BASE + 0x100,  ///< Dolby Vision high tier hd24
     LEVEL_DV_HIGH_HD_30,                        ///< Dolby Vision high tier hd30
@@ -690,6 +716,9 @@ enum C2Config::level_t : uint32_t {
     LEVEL_DV_HIGH_UHD_30,                       ///< Dolby Vision high tier uhd30
     LEVEL_DV_HIGH_UHD_48,                       ///< Dolby Vision high tier uhd48
     LEVEL_DV_HIGH_UHD_60,                       ///< Dolby Vision high tier uhd60
+    LEVEL_DV_HIGH_UHD_120,                      ///< Dolby Vision high tier uhd120
+    LEVEL_DV_HIGH_8K_30,                        ///< Dolby Vision high tier 8k30
+    LEVEL_DV_HIGH_8K_60,                        ///< Dolby Vision high tier 8k60
 
     // AV1 levels
     LEVEL_AV1_2    = _C2_PL_AV1_BASE ,          ///< AV1 Level 2
@@ -1094,6 +1123,36 @@ typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexMaxBufferSize> C2StreamM
 constexpr char C2_PARAMKEY_INPUT_MAX_BUFFER_SIZE[] = "input.buffers.max-size";
 constexpr char C2_PARAMKEY_OUTPUT_MAX_BUFFER_SIZE[] = "output.buffers.max-size";
 
+/**
+ * Large frame struct
+ *
+ * This structure describes the size limits for large frames (frames with multiple
+ * access units.)
+ */
+struct C2LargeFrameStruct {
+    uint32_t maxSize;         ///< maximum size of the buffer in bytes
+    uint32_t thresholdSize;   ///< size threshold for the buffer in bytes. The buffer is considered
+                              ///< full as soon as its size reaches or surpasses this limit.
+    C2LargeFrameStruct()
+        : maxSize(0),
+          thresholdSize(0) {}
+
+    C2LargeFrameStruct(uint32_t maxSize_, uint32_t thresholdSize_)
+        : maxSize(maxSize_), thresholdSize(thresholdSize_) {}
+
+    DEFINE_AND_DESCRIBE_C2STRUCT(LargeFrame)
+    C2FIELD(maxSize, "max-size")
+    C2FIELD(thresholdSize, "threshold-size")
+};
+
+/**
+ * This tuning controls the size limits for large output frames for the component.
+ * The default value for this tuning is platform specific.
+ */
+typedef C2StreamParam<C2Tuning, C2LargeFrameStruct, kParamIndexLargeFrame>
+        C2LargeFrame;
+constexpr char C2_PARAMKEY_OUTPUT_LARGE_FRAME[] = "output.large-frame";
+
 /* ---------------------------------------- misc. state ---------------------------------------- */
 
 /**
@@ -1338,6 +1397,47 @@ struct C2RotationStruct {
 typedef C2StreamParam<C2Info, C2RotationStruct, kParamIndexRotation> C2StreamRotationInfo;
 constexpr char C2_PARAMKEY_ROTATION[] = "raw.rotation";
 constexpr char C2_PARAMKEY_VUI_ROTATION[] = "coded.vui.rotation";
+
+/**
+ * Region of Interest of an image/video frame communicated as an array of C2QpOffsetRectStruct
+ *
+ * Fields width, height, left and top of C2QpOffsetRectStruct form a bounding box contouring RoI.
+ * Field qpOffset of C2QpOffsetRectStruct indicates the qp bias to be used for quantizing the
+ * coding units of the bounding box.
+ *
+ * If Roi rect is not valid that is bounding box width is < 0 or bounding box height is < 0,
+ * components may ignore the configuration silently. If Roi rect extends outside frame
+ * boundaries, then rect shall be clamped to the frame boundaries.
+ *
+ * The scope of this key is throughout the encoding session until it is reconfigured with a
+ * different value.
+ *
+ * The number of elements in C2StreamQpOffset array is not limited by C2 specification.
+ * However components may mandate a limit. Implementations may drop the rectangles that are beyond
+ * the supported limits. Hence it is preferable to place the rects in descending order of
+ * importance. Transitively, if the bounding boxes overlap, then the most preferred
+ * rectangle's qp offset (earlier rectangle qp offset) will be used to quantize the block.
+ */
+struct C2QpOffsetRectStruct : C2Rect {
+    C2QpOffsetRectStruct() = default;
+    C2QpOffsetRectStruct(const C2Rect &rect, int32_t offset) : C2Rect(rect), qpOffset(offset) {}
+
+    bool operator==(const C2QpOffsetRectStruct &) = delete;
+    bool operator!=(const C2QpOffsetRectStruct &) = delete;
+
+    int32_t qpOffset;
+
+    DEFINE_AND_DESCRIBE_C2STRUCT(QpOffsetRect)
+    C2FIELD(width, "width")
+    C2FIELD(height, "height")
+    C2FIELD(left, "left")
+    C2FIELD(top, "top")
+    C2FIELD(qpOffset, "qp-offset")
+};
+
+typedef C2StreamParam<C2Info, C2SimpleArrayStruct<C2QpOffsetRectStruct>, kParamIndexQpOffsetRects>
+        C2StreamQpOffsetRects;
+constexpr char C2_PARAMKEY_QP_OFFSET_RECTS[] = "coding.qp-offset-rects";
 
 /**
  * Pixel (sample) aspect ratio.
@@ -1602,16 +1702,82 @@ struct C2HdrStaticMetadataStruct {
     C2FIELD(maxFall, "max-fall")
 };
 typedef C2StreamParam<C2Info, C2HdrStaticMetadataStruct, kParamIndexHdrStaticMetadata>
-        C2StreamHdrStaticInfo;
+        C2StreamHdrStaticMetadataInfo;
+typedef C2StreamParam<C2Info, C2HdrStaticMetadataStruct, kParamIndexHdrStaticMetadata>
+        C2StreamHdrStaticInfo;  // deprecated
 constexpr char C2_PARAMKEY_HDR_STATIC_INFO[] = "raw.hdr-static-info";
 
 /**
  * HDR10+ Metadata Info.
+ *
+ * Deprecated. Use C2StreamHdrDynamicMetadataInfo with
+ * HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40
  */
 typedef C2StreamParam<C2Info, C2BlobValue, kParamIndexHdr10PlusMetadata>
-        C2StreamHdr10PlusInfo;
-constexpr char C2_PARAMKEY_INPUT_HDR10_PLUS_INFO[] = "input.hdr10-plus-info";
-constexpr char C2_PARAMKEY_OUTPUT_HDR10_PLUS_INFO[] = "output.hdr10-plus-info";
+        C2StreamHdr10PlusInfo;  // deprecated
+constexpr char C2_PARAMKEY_INPUT_HDR10_PLUS_INFO[] = "input.hdr10-plus-info";  // deprecated
+constexpr char C2_PARAMKEY_OUTPUT_HDR10_PLUS_INFO[] = "output.hdr10-plus-info";  // deprecated
+
+/**
+ * HDR dynamic metadata types
+ */
+C2ENUM(C2Config::hdr_dynamic_metadata_type_t, uint32_t,
+    HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_10,  ///< SMPTE ST 2094-10
+    HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40,  ///< SMPTE ST 2094-40
+)
+
+struct C2HdrDynamicMetadataStruct {
+    inline C2HdrDynamicMetadataStruct() { memset(this, 0, sizeof(*this)); }
+
+    inline C2HdrDynamicMetadataStruct(
+            size_t flexCount, C2Config::hdr_dynamic_metadata_type_t type)
+        : type_(type) {
+        memset(data, 0, flexCount);
+    }
+
+    C2Config::hdr_dynamic_metadata_type_t type_;
+    uint8_t data[];
+
+    DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(HdrDynamicMetadata, data)
+    C2FIELD(type_, "type")
+    C2FIELD(data, "data")
+};
+
+/**
+ * Dynamic HDR Metadata Info.
+ */
+typedef C2StreamParam<C2Info, C2HdrDynamicMetadataStruct, kParamIndexHdrDynamicMetadata>
+        C2StreamHdrDynamicMetadataInfo;
+constexpr char C2_PARAMKEY_INPUT_HDR_DYNAMIC_INFO[] = "input.hdr-dynamic-info";
+constexpr char C2_PARAMKEY_OUTPUT_HDR_DYNAMIC_INFO[] = "output.hdr-dynamic-info";
+
+/**
+ * HDR Format
+ */
+C2ENUM(C2Config::hdr_format_t, uint32_t,
+    UNKNOWN,     ///< HDR format not known (default)
+    SDR,         ///< not HDR (SDR)
+    HLG,         ///< HLG
+    HDR10,       ///< HDR10
+    HDR10_PLUS,  ///< HDR10+
+);
+
+/**
+ * HDR Format Info
+ *
+ * This information may be present during configuration to allow encoders to
+ * prepare encoding certain HDR formats. When this information is not present
+ * before start, encoders should determine the HDR format based on the available
+ * HDR metadata on the first input frame.
+ *
+ * While this information is optional, it is not a hint. When present, encoders
+ * that do not support dynamic reconfiguration do not need to switch to the HDR
+ * format based on the metadata on the first input frame.
+ */
+typedef C2StreamParam<C2Info, C2SimpleValueStruct<C2EasyEnum<C2Config::hdr_format_t>>,
+                kParamIndexHdrFormat>
+        C2StreamHdrFormatInfo;
+constexpr char C2_PARAMKEY_HDR_FORMAT[] = "coded.hdr-format";
 
 /* ------------------------------------ block-based coding ----------------------------------- */
 
@@ -1673,7 +1839,7 @@ C2ENUM(C2Config::picture_type_t, uint32_t,
     SYNC_FRAME = (1 << 0),  ///< sync frame, e.g. IDR
     I_FRAME    = (1 << 1),  ///< intra frame that is completely encoded
     P_FRAME    = (1 << 2),  ///< inter predicted frame from previous frames
-    B_FRAME    = (1 << 3),  ///< backward predicted (out-of-order) frame
+    B_FRAME    = (1 << 3),  ///< bidirectional predicted (out-of-order) frame
 )
 
 /**
@@ -1930,6 +2096,15 @@ constexpr char C2_PARAMKEY_MAX_CHANNEL_COUNT[] = "raw.max-channel-count";
 constexpr char C2_PARAMKEY_MAX_CODED_CHANNEL_COUNT[] = "coded.max-channel-count";
 
 /**
+ * Audio channel mask. Used by decoder to express audio channel mask of decoded content,
+ * or by encoder for the channel mask of the encoded content once decoded.
+ * Channel representation is specified according to the Java android.media.AudioFormat
+ * CHANNEL_OUT_* constants.
+ */
+ typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexAndroidChannelMask> C2StreamChannelMaskInfo;
+ const char C2_PARAMKEY_CHANNEL_MASK[] = "raw.channel-mask";
+
+/**
  * Audio sample format (PCM encoding)
  */
 C2ENUM(C2Config::pcm_encoding_t, uint32_t,
@@ -2050,6 +2225,49 @@ constexpr char C2_PARAMKEY_DRC_OUTPUT_LOUDNESS[] = "output.drc.output-loudness";
 typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexAudioFrameSize>
         C2StreamAudioFrameSizeInfo;
 constexpr char C2_PARAMKEY_AUDIO_FRAME_SIZE[] = "raw.audio-frame-size";
+
+/**
+ * Information for an access unit in a large frame (containing multiple access units)
+ */
+struct C2AccessUnitInfosStruct {
+
+    inline C2AccessUnitInfosStruct() {
+        memset(this, 0, sizeof(*this));
+    }
+
+    inline C2AccessUnitInfosStruct(
+            uint32_t flags_,
+            uint32_t size_,
+            int64_t timestamp_)
+        : flags(flags_),
+          size(size_),
+          timestamp(timestamp_) { }
+
+    uint32_t flags; ///<flags for the access-unit
+    uint32_t size; ///<size of access-unit
+    int64_t timestamp; ///<timestamp in us for the access-unit
+
+    DEFINE_AND_DESCRIBE_C2STRUCT(AccessUnitInfos)
+    C2FIELD(flags, "flags")
+    C2FIELD(size, "size")
+    C2FIELD(timestamp, "timestamp")
+};
+
+/**
+ * Multiple access unit support (e.g large audio frames)
+ *
+ * If supported by a component, multiple access units may be contained
+ * in a single work item. For now this is only defined for linear buffers.
+ * The metadata indicates the access-unit boundaries in a single buffer.
+ * The boundary of each access-units are marked by its size, immediately
+ * followed by the next access-unit.
+ */
+typedef C2StreamParam<C2Info, C2SimpleArrayStruct<C2AccessUnitInfosStruct>,
+                kParamIndexAccessUnitInfos>
+        C2AccessUnitInfos;
+
+constexpr char C2_PARAMKEY_INPUT_ACCESS_UNIT_INFOS[] = "input.access-unit-infos";
+constexpr char C2_PARAMKEY_OUTPUT_ACCESS_UNIT_INFOS[] = "output.access-unit-infos";
 
 /* --------------------------------------- AAC components --------------------------------------- */
 
@@ -2367,6 +2585,7 @@ typedef C2PortParam<C2Info, C2SimpleValueStruct<int64_t>, kParamIndexTunnelSyste
         C2PortTunnelSystemTime;
 constexpr char C2_PARAMKEY_OUTPUT_RENDER_TIME[] = "output.render-time";
 
+
 /**
  * Tunneled mode video peek signaling flag.
  *
@@ -2391,22 +2610,58 @@ typedef C2StreamParam<C2Info, C2EasyBoolValue, kParamIndexTunnelStartRender>
         C2StreamTunnelStartRender;
 constexpr char C2_PARAMKEY_TUNNEL_START_RENDER[] = "output.tunnel-start-render";
 
-C2ENUM(C2PlatformConfig::encoding_quality_level_t, uint32_t,
-    NONE,
-    S_HANDHELD,
-    S_HANDHELD_PC
+/** Tunnel Peek Mode. */
+C2ENUM(C2PlatformConfig::tunnel_peek_mode_t, uint32_t,
+    UNSPECIFIED_PEEK = 0,
+    SPECIFIED_PEEK = 1
 );
 
-namespace android {
+/**
+ * Tunnel Peek Mode Tuning parameter.
+ *
+ * If set to UNSPECIFIED_PEEK_MODE, the decoder is free to ignore the
+ * C2StreamTunnelHoldRender and C2StreamTunnelStartRender flags and associated
+ * features. Additionally, it becomes up to the decoder to display any frame
+ * before receiving synchronization information.
+ *
+ * Note: This parameter allows a decoder to ignore the video peek machinery and
+ * to revert to its preferred behavior.
+ */
+typedef C2StreamParam<C2Tuning,
+        C2SimpleValueStruct<C2EasyEnum<C2PlatformConfig::tunnel_peek_mode_t>>,
+        kParamIndexTunnelPeekMode> C2StreamTunnelPeekModeTuning;
+constexpr char C2_PARAMKEY_TUNNEL_PEEK_MODE[] =
+        "output.tunnel-peek-mode";
 
 /**
  * Encoding quality level signaling.
+ *
+ * Signal the 'minimum encoding quality' introduced in Android 12/S. It indicates
+ * whether the underlying codec is expected to take extra steps to ensure quality meets the
+ * appropriate minimum. A value of NONE indicates that the codec is not to apply
+ * any minimum quality bar requirements. Other values indicate that the codec is to apply
+ * a minimum quality bar, with the exact quality bar being decided by the parameter value.
  */
 typedef C2GlobalParam<C2Setting,
         C2SimpleValueStruct<C2EasyEnum<C2PlatformConfig::encoding_quality_level_t>>,
         kParamIndexEncodingQualityLevel> C2EncodingQualityLevel;
+constexpr char C2_PARAMKEY_ENCODING_QUALITY_LEVEL[] = "algo.encoding-quality-level";
 
-}
+C2ENUM(C2PlatformConfig::encoding_quality_level_t, uint32_t,
+    NONE = 0,
+    S_HANDHELD = 1              // corresponds to VMAF=70
+);
+
+/**
+ * Video Encoding Statistics Export
+ */
+
+/**
+ * Average block QP exported from video encoder.
+ */
+typedef C2StreamParam<C2Info, C2SimpleValueStruct<int32_t>, kParamIndexAverageBlockQuantization>
+        C2AndroidStreamAverageBlockQuantizationInfo;
+constexpr char C2_PARAMKEY_AVERAGE_QP[] = "coded.average-qp";
 
 /// @}
 

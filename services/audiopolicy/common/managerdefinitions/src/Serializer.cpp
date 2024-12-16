@@ -29,6 +29,7 @@
 #include <utils/StrongPointer.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
+#include "IOProfile.h"
 #include "Serializer.h"
 #include "TypeConverter.h"
 
@@ -123,6 +124,7 @@ struct MixPortTraits : public AndroidCollectionTraits<IOProfile, IOProfileCollec
         static constexpr const char *flags = "flags";
         static constexpr const char *maxOpenCount = "maxOpenCount";
         static constexpr const char *maxActiveCount = "maxActiveCount";
+        static constexpr const char *recommendedMuteDurationMs = "recommendedMuteDurationMs";
     };
 
     // Children: GainTraits
@@ -195,7 +197,6 @@ struct GlobalConfigTraits
 
     struct Attributes
     {
-        static constexpr const char *speakerDrcEnabled = "speaker_drc_enabled";
         static constexpr const char *callScreenModeSupported= "call_screen_mode_supported";
         static constexpr const char *engineLibrarySuffix = "engine_library";
     };
@@ -252,6 +253,18 @@ private:
 
     // Children: ModulesTraits, VolumeTraits, SurroundSoundTraits (optional)
 };
+
+// Deleter using free() for use with std::unique_ptr<>. See also UniqueCPtr<> below.
+struct FreeDelete {
+    // NOTE: Deleting a const object is valid but free() takes a non-const pointer.
+    void operator()(const void* ptr) const {
+        free(const_cast<void*>(ptr));
+    }
+};
+
+// Alias for std::unique_ptr<> that uses the C function free() to delete objects.
+template <typename T>
+using UniqueCPtr = std::unique_ptr<T, FreeDelete>;
 
 template <class T>
 constexpr void (*xmlDeleter)(T* t);
@@ -470,7 +483,14 @@ std::variant<status_t, MixPortTraits::Element> PolicySerializer::deserialize<Mix
     if (!flags.empty()) {
         // Source role
         if (portRole == AUDIO_PORT_ROLE_SOURCE) {
-            mixPort->setFlags(OutputFlagConverter::maskFromString(flags, mFlagsSeparator.c_str()));
+            //TODO: b/193496180 use spatializer flag at audio HAL when available until then,
+            // use DEEP_BUFFER+FAST flag combo to indicate the spatializer output profile
+            uint32_t intFlags =
+                    OutputFlagConverter::maskFromString(flags, mFlagsSeparator.c_str());
+            if (intFlags == (AUDIO_OUTPUT_FLAG_FAST | AUDIO_OUTPUT_FLAG_DEEP_BUFFER)) {
+                intFlags = AUDIO_OUTPUT_FLAG_SPATIALIZER;
+            }
+            mixPort->setFlags(intFlags);
         } else {
             // Sink role
             mixPort->setFlags(InputFlagConverter::maskFromString(flags, mFlagsSeparator.c_str()));
@@ -484,6 +504,13 @@ std::variant<status_t, MixPortTraits::Element> PolicySerializer::deserialize<Mix
     if (!maxActiveCount.empty()) {
         convertTo(maxActiveCount, mixPort->maxActiveCount);
     }
+
+    std::string recommendedmuteDurationMsLiteral =
+            getXmlAttribute(child, Attributes::recommendedMuteDurationMs);
+    if (!recommendedmuteDurationMsLiteral.empty()) {
+        convertTo(recommendedmuteDurationMsLiteral, mixPort->recommendedMuteDurationMs);
+    }
+
     // Deserialize children
     AudioGainTraits::Collection gains;
     status = deserializeCollection<AudioGainTraits>(child, &gains, NULL);
@@ -591,13 +618,15 @@ std::variant<status_t, RouteTraits::Element> PolicySerializer::deserialize<Route
     }
     // Convert Sink name to port pointer
     sp<PolicyAudioPort> sink = ctx->findPortByTagName(sinkAttr);
-    if (sink == NULL && !mIgnoreVendorExtensions) {
-        ALOGE("%s: no sink found with name=%s", __func__, sinkAttr.c_str());
-        return BAD_VALUE;
-    } else if (sink == NULL) {
-        ALOGW("Skipping route to sink \"%s\" as it likely has vendor extension type",
-                sinkAttr.c_str());
-        return NO_INIT;
+    if (sink == NULL) {
+        if (!mIgnoreVendorExtensions) {
+            ALOGE("%s: no sink found with name \"%s\"", __func__, sinkAttr.c_str());
+            return BAD_VALUE;
+        } else {
+            ALOGW("%s: skipping route to sink \"%s\" as it likely has vendor extension type",
+                  __func__, sinkAttr.c_str());
+            return NO_INIT;
+        }
     }
     route->setSink(sink);
 
@@ -608,18 +637,20 @@ std::variant<status_t, RouteTraits::Element> PolicySerializer::deserialize<Route
     }
     // Tokenize and Convert Sources name to port pointer
     PolicyAudioPortVector sources;
-    std::unique_ptr<char[]> sourcesLiteral{strndup(
+    UniqueCPtr<char> sourcesLiteral{strndup(
                 sourcesAttr.c_str(), strlen(sourcesAttr.c_str()))};
     char *devTag = strtok(sourcesLiteral.get(), ",");
     while (devTag != NULL) {
         if (strlen(devTag) != 0) {
             sp<PolicyAudioPort> source = ctx->findPortByTagName(devTag);
-            if (source == NULL && !mIgnoreVendorExtensions) {
-                ALOGE("%s: no source found with name=%s", __func__, devTag);
-                return BAD_VALUE;
-            } else if (source == NULL) {
-                ALOGW("Skipping route source \"%s\" as it likely has vendor extension type",
-                        devTag);
+            if (source == NULL) {
+                if (!mIgnoreVendorExtensions) {
+                    ALOGE("%s: no source found with name \"%s\"", __func__, devTag);
+                    return BAD_VALUE;
+                } else {
+                    ALOGW("%s: skipping route source \"%s\" as it likely has vendor extension type",
+                          __func__, devTag);
+                }
             } else {
                 sources.add(source);
             }
@@ -701,10 +732,16 @@ std::variant<status_t, ModuleTraits::Element> PolicySerializer::deserialize<Modu
                         sp<DeviceDescriptor> device = module->getDeclaredDevices().
                                 getDeviceFromTagName(std::string(reinterpret_cast<const char*>(
                                                         attachedDevice.get())));
-                        if (device == nullptr && mIgnoreVendorExtensions) {
-                            ALOGW("Skipped attached device \"%s\" because it likely uses a vendor"
-                                    "extension type",
-                                    reinterpret_cast<const char*>(attachedDevice.get()));
+                        if (device == NULL) {
+                            if (mIgnoreVendorExtensions) {
+                                ALOGW("%s: skipped attached device \"%s\" because it likely uses a "
+                                      "vendor extension type",
+                                      __func__,
+                                      reinterpret_cast<const char*>(attachedDevice.get()));
+                            } else {
+                                ALOGE("%s: got null device in %s, \"%s\"", __func__, child->name,
+                                      reinterpret_cast<const char*>(attachedDevice.get()));
+                            }
                             continue;
                         }
                         ctx->addDevice(device);
@@ -742,12 +779,7 @@ PolicySerializer::deserialize<GlobalConfigTraits>(
     for (const xmlNode *cur = root->xmlChildrenNode; cur != NULL; cur = cur->next) {
         if (!xmlStrcmp(cur->name, reinterpret_cast<const xmlChar*>(GlobalConfigTraits::tag))) {
             bool value;
-            std::string attr = getXmlAttribute(cur, Attributes::speakerDrcEnabled);
-            if (!attr.empty() &&
-                    convertTo<std::string, bool>(attr, value)) {
-                config->setSpeakerDrcEnabled(value);
-            }
-            attr = getXmlAttribute(cur, Attributes::callScreenModeSupported);
+            std::string attr = getXmlAttribute(cur, Attributes::callScreenModeSupported);
             if (!attr.empty() &&
                     convertTo<std::string, bool>(attr, value)) {
                 config->setCallScreenModeSupported(value);
@@ -849,10 +881,10 @@ status_t PolicySerializer::deserialize(const char *configFile, AudioPolicyConfig
         ALOGE("%s: No version found in root node %s", __func__, rootName);
         return BAD_VALUE;
     }
-    if (version == "7.0") {
+    if (version == "7.0" || version == "7.1") {
         mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
     } else if (version != "1.0") {
-        ALOGE("%s: Version does not match; expected \"1.0\" or \"7.0\" got \"%s\"",
+        ALOGE("%s: Version does not match; expected \"1.0\", \"7.0\", or \"7.1\" got \"%s\"",
                 __func__, version.c_str());
         return BAD_VALUE;
     }
@@ -880,7 +912,6 @@ status_t deserializeAudioPolicyFile(const char *fileName, AudioPolicyConfig *con
 {
     PolicySerializer serializer;
     status_t status = serializer.deserialize(fileName, config);
-    if (status != OK) config->clear();
     return status;
 }
 
@@ -888,7 +919,6 @@ status_t deserializeAudioPolicyFileForVts(const char *fileName, AudioPolicyConfi
 {
     PolicySerializer serializer;
     status_t status = serializer.deserialize(fileName, config, true /*ignoreVendorExtensions*/);
-    if (status != OK) config->clear();
     return status;
 }
 

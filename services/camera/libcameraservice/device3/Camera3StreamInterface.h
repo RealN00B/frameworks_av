@@ -17,18 +17,73 @@
 #ifndef ANDROID_SERVERS_CAMERA3_STREAM_INTERFACE_H
 #define ANDROID_SERVERS_CAMERA3_STREAM_INTERFACE_H
 
+#include <gui/Flags.h>
 #include <utils/RefBase.h>
 
+#include <camera/camera2/OutputConfiguration.h>
 #include <camera/CameraMetadata.h>
 #include "Camera3StreamBufferListener.h"
 #include "Camera3StreamBufferFreedListener.h"
 
-struct camera3_stream;
-struct camera3_stream_buffer;
-
 namespace android {
 
 namespace camera3 {
+
+typedef enum camera_buffer_status {
+    CAMERA_BUFFER_STATUS_OK = 0,
+    CAMERA_BUFFER_STATUS_ERROR = 1
+} camera_buffer_status_t;
+
+typedef enum camera_stream_type {
+    CAMERA_STREAM_OUTPUT = 0,
+    CAMERA_STREAM_INPUT = 1,
+    CAMERA_NUM_STREAM_TYPES
+} camera_stream_type_t;
+
+typedef enum camera_stream_rotation {
+    /* No rotation */
+    CAMERA_STREAM_ROTATION_0 = 0,
+
+    /* Rotate by 90 degree counterclockwise */
+    CAMERA_STREAM_ROTATION_90 = 1,
+
+    /* Rotate by 180 degree counterclockwise */
+    CAMERA_STREAM_ROTATION_180 = 2,
+
+    /* Rotate by 270 degree counterclockwise */
+    CAMERA_STREAM_ROTATION_270 = 3
+} camera_stream_rotation_t;
+
+typedef struct camera_stream {
+    camera_stream_type_t stream_type;
+    uint32_t width;
+    uint32_t height;
+    int format;
+    uint32_t usage;
+    uint32_t max_buffers;
+    android_dataspace_t data_space;
+    camera_stream_rotation_t rotation;
+    std::string physical_camera_id;
+
+    std::unordered_set<int32_t> sensor_pixel_modes_used;
+    int64_t dynamic_range_profile;
+    int64_t use_case;
+    int32_t color_space;
+} camera_stream_t;
+
+typedef struct camera_stream_buffer {
+    camera_stream_t *stream;
+    buffer_handle_t *buffer;
+    camera_buffer_status_t status;
+    int acquire_fence;
+    int release_fence;
+} camera_stream_buffer_t;
+
+struct Size {
+    uint32_t width;
+    uint32_t height;
+    explicit Size(uint32_t w = 0, uint32_t h = 0) : width(w), height(h){}
+};
 
 enum {
     /**
@@ -56,13 +111,66 @@ class OutputStreamInfo {
         uint64_t consumerUsage;
         bool finalized = false;
         bool supportsOffline = false;
+        std::unordered_set<int32_t> sensorPixelModesUsed;
+        int64_t dynamicRangeProfile;
+        int64_t streamUseCase;
+        int timestampBase;
+        int mirrorMode;
+        int32_t colorSpace;
         OutputStreamInfo() :
             width(-1), height(-1), format(-1), dataSpace(HAL_DATASPACE_UNKNOWN),
-            consumerUsage(0) {}
+            consumerUsage(0),
+            dynamicRangeProfile(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD),
+            streamUseCase(ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT),
+            timestampBase(OutputConfiguration::TIMESTAMP_BASE_DEFAULT),
+            mirrorMode(OutputConfiguration::MIRROR_MODE_AUTO),
+            colorSpace(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED) {}
         OutputStreamInfo(int _width, int _height, int _format, android_dataspace _dataSpace,
-                uint64_t _consumerUsage) :
+                uint64_t _consumerUsage, const std::unordered_set<int32_t>& _sensorPixelModesUsed,
+                int64_t _dynamicRangeProfile, int _streamUseCase, int _timestampBase, int _mirrorMode,
+                int32_t _colorSpace) :
             width(_width), height(_height), format(_format),
-            dataSpace(_dataSpace), consumerUsage(_consumerUsage) {}
+            dataSpace(_dataSpace), consumerUsage(_consumerUsage),
+            sensorPixelModesUsed(_sensorPixelModesUsed), dynamicRangeProfile(_dynamicRangeProfile),
+            streamUseCase(_streamUseCase), timestampBase(_timestampBase), mirrorMode(_mirrorMode),
+            colorSpace(_colorSpace) {}
+};
+
+// Utility class to lock and unlock a GraphicBuffer
+class GraphicBufferLocker {
+public:
+    GraphicBufferLocker(sp<GraphicBuffer> buffer) : _buffer(buffer) {}
+
+    status_t lockAsync(uint32_t usage, void** dstBuffer, int fenceFd) {
+        if (_buffer == nullptr) return BAD_VALUE;
+
+        status_t res = OK;
+        if (!_locked) {
+            status_t res =  _buffer->lockAsync(usage, dstBuffer, fenceFd);
+            if (res == OK) {
+                _locked = true;
+            }
+        }
+        return res;
+    }
+
+    status_t lockAsync(void** dstBuffer, int fenceFd) {
+        return lockAsync(GRALLOC_USAGE_SW_WRITE_OFTEN, dstBuffer, fenceFd);
+    }
+
+    ~GraphicBufferLocker() {
+        if (_locked && _buffer != nullptr) {
+            auto res = _buffer->unlock();
+            if (res != OK) {
+                ALOGE("%s: Error trying to unlock buffer: %s (%d)", __FUNCTION__,
+                        strerror(-res), res);
+            }
+        }
+    }
+
+private:
+    sp<GraphicBuffer> _buffer;
+    bool _locked = false;
 };
 
 /**
@@ -87,18 +195,32 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual int      getStreamSetId() const = 0;
 
     /**
+     * Is this stream part of a multi-resolution stream set
+     */
+    virtual bool     isMultiResolution() const = 0;
+
+    /**
+     * Get the HAL stream group id for a multi-resolution stream set
+     */
+    virtual int      getHalStreamGroupId() const = 0;
+
+    /**
      * Get the stream's dimensions and format
      */
     virtual uint32_t getWidth() const = 0;
     virtual uint32_t getHeight() const = 0;
     virtual int      getFormat() const = 0;
+    virtual int64_t  getDynamicRangeProfile() const = 0;
     virtual android_dataspace getDataSpace() const = 0;
+    virtual int32_t getColorSpace() const = 0;
     virtual void setFormatOverride(bool formatOverriden) = 0;
     virtual bool isFormatOverridden() const = 0;
     virtual int getOriginalFormat() const = 0;
     virtual void setDataSpaceOverride(bool dataSpaceOverriden) = 0;
     virtual bool isDataSpaceOverridden() const = 0;
     virtual android_dataspace getOriginalDataSpace() const = 0;
+    virtual int getMaxHalBuffers() const = 0;
+    virtual int getMaxTotalBuffers() const = 0;
 
     /**
      * Offline processing
@@ -107,23 +229,23 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual bool getOfflineProcessingSupport() const = 0;
 
     /**
-     * Get a HAL3 handle for the stream, without starting stream configuration.
+     * Get a handle for the stream, without starting stream configuration.
      */
-    virtual camera3_stream* asHalStream() = 0;
+    virtual camera_stream* asHalStream() = 0;
 
     /**
      * Start the stream configuration process. Returns a handle to the stream's
-     * information to be passed into the HAL device's configure_streams call.
+     * information to be passed into the device's configure_streams call.
      *
      * Until finishConfiguration() is called, no other methods on the stream may
-     * be called. The usage and max_buffers fields of camera3_stream may be
+     * be called. The usage and max_buffers fields of camera_stream may be
      * modified between start/finishConfiguration, but may not be changed after
-     * that. The priv field of camera3_stream may be modified at any time after
+     * that. The priv field of camera_stream may be modified at any time after
      * startConfiguration.
      *
      * Returns NULL in case of error starting configuration.
      */
-    virtual camera3_stream* startConfiguration() = 0;
+    virtual camera_stream* startConfiguration() = 0;
 
     /**
      * Check if the stream is mid-configuration (start has been called, but not
@@ -161,6 +283,11 @@ class Camera3StreamInterface : public virtual RefBase {
      * prepareNextBuffer called on it.
      */
     virtual bool     isUnpreparable() = 0;
+
+    /**
+     * Mark the stream as unpreparable.
+     */
+    virtual void     markUnpreparable() = 0;
 
     /**
      * Start stream preparation. May only be called in the CONFIGURED state,
@@ -239,7 +366,7 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual status_t tearDown() = 0;
 
     /**
-     * Fill in the camera3_stream_buffer with the next valid buffer for this
+     * Fill in the camera_stream_buffer with the next valid buffer for this
      * stream, to hand over to the HAL.
      *
      * Multiple surfaces could share the same HAL stream, but a request may
@@ -253,9 +380,22 @@ class Camera3StreamInterface : public virtual RefBase {
      * buffers.
      *
      */
-    virtual status_t getBuffer(camera3_stream_buffer *buffer,
+    virtual status_t getBuffer(camera_stream_buffer *buffer,
             nsecs_t waitBufferTimeout,
             const std::vector<size_t>& surface_ids = std::vector<size_t>()) = 0;
+
+    struct OutstandingBuffer {
+        camera_stream_buffer* outBuffer;
+
+        /**
+         * Multiple surfaces could share the same HAL stream, but a request may
+         * be only for a subset of surfaces. In this case, the
+         * Camera3StreamInterface object needs the surface ID information to acquire
+         * buffers for those surfaces. For the case of single surface for a HAL
+         * stream, surface_ids parameter has no effect.
+         */
+        std::vector<size_t> surface_ids;
+    };
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -269,13 +409,13 @@ class Camera3StreamInterface : public virtual RefBase {
      * This method may only be called for buffers provided by getBuffer().
      * For bidirectional streams, this method applies to the output-side buffers
      */
-    virtual status_t returnBuffer(const camera3_stream_buffer &buffer,
-            nsecs_t timestamp, bool timestampIncreasing = true,
+    virtual status_t returnBuffer(const camera_stream_buffer &buffer,
+            nsecs_t timestamp, nsecs_t readoutTimestamp, bool timestampIncreasing = true,
             const std::vector<size_t>& surface_ids = std::vector<size_t>(),
-            uint64_t frameNumber = 0) = 0;
+            uint64_t frameNumber = 0, int32_t transform = -1) = 0;
 
     /**
-     * Fill in the camera3_stream_buffer with the next valid buffer for this
+     * Fill in the camera_stream_buffer with the next valid buffer for this
      * stream, to hand over to the HAL.
      *
      * This method may only be called once finishConfiguration has been called.
@@ -285,7 +425,8 @@ class Camera3StreamInterface : public virtual RefBase {
      * Normally this call will block until the handed out buffer count is less than the stream
      * max buffer count; if respectHalLimit is set to false, this is ignored.
      */
-    virtual status_t getInputBuffer(camera3_stream_buffer *buffer, bool respectHalLimit = true) = 0;
+    virtual status_t getInputBuffer(camera_stream_buffer *buffer,
+            Size *size, bool respectHalLimit = true) = 0;
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -293,14 +434,16 @@ class Camera3StreamInterface : public virtual RefBase {
      * This method may only be called for buffers provided by getBuffer().
      * For bidirectional streams, this method applies to the input-side buffers
      */
-    virtual status_t returnInputBuffer(const camera3_stream_buffer &buffer) = 0;
+    virtual status_t returnInputBuffer(const camera_stream_buffer &buffer) = 0;
 
+#if !WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
     /**
      * Get the buffer producer of the input buffer queue.
      *
      * This method only applies to input streams.
      */
     virtual status_t getInputBufferProducer(sp<IGraphicBufferProducer> *producer) = 0;
+#endif
 
     /**
      * Whether any of the stream's buffers are currently in use by the HAL,
@@ -339,7 +482,7 @@ class Camera3StreamInterface : public virtual RefBase {
     /**
      * Debug dump of the stream's state.
      */
-    virtual void     dump(int fd, const Vector<String16> &args) const = 0;
+    virtual void     dump(int fd, const Vector<String16> &args) = 0;
 
     virtual void     addBufferListener(
             wp<Camera3StreamBufferListener> listener) = 0;

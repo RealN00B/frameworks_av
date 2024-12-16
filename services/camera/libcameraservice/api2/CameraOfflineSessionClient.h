@@ -17,6 +17,7 @@
 #ifndef ANDROID_SERVERS_CAMERA_PHOTOGRAPHY_CAMERAOFFLINESESSIONCLIENT_H
 #define ANDROID_SERVERS_CAMERA_PHOTOGRAPHY_CAMERAOFFLINESESSIONCLIENT_H
 
+#include <android/hardware/ICameraService.h>
 #include <android/hardware/camera2/BnCameraOfflineSession.h>
 #include <android/hardware/camera2/ICameraDeviceCallbacks.h>
 #include "common/FrameProcessorBase.h"
@@ -47,15 +48,19 @@ public:
             sp<CameraOfflineSessionBase> session,
             const KeyedVector<sp<IBinder>, sp<CompositeStream>>& offlineCompositeStreamMap,
             const sp<ICameraDeviceCallbacks>& remoteCallback,
-            const String16& clientPackageName,
-            const std::optional<String16>& clientFeatureId,
-            const String8& cameraIdStr, int cameraFacing,
+            std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+            const std::string& clientPackageName,
+            const std::optional<std::string>& clientFeatureId,
+            const std::string& cameraIdStr, int cameraFacing, int sensorOrientation,
             int clientPid, uid_t clientUid, int servicePid) :
             CameraService::BasicClient(
                     cameraService,
                     IInterface::asBinder(remoteCallback),
-                    clientPackageName, clientFeatureId,
-                    cameraIdStr, cameraFacing, clientPid, clientUid, servicePid),
+                    attributionAndPermissionUtils,
+                    // (v)ndk doesn't have offline session support
+                    clientPackageName, /*overridePackageName*/false, clientFeatureId,
+                    cameraIdStr, cameraFacing, sensorOrientation, clientPid, clientUid, servicePid,
+                    hardware::ICameraService::ROTATION_OVERRIDE_NONE),
             mRemoteCallback(remoteCallback), mOfflineSession(session),
             mCompositeStreamMap(offlineCompositeStreamMap) {}
 
@@ -71,10 +76,30 @@ public:
 
     status_t dumpClient(int /*fd*/, const Vector<String16>& /*args*/) override;
 
-    status_t initialize(sp<CameraProviderManager> /*manager*/,
-            const String8& /*monitorTags*/) override;
+    status_t startWatchingTags(const std::string &tags, int outFd) override;
+    status_t stopWatchingTags(int outFd) override;
+    status_t dumpWatchedEventsToVector(std::vector<std::string> &out) override;
 
-    status_t setRotateAndCropOverride(uint8_t rotateAndCrop) override;
+    status_t initialize(sp<CameraProviderManager> /*manager*/,
+            const std::string& /*monitorTags*/) override;
+
+    status_t setRotateAndCropOverride(uint8_t rotateAndCrop, bool fromHal = false) override;
+
+    status_t setAutoframingOverride(uint8_t autoframingValue) override;
+
+    bool supportsCameraMute() override;
+    status_t setCameraMute(bool enabled) override;
+
+    status_t setCameraServiceWatchdog(bool enabled) override;
+
+    void setStreamUseCaseOverrides(
+            const std::vector<int64_t>& useCaseOverrides) override;
+
+    void clearStreamUseCaseOverrides() override;
+
+    bool supportsZoomOverride() override;
+
+    status_t setZoomOverride(int32_t zoomOverride) override;
 
     // permissions management
     status_t startCameraOps() override;
@@ -86,13 +111,21 @@ public:
     // NotificationListener API
     void notifyError(int32_t errorCode, const CaptureResultExtras& resultExtras) override;
     void notifyShutter(const CaptureResultExtras& resultExtras, nsecs_t timestamp) override;
-    void notifyIdle() override;
+    status_t notifyActive(float maxPreviewFps) override;
+    void notifyIdle(int64_t requestCount, int64_t resultErrorCount, bool deviceError,
+            std::pair<int32_t, int32_t> mostRequestedFpsRange,
+            const std::vector<hardware::CameraStreamStats>& streamStats) override;
     void notifyAutoFocus(uint8_t newState, int triggerId) override;
     void notifyAutoExposure(uint8_t newState, int triggerId) override;
     void notifyAutoWhitebalance(uint8_t newState, int triggerId) override;
     void notifyPrepared(int streamId) override;
     void notifyRequestQueueEmpty() override;
     void notifyRepeatingRequestError(long lastFrameNumber) override;
+    status_t injectCamera(const std::string& injectedCamId,
+            sp<CameraProviderManager> manager) override;
+    status_t stopInjection() override;
+    status_t injectSessionParams(
+        const hardware::camera2::impl::CameraMetadataNative& sessionParams) override;
 
 private:
     mutable Mutex mBinderSerializationLock;

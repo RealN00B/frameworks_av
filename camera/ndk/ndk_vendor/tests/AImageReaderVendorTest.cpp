@@ -35,9 +35,9 @@
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraDevice.h>
 #include <camera/NdkCameraCaptureSession.h>
+#include <hidl/ServiceManagement.h>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
-#include <cutils/native_handle.h>
 #include <VendorTagDescriptor.h>
 
 namespace {
@@ -50,7 +50,7 @@ static constexpr int kTestImageHeight = 480;
 static constexpr int kTestImageFormat = AIMAGE_FORMAT_YUV_420_888;
 
 using android::hardware::camera::common::V1_0::helper::VendorTagDescriptorCache;
-using ConfiguredWindows = std::set<native_handle_t *>;
+using ConfiguredWindows = std::set<ANativeWindow*>;
 
 class CameraHelper {
    public:
@@ -60,13 +60,13 @@ class CameraHelper {
 
     struct PhysicalImgReaderInfo {
         const char* physicalCameraId;
-        native_handle_t* anw;
+        ANativeWindow* anw;
     };
 
     // Retaining the error code in case the caller needs to analyze it.
-    std::variant<int, ConfiguredWindows> initCamera(native_handle_t* imgReaderAnw,
+    std::variant<int, ConfiguredWindows> initCamera(ANativeWindow* imgReaderAnw,
             const std::vector<PhysicalImgReaderInfo>& physicalImgReaders,
-            bool usePhysicalSettings) {
+            bool usePhysicalSettings, bool prepareWindows = false) {
         ConfiguredWindows configuredWindows;
         if (imgReaderAnw == nullptr) {
             ALOGE("Cannot initialize camera before image reader get initialized.");
@@ -104,7 +104,7 @@ class CameraHelper {
         }
         configuredWindows.insert(mImgReaderAnw);
         std::vector<const char*> idPointerList;
-        std::set<const native_handle_t*> physicalStreamMap;
+        std::set<ANativeWindow*> physicalStreamMap;
         for (auto& physicalStream : physicalImgReaders) {
             ACaptureSessionOutput* sessionOutput = nullptr;
             ret = ACaptureSessionPhysicalOutput_create(physicalStream.anw,
@@ -142,7 +142,26 @@ class CameraHelper {
             ALOGE("ACameraDevice_createCaptureSession failed, ret=%d", ret);
             return ret;
         }
-
+        if (prepareWindows) {
+            // Set window prepared callback
+            ACameraCaptureSession_setWindowPreparedCallback(mSession, /*context*/this,
+                    mPreparedCb);
+            // Prepare windows
+            for (auto &window : configuredWindows) {
+                ret = ACameraCaptureSession_prepareWindow(mSession, window);
+                if (ret != ACAMERA_OK) {
+                    ALOGE("%s: ACameraCaptureSession_prepareWindow failed", __FUNCTION__);
+                    return ret;
+                }
+                incPendingPrepared(window);
+            }
+            // Some time for the on-PreparedCallbacks
+            usleep(configuredWindows.size() * 100000);
+            // Check that callbacks were received
+            if (!gotAllPreparedCallbacks()) {
+                return -1;
+            }
+        }
         // Create capture request
         if (usePhysicalSettings) {
             ret = ACameraDevice_createCaptureRequest_withPhysicalIds(mDevice,
@@ -236,6 +255,11 @@ class CameraHelper {
         return ACameraCaptureSession_capture(mSession, &mCaptureCallbacks, 1, &mStillRequest,
                                              &seqId);
     }
+    int takePicture2() {
+        int seqId;
+        return ACameraCaptureSession_captureV2(mSession, &mCaptureCallbacksV2, 1,
+                &mStillRequest, &seqId);
+    }
 
     int takeLogicalCameraPicture() {
         int seqId;
@@ -243,21 +267,85 @@ class CameraHelper {
                 1, &mStillRequest, &seqId);
     }
 
-    bool checkCallbacks(int pictureCount) {
+    int takeLogicalCameraPicture2() {
+        int seqId;
+        return ACameraCaptureSession_logicalCamera_captureV2(mSession,
+                &mLogicalCaptureCallbacksV2, 1, &mStillRequest, &seqId);
+    }
+
+    bool checkCallbacks(int pictureCount, bool printLog = false) {
         std::lock_guard<std::mutex> lock(mMutex);
         if (mCompletedCaptureCallbackCount != pictureCount) {
-            ALOGE("Completed capture callaback count not as expected. expected %d actual %d",
-                  pictureCount, mCompletedCaptureCallbackCount);
+            ALOGE_IF(printLog,
+                     "Completed capture callback count not as expected. expected %d actual %d",
+                     pictureCount, mCompletedCaptureCallbackCount);
+            return false;
+        }
+        return true;
+    }
+    bool checkCallbacksV2(int pictureCount, bool printLog = false) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mCaptureStartedCallbackCount != pictureCount) {
+            ALOGE_IF(printLog,
+                     "Capture started callback count not as expected. expected %d actual %d",
+                     pictureCount, mCaptureStartedCallbackCount);
             return false;
         }
         return true;
     }
 
+
    private:
+    static void onPreparedCb(void* obj, ANativeWindow *anw, ACameraCaptureSession *session) {
+        CameraHelper* thiz = reinterpret_cast<CameraHelper*>(obj);
+        thiz->handlePrepared(anw, session);
+    }
+    bool gotAllPreparedCallbacks() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        bool ret = (mPendingPreparedCbs.size() == 0);
+        if (!ret) {
+            ALOGE("%s: mPendingPreparedCbs has the following expected callbacks", __FUNCTION__);
+            for (auto pair : mPendingPreparedCbs) {
+                ALOGE("%s: ANW: %p : pending callbacks %d", __FUNCTION__, pair.first, pair.second);
+            }
+        }
+        return ret;
+    }
+
+    void handlePrepared(ANativeWindow *anw, ACameraCaptureSession *session) {
+        // Reduce the pending prepared count of anw by 1. If count is  0, remove the key.
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (session != mSession) {
+            ALOGE("%s: Received callback for incorrect session ? mSession %p, session %p",
+                    __FUNCTION__, mSession, session);
+            return;
+        }
+        if(mPendingPreparedCbs.find(anw) == mPendingPreparedCbs.end()) {
+            ALOGE("%s: ANW %p was not being prepared at all ?", __FUNCTION__, anw);
+            return;
+        }
+        mPendingPreparedCbs[anw]--;
+        if (mPendingPreparedCbs[anw] == 0) {
+            mPendingPreparedCbs.erase(anw);
+        }
+    }
+    void incPendingPrepared(ANativeWindow *anw) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if ((mPendingPreparedCbs.find(anw) == mPendingPreparedCbs.end())) {
+            mPendingPreparedCbs[anw] = 1;
+            return;
+        }
+        mPendingPreparedCbs[anw]++;
+    }
+
+    // ANW -> pending prepared callbacks
+    std::unordered_map<ANativeWindow*, int> mPendingPreparedCbs;
     ACameraDevice_StateCallbacks mDeviceCb{this, nullptr, nullptr};
     ACameraCaptureSession_stateCallbacks mSessionCb{ this, nullptr, nullptr, nullptr};
 
-    native_handle_t* mImgReaderAnw = nullptr;  // not owned by us.
+    ACameraCaptureSession_prepareCallback mPreparedCb = &onPreparedCb;
+
+    ANativeWindow* mImgReaderAnw = nullptr;  // not owned by us.
 
     // Camera device
     ACameraDevice* mDevice = nullptr;
@@ -276,6 +364,7 @@ class CameraHelper {
     const char* mCameraId;
     ACameraManager* mCameraManager;
     int mCompletedCaptureCallbackCount = 0;
+    int mCaptureStartedCallbackCount = 0;
     std::mutex mMutex;
     ACameraCaptureSession_captureCallbacks mCaptureCallbacks = {
         // TODO: Add tests for other callbacks
@@ -293,8 +382,25 @@ class CameraHelper {
         nullptr, // onCaptureSequenceAborted
         nullptr, // onCaptureBufferLost
     };
+    ACameraCaptureSession_captureCallbacksV2 mCaptureCallbacksV2 = {
+        this, // context
+        [](void* ctx , ACameraCaptureSession *,const ACaptureRequest *, int64_t,
+              int64_t frameNumber ) {
+            CameraHelper *ch = static_cast<CameraHelper *>(ctx);
+            ASSERT_TRUE(frameNumber >= 0);
+            std::lock_guard<std::mutex> lock(ch->mMutex);
+            ch->mCaptureStartedCallbackCount++;
+        },
+        nullptr, // onCaptureProgressed
+        nullptr, // onCaptureCompleted
+        nullptr, // onCaptureFailed
+        nullptr, // onCaptureSequenceCompleted
+        nullptr, // onCaptureSequenceAborted
+        nullptr, // onCaptureBufferLost
+    };
 
     std::vector<std::string> mPhysicalCameraIds;
+
     ACameraCaptureSession_logicalCamera_captureCallbacks mLogicalCaptureCallbacks = {
         // TODO: Add tests for other callbacks
         this, // context
@@ -336,6 +442,23 @@ class CameraHelper {
         nullptr, // onCaptureSequenceAborted
         nullptr, // onCaptureBufferLost
     };
+    ACameraCaptureSession_logicalCamera_captureCallbacksV2 mLogicalCaptureCallbacksV2 = {
+        this, // context
+        [](void* ctx , ACameraCaptureSession *,const ACaptureRequest *, int64_t,
+                int64_t frameNumber) {
+            CameraHelper *ch = static_cast<CameraHelper *>(ctx);
+            ASSERT_TRUE(frameNumber >= 0);
+            std::lock_guard<std::mutex> lock(ch->mMutex);
+            ch->mCaptureStartedCallbackCount++;
+        },
+        nullptr, // onCaptureProgressed
+        nullptr, //onLogicalCaptureCompleted
+        nullptr, //onLogicalCpatureFailed
+        nullptr, // onCaptureSequenceCompleted
+        nullptr, // onCaptureSequenceAborted
+        nullptr, // onCaptureBufferLost
+    };
+
 };
 
 class ImageReaderTestCase {
@@ -356,7 +479,7 @@ class ImageReaderTestCase {
     ~ImageReaderTestCase() {
         if (mImgReaderAnw) {
             AImageReader_delete(mImgReader);
-            // No need to call native_handle_t_release on imageReaderAnw
+            // No need to call AImageReader_release(mImgReaderAnw).
         }
     }
 
@@ -386,17 +509,18 @@ class ImageReaderTestCase {
             return ret;
         }
 
-        ret = AImageReader_getWindowNativeHandle(mImgReader, &mImgReaderAnw);
+
+        ret = AImageReader_getWindow(mImgReader, &mImgReaderAnw);
         if (ret != AMEDIA_OK || mImgReaderAnw == nullptr) {
-            ALOGE("Failed to get native_handle_t from AImageReader, ret=%d, mImgReaderAnw=%p.", ret,
-                  mImgReaderAnw);
+            ALOGE("Failed to get ANativeWindow* from AImageReader, ret=%d, mImgReader=%p.", ret,
+                  mImgReader);
             return -1;
         }
 
         return 0;
     }
 
-    native_handle_t* getNativeWindow() { return mImgReaderAnw; }
+    ANativeWindow* getNativeWindow() { return mImgReaderAnw; }
 
     int getAcquiredImageCount() {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -529,7 +653,7 @@ class ImageReaderTestCase {
     int mAcquiredImageCount{0};
 
     AImageReader* mImgReader = nullptr;
-    native_handle_t* mImgReaderAnw = nullptr;
+    ANativeWindow* mImgReaderAnw = nullptr;
 
     AImageReader_ImageListener mReaderAvailableCb{this, onImageAvailable};
     AImageReader_BufferRemovedListener mReaderDetachedCb{this, onBufferRemoved};
@@ -570,7 +694,7 @@ class AImageReaderVendorTest : public ::testing::Test {
     }
 
     bool takePictures(const char* id, uint64_t readerUsage, int readerMaxImages,
-            bool readerAsync, int pictureCount) {
+            bool readerAsync, int pictureCount, bool v2 = false, bool prepareSurfaces = false) {
         int ret = 0;
 
         ImageReaderTestCase testCase(
@@ -585,7 +709,7 @@ class AImageReaderVendorTest : public ::testing::Test {
         CameraHelper cameraHelper(id, mCameraManager);
         std::variant<int, ConfiguredWindows> retInit =
                 cameraHelper.initCamera(testCase.getNativeWindow(), {}/*physicalImageReaders*/,
-                                        false/*usePhysicalSettings*/);
+                                        false/*usePhysicalSettings*/, prepareSurfaces);
         int *retp = std::get_if<int>(&retInit);
         if (retp) {
             ALOGE("Unable to initialize camera helper");
@@ -600,7 +724,11 @@ class AImageReaderVendorTest : public ::testing::Test {
         }
 
         for (int i = 0; i < pictureCount; i++) {
-            ret = cameraHelper.takePicture();
+            if (v2) {
+                ret = cameraHelper.takePicture2();
+            } else {
+                ret = cameraHelper.takePicture();
+            }
             if (ret < 0) {
                 ALOGE("Unable to take picture");
                 return false;
@@ -610,28 +738,38 @@ class AImageReaderVendorTest : public ::testing::Test {
         // Sleep until all capture finished
         for (int i = 0; i < kCaptureWaitRetry * pictureCount; i++) {
             usleep(kCaptureWaitUs);
-            if (testCase.getAcquiredImageCount() == pictureCount) {
+            bool receivedAllCallbacks = v2 ? cameraHelper.checkCallbacksV2(pictureCount)
+                                           : cameraHelper.checkCallbacks(pictureCount);
+
+            bool acquiredAllImages = testCase.getAcquiredImageCount() == pictureCount;
+            if (acquiredAllImages) {
                 ALOGI("Session take ~%d ms to capture %d images", i * kCaptureWaitUs / 1000,
                       pictureCount);
+            }
+            // Wait for all images to be acquired and all callbacks to be processed
+            if (acquiredAllImages && receivedAllCallbacks) {
                 break;
             }
         }
         return testCase.getAcquiredImageCount() == pictureCount &&
-                cameraHelper.checkCallbacks(pictureCount);
+               v2 ? cameraHelper.checkCallbacksV2(pictureCount, /* printLog= */true) :
+                    cameraHelper.checkCallbacks(pictureCount, /* printLog= */true);
     }
 
-    bool testTakePicturesNative(const char* id) {
+    bool testTakePicturesNative(const char* id, bool prepareSurfaces) {
         for (auto& readerUsage :
              {AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN}) {
             for (auto& readerMaxImages : {1, 4, 8}) {
                 for (auto& readerAsync : {true, false}) {
                     for (auto& pictureCount : {1, 4, 8}) {
-                        if (!takePictures(id, readerUsage, readerMaxImages,
-                                readerAsync, pictureCount)) {
-                            ALOGE("Test takePictures failed for test case usage=%" PRIu64
-                                  ", maxImages=%d, async=%d, pictureCount=%d",
-                                  readerUsage, readerMaxImages, readerAsync, pictureCount);
-                            return false;
+                        for ( auto & v2 : {true, false}) {
+                            if (!takePictures(id, readerUsage, readerMaxImages,
+                                    readerAsync, pictureCount, v2, prepareSurfaces)) {
+                                ALOGE("Test takePictures failed for test case usage=%" PRIu64
+                                      ", maxImages=%d, async=%d, pictureCount=%d",
+                                      readerUsage, readerMaxImages, readerAsync, pictureCount);
+                                return false;
+                            }
                         }
                     }
                 }
@@ -725,7 +863,7 @@ class AImageReaderVendorTest : public ::testing::Test {
         return;
     }
 
-    void testLogicalCameraPhysicalStream(bool usePhysicalSettings) {
+    void testLogicalCameraPhysicalStream(bool usePhysicalSettings, bool v2) {
         const char* cameraId = nullptr;
         ACameraMetadata* staticMetadata = nullptr;
         std::vector<const char*> physicalCameraIds;
@@ -772,7 +910,12 @@ class AImageReaderVendorTest : public ::testing::Test {
         }
 
         for (int i = 0; i < pictureCount; i++) {
-            ret = cameraHelper.takeLogicalCameraPicture();
+            if (v2) {
+              ret = cameraHelper.takeLogicalCameraPicture2();
+            }
+            else {
+              ret = cameraHelper.takeLogicalCameraPicture();
+            }
             ASSERT_EQ(ret, 0);
         }
 
@@ -793,49 +936,61 @@ class AImageReaderVendorTest : public ::testing::Test {
             ALOGI("Testing window %p", testCase->getNativeWindow());
             ASSERT_EQ(testCase->getAcquiredImageCount(), pictureCount);
         }
-
-        ASSERT_TRUE(cameraHelper.checkCallbacks(pictureCount));
+        if (v2) {
+            ASSERT_TRUE(cameraHelper.checkCallbacksV2(pictureCount));
+        } else {
+            ASSERT_TRUE(cameraHelper.checkCallbacks(pictureCount));
+        }
 
         ACameraMetadata_free(staticMetadata);
     }
+
+    void testBasicTakePictures(bool prepareSurfaces) {
+        // We always use the first camera.
+        const char* cameraId = mCameraIdList->cameraIds[0];
+        ASSERT_TRUE(cameraId != nullptr);
+
+        ACameraMetadata* staticMetadata = nullptr;
+        camera_status_t ret = ACameraManager_getCameraCharacteristics(
+                mCameraManager, cameraId, &staticMetadata);
+        ASSERT_EQ(ret, ACAMERA_OK);
+        ASSERT_NE(staticMetadata, nullptr);
+
+        bool isBC = isCapabilitySupported(staticMetadata,
+                ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE);
+
+        uint32_t namedTag = 0;
+        // Test that ACameraMetadata_getTagFromName works as expected for public tag
+        // names
+        camera_status_t status = ACameraManager_getTagFromName(mCameraManager, cameraId,
+                "android.control.aeMode", &namedTag);
+
+        ASSERT_EQ(status, ACAMERA_OK);
+        ASSERT_EQ(namedTag, ACAMERA_CONTROL_AE_MODE);
+
+        ACameraMetadata_free(staticMetadata);
+
+        if (!isBC) {
+            ALOGW("Camera does not support BACKWARD_COMPATIBLE.");
+            return;
+        }
+
+        EXPECT_TRUE(testTakePicturesNative(cameraId, prepareSurfaces));
+    }
 };
 
-TEST_F(AImageReaderVendorTest, CreateWindowNativeHandle) {
-    // We always use the first camera.
-    const char* cameraId = mCameraIdList->cameraIds[0];
-    ASSERT_TRUE(cameraId != nullptr);
 
-    ACameraMetadata* staticMetadata = nullptr;
-    camera_status_t ret = ACameraManager_getCameraCharacteristics(
-            mCameraManager, cameraId, &staticMetadata);
-    ASSERT_EQ(ret, ACAMERA_OK);
-    ASSERT_NE(staticMetadata, nullptr);
 
-    bool isBC = isCapabilitySupported(staticMetadata,
-            ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE);
-
-    uint32_t namedTag = 0;
-    // Test that ACameraMetadata_getTagFromName works as expected for public tag
-    // names
-    camera_status_t status = ACameraManager_getTagFromName(mCameraManager, cameraId,
-            "android.control.aeMode", &namedTag);
-
-    ASSERT_EQ(status, ACAMERA_OK);
-    ASSERT_EQ(namedTag, ACAMERA_CONTROL_AE_MODE);
-
-    ACameraMetadata_free(staticMetadata);
-
-    if (!isBC) {
-        ALOGW("Camera does not support BACKWARD_COMPATIBLE.");
-        return;
-    }
-
-    EXPECT_TRUE(testTakePicturesNative(cameraId));
+TEST_F(AImageReaderVendorTest, CreateANativeWindow) {
+    testBasicTakePictures(/*prepareSurfaces*/ false);
+    testBasicTakePictures(/*prepareSurfaces*/ true);
 }
 
 TEST_F(AImageReaderVendorTest, LogicalCameraPhysicalStream) {
-    testLogicalCameraPhysicalStream(false/*usePhysicalSettings*/);
-    testLogicalCameraPhysicalStream(true/*usePhysicalSettings*/);
+    for (auto & v2 : {true, false}) {
+        testLogicalCameraPhysicalStream(false/*usePhysicalSettings*/, v2);
+        testLogicalCameraPhysicalStream(true/*usePhysicalSettings*/, v2);
+    }
 }
 
 }  // namespace

@@ -1,5 +1,6 @@
 // audio preprocessing wrapper
 package {
+    default_team: "trendy_team_media_framework_audio",
     default_applicable_licenses: [
         "frameworks_av_media_libeffects_preprocessing_license",
     ],
@@ -56,5 +57,39 @@ cc_library {
     srcs: ["PreProcessing.cpp"],
     header_libs: [
         "libwebrtc_absl_headers",
+    ],
+}
+
+cc_library_shared {
+    name: "libpreprocessingaidl",
+    srcs: [
+        ":effectCommonFile",
+        "aidl/EffectPreProcessing.cpp",
+        "aidl/PreProcessingContext.cpp",
+    ],
+    defaults: [
+        "aidlaudioeffectservice_defaults",
+    ],
+    local_include_dirs: ["aidl"],
+    shared_libs: [
+        "libaudioutils",
+        "liblog",
+        "libutils",
+    ],
+    static_libs: [
+        "webrtc_audio_processing",
+    ],
+    header_libs: [
+        "libaudioeffects",
+        "libhardware_headers",
+        "libwebrtc_absl_headers",
+    ],
+    cflags: [
+        "-Wno-unused-parameter",
+        "-Wthread-safety",
+    ],
+    relative_install_path: "soundfx",
+    visibility: [
+        "//hardware/interfaces/audio/aidl/default:__subpackages__",
     ],
 }

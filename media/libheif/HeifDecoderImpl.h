@@ -54,6 +54,8 @@ public:
 
     size_t skipScanlines(size_t count) override;
 
+    uint32_t getColorDepth() override;
+
 private:
     struct DecodeThread;
 
@@ -69,6 +71,8 @@ private:
     bool mHasImage;
     bool mHasVideo;
     size_t mSequenceLength;
+
+    Mutex mRetrieverLock;
 
     // Slice decoding only
     Mutex mLock;

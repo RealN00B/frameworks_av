@@ -28,6 +28,7 @@ package {
 cc_test {
     name: "ExtractorFactoryTest",
     gtest: true,
+    test_suites: ["device-tests"],
 
     srcs: [
         "ExtractorFactoryTest.cpp",
@@ -48,10 +49,6 @@ cc_test {
     static_libs: [
         "libstagefright",
         "libstagefright_foundation",
-    ],
-
-    include_dirs: [
-        "frameworks/av/media/libstagefright",
     ],
 
     // TODO: (b/150181583)

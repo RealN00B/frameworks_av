@@ -75,6 +75,14 @@ struct MediaCodecList : public BnMediaCodecList {
             uint32_t flags,
             Vector<AString> *matchingCodecs);
 
+    // add optional format, to further refine matching codecs
+    static void findMatchingCodecs(
+            const char *mime,
+            bool createEncoder,
+            uint32_t flags,
+            const sp<AMessage> &format,
+            Vector<AString> *matchingCodecs);
+
     static bool isSoftwareCodec(const AString &componentName);
 
 private:
@@ -105,6 +113,11 @@ private:
 
     MediaCodecList(const MediaCodecList&) = delete;
     MediaCodecList& operator=(const MediaCodecList&) = delete;
+
+    static bool codecHandlesFormat(
+            const char *mime,
+            const sp<MediaCodecInfo> &info,
+            const sp<AMessage> &format);
 };
 
 }  // namespace android

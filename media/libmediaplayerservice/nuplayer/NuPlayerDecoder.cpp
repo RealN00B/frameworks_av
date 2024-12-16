@@ -40,9 +40,14 @@
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/SurfaceUtils.h>
+#include <mpeg2ts/ATSParser.h>
 #include <gui/Surface.h>
 
-#include "ATSParser.h"
+#define ATRACE_TAG ATRACE_TAG_AUDIO
+#include <utils/Trace.h>
+
+#include <android-base/stringprintf.h>
+using ::android::base::StringPrintf;
 
 namespace android {
 
@@ -158,7 +163,10 @@ void NuPlayer::Decoder::onMessageReceived(const sp<AMessage> &msg) {
                     int32_t index;
                     CHECK(msg->findInt32("index", &index));
 
+                    ATRACE_BEGIN(StringPrintf("Nuplayer::handleAnInputBuffer [%s]",
+                                              mIsAudio ? "audio" : "video").c_str());
                     handleAnInputBuffer(index);
+                    ATRACE_END();
                     break;
                 }
 
@@ -176,7 +184,10 @@ void NuPlayer::Decoder::onMessageReceived(const sp<AMessage> &msg) {
                     CHECK(msg->findInt64("timeUs", &timeUs));
                     CHECK(msg->findInt32("flags", &flags));
 
+                    ATRACE_BEGIN(StringPrintf("Nuplayer::handleAnOutputBuffer [%s]",
+                                              mIsAudio ? "audio" : "video").c_str());
                     handleAnOutputBuffer(index, offset, size, timeUs, flags);
+                    ATRACE_END();
                     break;
                 }
 
@@ -185,7 +196,10 @@ void NuPlayer::Decoder::onMessageReceived(const sp<AMessage> &msg) {
                     sp<AMessage> format;
                     CHECK(msg->findMessage("format", &format));
 
+                    ATRACE_BEGIN(StringPrintf("Nuplayer::handleOutputFormatChange [%s]",
+                                              mIsAudio ? "audio" : "video").c_str());
                     handleOutputFormatChange(format);
+                    ATRACE_END();
                     break;
                 }
 
@@ -206,15 +220,16 @@ void NuPlayer::Decoder::onMessageReceived(const sp<AMessage> &msg) {
                     break;
                 }
             }
-
             break;
         }
 
         case kWhatRenderBuffer:
         {
+            ATRACE_BEGIN("Nuplayer::onRenderBuffer");
             if (!isStaleReply(msg)) {
                 onRenderBuffer(msg);
             }
+            ATRACE_END();
             break;
         }
 
@@ -302,7 +317,7 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
     ALOGV("[%s] onConfigure (surface=%p)", mComponentName.c_str(), mSurface.get());
 
     mCodec = MediaCodec::CreateByType(
-            mCodecLooper, mime.c_str(), false /* encoder */, NULL /* err */, mPid, mUid);
+            mCodecLooper, mime.c_str(), false /* encoder */, NULL /* err */, mPid, mUid, format);
     int32_t secure = 0;
     if (format->findInt32("secure", &secure) && secure != 0) {
         if (mCodec != NULL) {
@@ -458,6 +473,14 @@ void NuPlayer::Decoder::onSetParameters(const sp<AMessage> &params) {
 
         sp<AMessage> codecParams = new AMessage();
         codecParams->setFloat("operating-rate", decodeFrameRate * mPlaybackSpeed);
+        mCodec->setParameters(codecParams);
+    }
+
+    int32_t videoScalingMode;
+    if (params->findInt32("android._video-scaling", &videoScalingMode)
+            && mCodec != NULL) {
+        sp<AMessage> codecParams = new AMessage();
+        codecParams->setInt32("android._video-scaling", videoScalingMode);
         mCodec->setParameters(codecParams);
     }
 }
@@ -1105,14 +1128,14 @@ bool NuPlayer::Decoder::onInputBufferFetched(const sp<AMessage> &msg) {
                         static_cast<MediaBufferHolder*>(holder.get())->mediaBuffer() : nullptr;
                 }
                 if (mediaBuf != NULL) {
-                    if (mediaBuf->size() > codecBuffer->capacity()) {
+                    if (mediaBuf->range_length() > codecBuffer->capacity()) {
                         handleError(ERROR_BUFFER_TOO_SMALL);
                         mDequeuedInputBuffers.push_back(bufferIx);
                         return false;
                     }
 
-                    codecBuffer->setRange(0, mediaBuf->size());
-                    memcpy(codecBuffer->data(), mediaBuf->data(), mediaBuf->size());
+                    codecBuffer->setRange(0, mediaBuf->range_length());
+                    memcpy(codecBuffer->data(), mediaBuf->data(), mediaBuf->range_length());
 
                     MetaDataBase &meta_data = mediaBuf->meta_data();
                     cryptInfo = NuPlayerDrm::getSampleCryptoInfo(meta_data);

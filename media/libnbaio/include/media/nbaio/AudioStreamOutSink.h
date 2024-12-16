@@ -17,7 +17,9 @@
 #ifndef ANDROID_AUDIO_STREAM_OUT_SINK_H
 #define ANDROID_AUDIO_STREAM_OUT_SINK_H
 
+#include <audio_utils/MelProcessor.h>
 #include <media/nbaio/NBAIO.h>
+#include <mediautils/Synchronization.h>
 
 namespace android {
 
@@ -42,15 +44,15 @@ public:
     //virtual size_t framesUnderrun() const;
     //virtual size_t underruns() const;
 
-    // This is an over-estimate, and could dupe the caller into making a blocking write()
-    // FIXME Use an audio HAL API to query the buffer emptying status when it's available.
-    virtual ssize_t availableToWrite() { return mStreamBufferSizeBytes / mFrameSize; }
-
     virtual ssize_t write(const void *buffer, size_t count);
 
     virtual status_t getTimestamp(ExtendedTimestamp &timestamp);
 
     // NBAIO_Sink end
+
+    void startMelComputation(const sp<audio_utils::MelProcessor>& processor);
+
+    void stopMelComputation();
 
 #if 0   // until necessary
     sp<StreamOutHalInterface> stream() const { return mStream; }
@@ -59,6 +61,7 @@ public:
 private:
     sp<StreamOutHalInterface> mStream;
     size_t              mStreamBufferSizeBytes; // as reported by get_buffer_size()
+    mediautils::atomic_sp<audio_utils::MelProcessor> mMelProcessor;
 };
 
 }   // namespace android

@@ -29,57 +29,34 @@
 #include "binding/SharedMemoryParcelable.h"
 #include "binding/SharedRegionParcelable.h"
 
-using android::NO_ERROR;
 using android::status_t;
-using android::Parcel;
-using android::Parcelable;
 
 using namespace aaudio;
 
-SharedRegionParcelable::SharedRegionParcelable() {}
-SharedRegionParcelable::~SharedRegionParcelable() {}
+SharedRegionParcelable::SharedRegionParcelable(const SharedRegion& parcelable)
+        : mSharedMemoryIndex(parcelable.sharedMemoryIndex),
+          mOffsetInBytes(parcelable.offsetInBytes),
+          mSizeInBytes(parcelable.sizeInBytes) {}
 
-void SharedRegionParcelable::setup(int32_t sharedMemoryIndex,
-                                   int32_t offsetInBytes,
-                                   int32_t sizeInBytes) {
-    mSharedMemoryIndex = sharedMemoryIndex;
-    mOffsetInBytes = offsetInBytes;
-    mSizeInBytes = sizeInBytes;
+SharedRegion SharedRegionParcelable::parcelable() const {
+    SharedRegion result;
+    result.sharedMemoryIndex = mSharedMemoryIndex;
+    result.offsetInBytes = mOffsetInBytes;
+    result.sizeInBytes = mSizeInBytes;
+    return result;
 }
 
-status_t SharedRegionParcelable::writeToParcel(Parcel* parcel) const {
-    status_t status = AAudioConvert_aaudioToAndroidStatus(validate());
-    if (status != NO_ERROR) goto error;
-
-    status = parcel->writeInt32(mSizeInBytes);
-    if (status != NO_ERROR) goto error;
-    if (mSizeInBytes > 0) {
-        status = parcel->writeInt32(mSharedMemoryIndex);
-        if (status != NO_ERROR) goto error;
-        status = parcel->writeInt32(mOffsetInBytes);
-        if (status != NO_ERROR) goto error;
-    }
-    return NO_ERROR;
-
-error:
-    ALOGE("%s returning %d", __func__, status);
-    return status;
+void SharedRegionParcelable::setup(MemoryInfoTuple memoryInfoTuple) {
+    mSharedMemoryIndex = std::get<MEMORY_INDEX>(memoryInfoTuple);
+    mOffsetInBytes = std::get<OFFSET>(memoryInfoTuple);
+    mSizeInBytes = std::get<SIZE>(memoryInfoTuple);
 }
 
-status_t SharedRegionParcelable::readFromParcel(const Parcel* parcel) {
-    status_t status = parcel->readInt32(&mSizeInBytes);
-    if (status != NO_ERROR) goto error;
-    if (mSizeInBytes > 0) {
-        status = parcel->readInt32(&mSharedMemoryIndex);
-        if (status != NO_ERROR) goto error;
-        status = parcel->readInt32(&mOffsetInBytes);
-        if (status != NO_ERROR) goto error;
-    }
-    return AAudioConvert_aaudioToAndroidStatus(validate());
-
-error:
-    ALOGE("%s returning %d", __func__, status);
-    return status;
+SharedRegionParcelable::MemoryInfoTuple SharedRegionParcelable::getMemoryInfo(
+        const std::map<int32_t, int32_t>* memoryIndexMap) const {
+    return {memoryIndexMap == nullptr ? mSharedMemoryIndex : memoryIndexMap->at(mSharedMemoryIndex),
+            mOffsetInBytes,
+            mSizeInBytes};
 }
 
 aaudio_result_t SharedRegionParcelable::resolve(SharedMemoryParcelable *memoryParcels,

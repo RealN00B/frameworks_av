@@ -74,6 +74,9 @@ prebuilt_etc {
         arm64: {
             src: "seccomp_policy/mediaextractor-arm64.policy",
         },
+        riscv64: {
+            src: "seccomp_policy/mediaextractor-riscv64.policy",
+        },
         x86: {
             src: "seccomp_policy/mediaextractor-x86.policy",
         },
@@ -85,4 +88,26 @@ prebuilt_etc {
         "crash_dump.policy",
         "code_coverage.policy",
     ],
+}
+
+cc_fuzz {
+    name: "mediaextractor_service_fuzzer",
+    shared_libs: [
+        "libmedia",
+        "libmediaextractorservice",
+        "libmediautils",
+        "liblog",
+        "libavservices_minijail",
+    ],
+    defaults: [
+        "service_fuzzer_defaults",
+        "fuzzer_disable_leaks",
+    ],
+    srcs: ["fuzzers/MediaExtractorServiceFuzzer.cpp"],
+    fuzz_config: {
+        cc: [
+            "android-media-playback+bugs@google.com",
+        ],
+        triage_assignee: "waghpawan@google.com",
+    },
 }

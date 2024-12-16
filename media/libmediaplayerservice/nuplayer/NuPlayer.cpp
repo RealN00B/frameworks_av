@@ -35,9 +35,7 @@
 #include "RTSPSource.h"
 #include "StreamingSource.h"
 #include "GenericSource.h"
-#include "TextDescriptions.h"
-
-#include "ATSParser.h"
+#include <timedtext/TextDescriptions.h>
 
 #include <cutils/properties.h>
 
@@ -56,11 +54,13 @@
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
 
+#include <mpeg2ts/ATSParser.h>
+
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/Surface.h>
 
 
-#include "ESDS.h"
+#include <media/esds/ESDS.h>
 #include <media/stagefright/Utils.h>
 
 namespace android {
@@ -370,7 +370,7 @@ status_t NuPlayer::setBufferingSettings(const BufferingSettings& buffering) {
 }
 
 void NuPlayer::setDataSourceAsync(const String8& rtpParams) {
-    ALOGD("setDataSourceAsync for RTP = %s", rtpParams.string());
+    ALOGD("setDataSourceAsync for RTP = %s", rtpParams.c_str());
     sp<AMessage> msg = new AMessage(kWhatSetDataSource, this);
 
     sp<AMessage> notify = new AMessage(kWhatSourceNotify, this);
@@ -555,6 +555,13 @@ void NuPlayer::writeTrackInfo(
         reply->writeInt32(isAuto);
         reply->writeInt32(isDefault);
         reply->writeInt32(isForced);
+    } else if (trackType == MEDIA_TRACK_TYPE_AUDIO) {
+        int32_t hapticChannelCount;
+        bool hasHapticChannels = format->findInt32("haptic-channel-count", &hapticChannelCount);
+        reply->writeInt32(hasHapticChannels);
+        if (hasHapticChannels) {
+            reply->writeInt32(hapticChannelCount);
+        }
     }
 }
 
@@ -871,10 +878,12 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
             readFromAMessage(msg, &rate);
             status_t err = OK;
             if (mRenderer != NULL) {
-                // AudioSink allows only 1.f and 0.f for offload mode.
-                // For other speed, switch to non-offload mode.
-                if (mOffloadAudio && ((rate.mSpeed != 0.f && rate.mSpeed != 1.f)
-                        || rate.mPitch != 1.f)) {
+                // AudioSink allows only 1.f and 0.f for offload and direct modes.
+                // For other speeds, restart audio to fallback to supported paths
+                bool audioDirectOutput = (mAudioSink->getFlags() & AUDIO_OUTPUT_FLAG_DIRECT) != 0;
+                if ((mOffloadAudio || audioDirectOutput) &&
+                        ((rate.mSpeed != 0.f && rate.mSpeed != 1.f) || rate.mPitch != 1.f)) {
+
                     int64_t currentPositionUs;
                     if (getCurrentPosition(&currentPositionUs) != OK) {
                         currentPositionUs = mPreviousSeekTimeUs;
@@ -1218,7 +1227,11 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                             notifyListener(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, err);
                         } else {
                             // Only audio track has error. Video track could be still good to play.
-                            notifyListener(MEDIA_INFO, MEDIA_INFO_PLAY_AUDIO_ERROR, err);
+                            if (mVideoEOS) {
+                                notifyListener(MEDIA_PLAYBACK_COMPLETE, 0, 0);
+                            } else {
+                                notifyListener(MEDIA_INFO, MEDIA_INFO_PLAY_AUDIO_ERROR, err);
+                            }
                         }
                         mAudioDecoderError = true;
                     } else {
@@ -1229,7 +1242,11 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                             notifyListener(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, err);
                         } else {
                             // Only video track has error. Audio track could be still good to play.
-                            notifyListener(MEDIA_INFO, MEDIA_INFO_PLAY_VIDEO_ERROR, err);
+                            if (mAudioEOS) {
+                                notifyListener(MEDIA_PLAYBACK_COMPLETE, 0, 0);
+                            } else {
+                                notifyListener(MEDIA_INFO, MEDIA_INFO_PLAY_VIDEO_ERROR, err);
+                            }
                         }
                         mVideoDecoderError = true;
                     }
@@ -1960,6 +1977,8 @@ status_t NuPlayer::instantiateDecoder(
         if (rate > 0) {
             format->setFloat("operating-rate", rate * mPlaybackSettings.mSpeed);
         }
+
+        format->setInt32("android._video-scaling", mVideoScalingMode);
     }
 
     Mutex::Autolock autoLock(mDecoderLock);
@@ -2079,9 +2098,12 @@ void NuPlayer::updateVideoSize(
              displayHeight,
              cropLeft, cropTop);
     } else {
-        CHECK(inputFormat->findInt32("width", &displayWidth));
-        CHECK(inputFormat->findInt32("height", &displayHeight));
-
+        if (!inputFormat->findInt32("width", &displayWidth)
+            || !inputFormat->findInt32("height", &displayHeight)) {
+            ALOGW("Either video width or video height missing, reporting 0x0!");
+            notifyListener(MEDIA_SET_VIDEO_SIZE, 0, 0);
+            return;
+        }
         ALOGV("Video input format %d x %d", displayWidth, displayHeight);
     }
 
@@ -2206,6 +2228,11 @@ status_t NuPlayer::setVideoScalingMode(int32_t mode) {
             ALOGE("Failed to set scaling mode (%d): %s",
                 -ret, strerror(-ret));
             return ret;
+        }
+        if (mVideoDecoder != NULL) {
+            sp<AMessage> params = new AMessage();
+            params->setInt32("android._video-scaling", mode);
+            mVideoDecoder->setParameters(params);
         }
     }
     return OK;
@@ -2891,6 +2918,38 @@ void NuPlayer::sendIMSRxNotice(const sp<AMessage> &msg) {
             in.writeInt32(recvTimeUs & 0xFFFFFFFF);
             break;
         }
+        case ARTPSource::RTCP_RR:
+        {
+            int64_t recvTimeUs;
+            int32_t senderId;
+            int32_t ssrc;
+            int32_t fraction;
+            int32_t lost;
+            int32_t lastSeq;
+            int32_t jitter;
+            int32_t lsr;
+            int32_t dlsr;
+            CHECK(msg->findInt64("recv-time-us", &recvTimeUs));
+            CHECK(msg->findInt32("rtcp-rr-ssrc", &senderId));
+            CHECK(msg->findInt32("rtcp-rrb-ssrc", &ssrc));
+            CHECK(msg->findInt32("rtcp-rrb-fraction", &fraction));
+            CHECK(msg->findInt32("rtcp-rrb-lost", &lost));
+            CHECK(msg->findInt32("rtcp-rrb-lastSeq", &lastSeq));
+            CHECK(msg->findInt32("rtcp-rrb-jitter", &jitter));
+            CHECK(msg->findInt32("rtcp-rrb-lsr", &lsr));
+            CHECK(msg->findInt32("rtcp-rrb-dlsr", &dlsr));
+            in.writeInt32(recvTimeUs >> 32);
+            in.writeInt32(recvTimeUs & 0xFFFFFFFF);
+            in.writeInt32(senderId);
+            in.writeInt32(ssrc);
+            in.writeInt32(fraction);
+            in.writeInt32(lost);
+            in.writeInt32(lastSeq);
+            in.writeInt32(jitter);
+            in.writeInt32(lsr);
+            in.writeInt32(dlsr);
+            break;
+        }
         case ARTPSource::RTCP_TSFB:   // RTCP TSFB
         case ARTPSource::RTCP_PSFB:   // RTCP PSFB
         case ARTPSource::RTP_AUTODOWN:
@@ -2981,6 +3040,16 @@ const char *NuPlayer::getDataSourceType() {
         default:
             return "None";
     }
+ }
+
+ void NuPlayer::dump(AString& logString) {
+    logString.append("renderer(");
+    if (mRenderer != nullptr) {
+        mRenderer->dump(logString);
+    } else {
+        logString.append("null");
+    }
+    logString.append(")");
  }
 
 // Modular DRM begin

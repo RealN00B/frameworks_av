@@ -41,7 +41,8 @@ class AudioInputDescriptor: public AudioPortConfig,
 {
 public:
     AudioInputDescriptor(const sp<IOProfile>& profile,
-                         AudioPolicyClientInterface *clientInterface);
+                         AudioPolicyClientInterface *clientInterface,
+                         bool isPreemptor);
 
     virtual ~AudioInputDescriptor() = default;
 
@@ -54,7 +55,7 @@ public:
     DeviceVector supportedDevices() const  {
         return mProfile != nullptr ? mProfile->getSupportedDevices() :  DeviceVector(); }
 
-    void dump(String8 *dst) const override;
+    void dump(String8 *dst, int spaces, const char* extraInfo) const override;
 
     audio_io_handle_t   mIoHandle = AUDIO_IO_HANDLE_NONE; // input handle
     wp<AudioPolicyMix>  mPolicyMix;                   // non NULL when used by a dynamic policy
@@ -72,7 +73,7 @@ public:
             const struct audio_port_config *srcConfig = NULL) const;
     virtual sp<AudioPort> getAudioPort() const { return mProfile; }
 
-    void toAudioPort(struct audio_port *port) const;
+    void toAudioPort(struct audio_port_v7 *port) const;
     void setPreemptedSessions(const SortedVector<audio_session_t>& sessions);
     SortedVector<audio_session_t> getPreemptedSessions() const;
     bool hasPreemptedSession(audio_session_t session) const;
@@ -93,8 +94,10 @@ public:
     audio_patch_handle_t getPatchHandle() const override;
     void setPatchHandle(audio_patch_handle_t handle) override;
     bool isMmap() override {
-        if (getPolicyAudioPort() != nullptr) {
-            return getPolicyAudioPort()->isMmap();
+        if (const auto policyPort = getPolicyAudioPort(); policyPort != nullptr) {
+            if (const auto port = policyPort->asAudioPort(); port != nullptr) {
+                return port->isMmap();
+            }
         }
         return false;
     }
@@ -125,6 +128,8 @@ public:
     // active use case
     void checkSuspendEffects();
 
+    bool isPreemptor() const { return mIsPreemptor; }
+
  private:
 
     void updateClientRecordingConfiguration(int event, const sp<RecordClientDescriptor>& client);
@@ -142,6 +147,8 @@ public:
     AudioPolicyClientInterface * const mClientInterface;
     int32_t mGlobalActiveCount = 0;  // non-client-specific activity ref count
     EffectDescriptorCollection mEnabledEffects;
+    audio_input_flags_t& mFlags = AudioPortConfig::mFlags.input;
+    bool mIsPreemptor; // true if this input was opened after preemting another one
 };
 
 class AudioInputCollection :

@@ -21,15 +21,16 @@
 
 #include "NdkImagePriv.h"
 #include "NdkImageReaderPriv.h"
-#include <private/media/NdkImage.h>
 
-#include <cutils/atomic.h>
-#include <utils/Log.h>
 #include <android_media_Utils.h>
-#include <ui/PublicFormat.h>
-#include <private/android/AHardwareBufferHelpers.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <grallocusage/GrallocUsageConversion.h>
 #include <gui/bufferqueue/1.0/WGraphicBufferProducer.h>
+#include <private/android/AHardwareBufferHelpers.h>
+#include <ui/PublicFormat.h>
+#include <utils/Log.h>
+
+#include <cutils/atomic.h>
 
 using namespace android;
 
@@ -47,6 +48,9 @@ const char* AImageReader::kGraphicBufferKey = "GraphicBuffer";
 
 static constexpr int kWindowHalTokenSizeMax = 256;
 
+static media_status_t validateParameters(int32_t width, int32_t height, int32_t format,
+                                         uint64_t usage, int32_t maxImages,
+                                         /*out*/ AImageReader**& reader);
 static native_handle_t *convertHalTokenToNativeHandle(const HalToken &halToken);
 
 bool
@@ -73,6 +77,8 @@ AImageReader::isSupportedFormatAndUsage(int32_t format, uint64_t usage) {
         case AIMAGE_FORMAT_Y8:
         case AIMAGE_FORMAT_HEIC:
         case AIMAGE_FORMAT_DEPTH_JPEG:
+        case AIMAGE_FORMAT_RAW_DEPTH10:
+        case HAL_PIXEL_FORMAT_YCBCR_P010:
             return true;
         case AIMAGE_FORMAT_PRIVATE:
             // For private format, cpu usage is prohibited.
@@ -86,6 +92,7 @@ int
 AImageReader::getNumPlanesForFormat(int32_t format) {
     switch (format) {
         case AIMAGE_FORMAT_YUV_420_888:
+        case HAL_PIXEL_FORMAT_YCBCR_P010:
             return 3;
         case AIMAGE_FORMAT_RGBA_8888:
         case AIMAGE_FORMAT_RGBX_8888:
@@ -103,6 +110,7 @@ AImageReader::getNumPlanesForFormat(int32_t format) {
         case AIMAGE_FORMAT_Y8:
         case AIMAGE_FORMAT_HEIC:
         case AIMAGE_FORMAT_DEPTH_JPEG:
+        case AIMAGE_FORMAT_RAW_DEPTH10:
             return 1;
         case AIMAGE_FORMAT_PRIVATE:
             return 0;
@@ -262,13 +270,17 @@ AImageReader::AImageReader(int32_t width,
                            int32_t height,
                            int32_t format,
                            uint64_t usage,
-                           int32_t maxImages)
+                           int32_t maxImages,
+                           uint32_t hardwareBufferFormat,
+                           android_dataspace dataSpace)
     : mWidth(width),
       mHeight(height),
       mFormat(format),
       mUsage(usage),
       mMaxImages(maxImages),
       mNumPlanes(getNumPlanesForFormat(format)),
+      mHalFormat(hardwareBufferFormat),
+      mHalDataSpace(dataSpace),
       mFrameListener(new FrameListener(this)),
       mBufferRemovedListener(new BufferRemovedListener(this)) {}
 
@@ -279,27 +291,32 @@ AImageReader::~AImageReader() {
 
 media_status_t
 AImageReader::init() {
-    PublicFormat publicFormat = static_cast<PublicFormat>(mFormat);
-    mHalFormat = mapPublicFormatToHalFormat(publicFormat);
-    mHalDataSpace = mapPublicFormatToHalDataspace(publicFormat);
     mHalUsage = AHardwareBuffer_convertToGrallocUsageBits(mUsage);
 
+#if !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     sp<IGraphicBufferProducer> gbProducer;
     sp<IGraphicBufferConsumer> gbConsumer;
     BufferQueue::createBufferQueue(&gbProducer, &gbConsumer);
+#endif  // !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     String8 consumerName = String8::format("ImageReader-%dx%df%xu%" PRIu64 "m%d-%d-%d",
             mWidth, mHeight, mFormat, mUsage, mMaxImages, getpid(),
             createProcessUniqueId());
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mBufferItemConsumer = new BufferItemConsumer(mHalUsage, mMaxImages, /*controlledByApp*/ true);
+#else
     mBufferItemConsumer =
             new BufferItemConsumer(gbConsumer, mHalUsage, mMaxImages, /*controlledByApp*/ true);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     if (mBufferItemConsumer == nullptr) {
         ALOGE("Failed to allocate BufferItemConsumer");
         return AMEDIA_ERROR_UNKNOWN;
     }
 
+#if !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     mProducer = gbProducer;
+#endif  // !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     mBufferItemConsumer->setName(consumerName);
     mBufferItemConsumer->setFrameAvailableListener(mFrameListener);
     mBufferItemConsumer->setBufferFreedListener(mBufferRemovedListener);
@@ -321,10 +338,18 @@ AImageReader::init() {
         return AMEDIA_ERROR_UNKNOWN;
     }
     if (mUsage & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT) {
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mBufferItemConsumer->setConsumerIsProtected(true);
+#else
         gbConsumer->setConsumerIsProtected(true);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     }
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mSurface = mBufferItemConsumer->getSurface();
+#else
     mSurface = new Surface(mProducer, /*controlledByApp*/true);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     if (mSurface == nullptr) {
         ALOGE("Failed to create surface");
         return AMEDIA_ERROR_UNKNOWN;
@@ -337,7 +362,7 @@ AImageReader::init() {
     }
 
     mCbLooper = new ALooper;
-    mCbLooper->setName(consumerName.string());
+    mCbLooper->setName(consumerName.c_str());
     res = mCbLooper->start(
             /*runOnCallingThread*/false,
             /*canCallJava*/       true,
@@ -563,13 +588,21 @@ AImageReader::releaseImageLocked(AImage* image, int releaseFenceFd, bool clearCa
     }
 }
 
+// The LL-NDK API is now deprecated. New devices will no longer have the token
+// manager service installed, so createHalToken will return false and this
+// will return AMEDIA_ERROR_UNKNOWN on those devices.
 media_status_t AImageReader::getWindowNativeHandle(native_handle **handle) {
     if (mWindowHandle != nullptr) {
         *handle = mWindowHandle;
         return AMEDIA_OK;
     }
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    sp<HGraphicBufferProducer> hgbp = new TWGraphicBufferProducer<HGraphicBufferProducer>(
+            mSurface->getIGraphicBufferProducer());
+#else
     sp<HGraphicBufferProducer> hgbp =
         new TWGraphicBufferProducer<HGraphicBufferProducer>(mProducer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     HalToken halToken;
     if (!createHalToken(hgbp, &halToken)) {
         return AMEDIA_ERROR_UNKNOWN;
@@ -645,6 +678,41 @@ AImageReader::acquireLatestImage(/*out*/AImage** image, /*out*/int* acquireFence
     }
 }
 
+static
+media_status_t validateParameters(int32_t width, int32_t height, int32_t format,
+                                  uint64_t usage, int32_t maxImages,
+                                  /*out*/ AImageReader**& reader) {
+    if (reader == nullptr) {
+        ALOGE("%s: reader argument is null", __FUNCTION__);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (width < 1 || height < 1) {
+        ALOGE("%s: image dimension must be positive: w:%d h:%d",
+                __FUNCTION__, width, height);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (maxImages < 1) {
+        ALOGE("%s: max outstanding image count must be at least 1 (%d)",
+                __FUNCTION__, maxImages);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (maxImages > BufferQueueDefs::NUM_BUFFER_SLOTS) {
+        ALOGE("%s: max outstanding image count (%d) cannot be larget than %d.",
+              __FUNCTION__, maxImages, BufferQueueDefs::NUM_BUFFER_SLOTS);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (!AImageReader::isSupportedFormatAndUsage(format, usage)) {
+        ALOGE("%s: format %d is not supported with usage 0x%" PRIx64 " by AImageReader",
+                __FUNCTION__, format, usage);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+    return AMEDIA_OK;
+}
+
 static native_handle_t *convertHalTokenToNativeHandle(
         const HalToken &halToken) {
     // We attempt to store halToken in the ints of the native_handle_t after its
@@ -695,42 +763,32 @@ media_status_t AImageReader_getWindowNativeHandle(
 } //extern "C"
 
 EXPORT
+media_status_t AImageReader_newWithDataSpace(
+        int32_t width, int32_t height, uint64_t usage, int32_t maxImages,
+        uint32_t hardwareBufferFormat, int32_t dataSpace,
+        /*out*/ AImageReader** reader) {
+    ALOGV("%s", __FUNCTION__);
+
+    android_dataspace halDataSpace = static_cast<android_dataspace>(dataSpace);
+    int32_t format = static_cast<int32_t>(
+          mapHalFormatDataspaceToPublicFormat(hardwareBufferFormat, halDataSpace));
+    return AImageReader_newWithUsage(width, height, format, usage, maxImages, reader);
+}
+
+EXPORT
 media_status_t AImageReader_newWithUsage(
         int32_t width, int32_t height, int32_t format, uint64_t usage,
         int32_t maxImages, /*out*/ AImageReader** reader) {
     ALOGV("%s", __FUNCTION__);
 
-    if (width < 1 || height < 1) {
-        ALOGE("%s: image dimension must be positive: w:%d h:%d",
-                __FUNCTION__, width, height);
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    }
+    validateParameters(width, height, format, usage, maxImages, reader);
 
-    if (maxImages < 1) {
-        ALOGE("%s: max outstanding image count must be at least 1 (%d)",
-                __FUNCTION__, maxImages);
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    }
-
-    if (maxImages > BufferQueueDefs::NUM_BUFFER_SLOTS) {
-        ALOGE("%s: max outstanding image count (%d) cannot be larget than %d.",
-              __FUNCTION__, maxImages, BufferQueueDefs::NUM_BUFFER_SLOTS);
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    }
-
-    if (!AImageReader::isSupportedFormatAndUsage(format, usage)) {
-        ALOGE("%s: format %d is not supported with usage 0x%" PRIx64 " by AImageReader",
-                __FUNCTION__, format, usage);
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    }
-
-    if (reader == nullptr) {
-        ALOGE("%s: reader argument is null", __FUNCTION__);
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    }
+    PublicFormat publicFormat = static_cast<PublicFormat>(format);
+    uint32_t halFormat = mapPublicFormatToHalFormat(publicFormat);
+    android_dataspace halDataSpace = mapPublicFormatToHalDataspace(publicFormat);
 
     AImageReader* tmpReader = new AImageReader(
-        width, height, format, usage, maxImages);
+        width, height, format, usage, maxImages, halFormat, halDataSpace);
     if (tmpReader == nullptr) {
         ALOGE("%s: AImageReader allocation failed", __FUNCTION__);
         return AMEDIA_ERROR_UNKNOWN;

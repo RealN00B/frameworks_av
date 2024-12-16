@@ -21,24 +21,23 @@
 #include <aaudio/AAudio.h>
 
 #include "binding/AAudioServiceInterface.h"
-#include "client/AAudioFlowGraph.h"
 #include "client/AudioStreamInternal.h"
 
 using android::sp;
-using android::IAAudioService;
 
 namespace aaudio {
 
 class AudioStreamInternalPlay : public AudioStreamInternal {
 public:
-    AudioStreamInternalPlay(AAudioServiceInterface  &serviceInterface, bool inService = false);
-    virtual ~AudioStreamInternalPlay();
+    explicit AudioStreamInternalPlay(AAudioServiceInterface  &serviceInterface,
+                                     bool inService = false);
+    virtual ~AudioStreamInternalPlay() = default;
 
     aaudio_result_t open(const AudioStreamBuilder &builder) override;
 
-    aaudio_result_t requestPause() override;
+    aaudio_result_t requestPause_l() override;
 
-    aaudio_result_t requestFlush() override;
+    aaudio_result_t requestFlush_l() override;
 
     bool isFlushSupported() const override {
         // Only implement FLUSH for OUTPUT streams.
@@ -65,7 +64,11 @@ public:
 
 protected:
 
-    void advanceClientToMatchServerPosition() override;
+    void prepareBuffersForStart() override;
+
+    void prepareBuffersForStop() override;
+
+    void advanceClientToMatchServerPosition(int32_t serverMargin) override;
 
     void onFlushFromServer() override;
 
@@ -87,12 +90,10 @@ private:
      * Asynchronous write with data conversion.
      * @param buffer
      * @param numFrames
-     * @return fdrames written or negative error
+     * @return frames written or negative error
      */
     aaudio_result_t writeNowWithConversion(const void *buffer,
                                            int32_t numFrames);
-
-    AAudioFlowGraph          mFlowGraph;
 
 };
 

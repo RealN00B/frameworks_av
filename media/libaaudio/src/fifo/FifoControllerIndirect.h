@@ -27,7 +27,7 @@ namespace android {
 /**
  * A FifoControllerBase with counters external to the class.
  *
- * The actual copunters may be stored in separate regions of shared memory
+ * The actual counters may be stored in separate regions of shared memory
  * with different access rights.
  */
 class FifoControllerIndirect : public FifoControllerBase {
@@ -44,7 +44,7 @@ public:
         setReadCounter(0);
         setWriteCounter(0);
     }
-    virtual ~FifoControllerIndirect() {};
+    virtual ~FifoControllerIndirect() = default;
 
     // TODO review use of memory barriers, probably incorrect
     virtual fifo_counter_t getReadCounter() override {
@@ -68,6 +68,6 @@ private:
     std::atomic<fifo_counter_t> * mWriteCounterAddress;
 };
 
-}  // android
+}  // namespace android
 
 #endif //FIFO_FIFO_CONTROLLER_INDIRECT_H

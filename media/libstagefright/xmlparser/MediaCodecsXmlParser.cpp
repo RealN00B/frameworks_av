@@ -19,6 +19,8 @@
 
 #include <media/stagefright/xmlparser/MediaCodecsXmlParser.h>
 
+#include <android/api-level.h>
+
 #include <android-base/logging.h>
 #include <android-base/macros.h>
 #include <android-base/properties.h>
@@ -30,6 +32,7 @@
 
 #include <expat.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -146,7 +149,10 @@ std::vector<std::string> MediaCodecsXmlParser::getDefaultXmlNames() {
         };
     static std::vector<std::string> names = {
             prefixes[0] + variants[0] + ".xml",
-            prefixes[1] + variants[1] + ".xml"
+            prefixes[1] + variants[1] + ".xml",
+
+            // shaping information is not currently variant specific.
+            "media_codecs_shaping.xml"
         };
     return names;
 }
@@ -346,6 +352,8 @@ struct MediaCodecsXmlParser::Impl {
         status_t addAlias(const char **attrs);
         status_t addFeature(const char **attrs);
         status_t addLimit(const char **attrs);
+        status_t addMapping(const char **attrs);
+        status_t addTuning(const char **attrs);
         status_t addQuirk(const char **attrs, const char *prefix = nullptr);
         status_t addSetting(const char **attrs, const char *prefix = nullptr);
         status_t enterMediaCodec(const char **attrs, bool encoder);
@@ -355,7 +363,7 @@ struct MediaCodecsXmlParser::Impl {
 
         status_t updateMediaCodec(
                 const char *rank, const StringSet &domain, const StringSet &variants,
-                const char *enabled);
+                const char *enabled, const char *minsdk);
     };
 
     status_t parseXmlFilesInSearchDirs(
@@ -428,7 +436,7 @@ status_t MediaCodecsXmlParser::Impl::parseXmlFilesInSearchDirs(
         if (findFileInDirs(searchDirs, fileName, &path)) {
             err = parseXmlPath(path);
         } else {
-            ALOGD("Cannot find %s", path.c_str());
+            ALOGI("Did not find %s in search path", fileName.c_str());
         }
         res = combineStatus(res, err);
     }
@@ -438,7 +446,7 @@ status_t MediaCodecsXmlParser::Impl::parseXmlFilesInSearchDirs(
 status_t MediaCodecsXmlParser::Impl::parseXmlPath(const std::string &path) {
     std::lock_guard<std::mutex> guard(mLock);
     if (!fileExists(path)) {
-        ALOGD("Cannot find %s", path.c_str());
+        ALOGV("Cannot find %s", path.c_str());
         mParsingStatus = combineStatus(mParsingStatus, NAME_NOT_FOUND);
         return NAME_NOT_FOUND;
     }
@@ -488,6 +496,9 @@ void MediaCodecsXmlParser::Impl::Parser::logAnyErrors(const Result &status) cons
     }
 }
 
+// current SDK for this device; filled in when initializing the parser.
+static int mysdk = 0;
+
 MediaCodecsXmlParser::Impl::Parser::Parser(State *state, std::string path)
     : mState(state),
       mPath(path),
@@ -497,6 +508,20 @@ MediaCodecsXmlParser::Impl::Parser::Parser(State *state, std::string path)
     if (end != std::string::npos) {
         mHrefBase = path.substr(0, end + 1);
     }
+
+#if defined(__ANDROID_API_U__)
+    // this is sdk calculation is intended only for devices >= U
+    static std::once_flag sCheckOnce;
+
+    std::call_once(sCheckOnce, [&](){
+        mysdk = android_get_device_api_level();
+
+        // work around main development branch being on same SDK as the last dessert release.
+        if (__ANDROID_API__ == __ANDROID_API_FUTURE__) {
+            mysdk++;
+        }
+    });
+#endif  // __ANDROID_API_U__
 }
 
 void MediaCodecsXmlParser::Impl::Parser::parseXmlFile() {
@@ -741,13 +766,19 @@ void MediaCodecsXmlParser::Impl::Parser::startElementHandler(
         {
             // ignore limits and features specified outside of type
             if (!mState->inType()
-                    && (strEq(name, "Limit") || strEq(name, "Feature") || strEq(name, "Variant"))) {
+                    && (strEq(name, "Limit") || strEq(name, "Feature")
+                        || strEq(name, "Variant") || strEq(name, "Mapping")
+                        || strEq(name, "Tuning"))) {
                 PLOGD("ignoring %s specified outside of a Type", name);
                 return;
             } else if (strEq(name, "Limit")) {
                 err = addLimit(attrs);
             } else if (strEq(name, "Feature")) {
                 err = addFeature(attrs);
+            } else if (strEq(name, "Mapping")) {
+                err = addMapping(attrs);
+            } else if (strEq(name, "Tuning")) {
+                err = addTuning(attrs);
             } else if (strEq(name, "Variant") && section != SECTION_VARIANT) {
                 err = limitVariants(attrs);
                 mState->enterSection(err == OK ? SECTION_VARIANT : SECTION_UNKNOWN);
@@ -919,6 +950,7 @@ status_t MediaCodecsXmlParser::Impl::Parser::enterMediaCodec(
     const char *a_domain = nullptr;
     const char *a_variant = nullptr;
     const char *a_enabled = nullptr;
+    const char *a_minsdk = nullptr;
 
     size_t i = 0;
     while (attrs[i] != nullptr) {
@@ -942,6 +974,8 @@ status_t MediaCodecsXmlParser::Impl::Parser::enterMediaCodec(
             a_variant = attrs[++i];
         } else if (strEq(attrs[i], "enabled")) {
             a_enabled = attrs[++i];
+        } else if (strEq(attrs[i], "minsdk")) {
+            a_minsdk = attrs[++i];
         } else {
             PLOGD("MediaCodec: ignoring unrecognized attribute '%s'", attrs[i]);
             ++i;
@@ -970,7 +1004,7 @@ status_t MediaCodecsXmlParser::Impl::Parser::enterMediaCodec(
 
     return updateMediaCodec(
             a_rank, parseCommaSeparatedStringSet(a_domain),
-            parseCommaSeparatedStringSet(a_variant), a_enabled);
+            parseCommaSeparatedStringSet(a_variant), a_enabled, a_minsdk);
 }
 
 MediaCodecsXmlParser::Impl::Result
@@ -981,7 +1015,9 @@ MediaCodecsXmlParser::Impl::State::enterMediaCodec(
     TypeMap::iterator typeIt;
     if (codecIt == mData->mCodecMap.end()) { // New codec name
         if (updating) {
-            return { NAME_NOT_FOUND, "MediaCodec: cannot update non-existing codec" };
+            std::string msg = "MediaCodec: cannot update non-existing codec: ";
+            msg = msg + name;
+            return { NAME_NOT_FOUND, msg };
         }
         // Create a new codec in mCodecMap
         codecIt = mData->mCodecMap.insert(Codec(name, CodecProperties())).first;
@@ -994,19 +1030,25 @@ MediaCodecsXmlParser::Impl::State::enterMediaCodec(
         codecIt->second.order = mData->mCodecMap.size();
     } else { // Existing codec name
         if (!updating) {
-            return { ALREADY_EXISTS, "MediaCodec: cannot add existing codec" };
+            std::string msg = "MediaCodec: cannot add existing codec: ";
+            msg = msg + name;
+            return { ALREADY_EXISTS, msg };
         }
         if (type != nullptr) {
             typeIt = codecIt->second.typeMap.find(type);
             if (typeIt == codecIt->second.typeMap.end()) {
-                return { NAME_NOT_FOUND, "MediaCodec: cannot update non-existing type for codec" };
+                std::string msg = "MediaCodec: cannot update non-existing type for codec: ";
+                msg = msg + name;
+                return { NAME_NOT_FOUND, msg };
             }
         } else {
             // This should happen only when the codec has at most one type.
             typeIt = codecIt->second.typeMap.begin();
             if (typeIt == codecIt->second.typeMap.end()
                     || codecIt->second.typeMap.size() != 1) {
-                return { BAD_VALUE, "MediaCodec: cannot update codec without type specified" };
+                std::string msg = "MediaCodec: cannot update codec without type specified: ";
+                msg = msg + name;
+                return { BAD_VALUE, msg };
             }
         }
     }
@@ -1016,7 +1058,7 @@ MediaCodecsXmlParser::Impl::State::enterMediaCodec(
 
 status_t MediaCodecsXmlParser::Impl::Parser::updateMediaCodec(
         const char *rank, const StringSet &domains, const StringSet &variants,
-        const char *enabled) {
+        const char *enabled, const char *minsdk) {
     CHECK(mState->inCodec());
     CodecProperties &codec = mState->codec();
 
@@ -1027,8 +1069,9 @@ status_t MediaCodecsXmlParser::Impl::Parser::updateMediaCodec(
         codec.rank = rank;
     }
 
-    codec.variantSet = variants;
+    codec.variantSet.insert(variants.begin(), variants.end());
 
+    // we allow sets of domains...
     for (const std::string &domain : domains) {
         if (domain.size() && domain.at(0) == '!') {
             codec.domainSet.erase(domain.substr(1));
@@ -1046,6 +1089,49 @@ status_t MediaCodecsXmlParser::Impl::Parser::updateMediaCodec(
             ALOGD("disabling %s", mState->codecName().c_str());
         }
     }
+
+    // evaluate against passed minsdk, with lots of logging to explain the logic
+    //
+    // if current sdk >= minsdk, we want to enable the codec
+    // this OVERRIDES any enabled="true|false" setting on the codec.
+    // (enabled=true minsdk=35 on a sdk 34 device results in a disabled codec)
+    //
+    // Although minsdk is not parsed before Android U, we can carry media_codecs.xml
+    // using this to devices earlier (e.g. as part of mainline). An example is appropriate.
+    //
+    // we have a codec that we want enabled in Android V (sdk=35), so we use:
+    //     <MediaCodec ..... enabled="false" minsdk="35" >
+    //
+    // on Q/R/S/T: it sees enabled=false, but ignores the unrecognized minsdk
+    //     so the codec will be disabled
+    // on U: it sees enabled=false, and sees minsdk=35, but U==34 and 34 < 35
+    //     so the codec will be disabled
+    // on V: it sees enabled=false, and sees minsdk=35, V==35 and 35 >= 35
+    //     so the codec will be enabled
+    //
+    // if we know the XML files will be used only on devices >= U, we can skip the enabled=false
+    // piece.  Android mainline's support horizons say we will be using the enabled=false for
+    // another 4-5 years after U.
+    //
+    if (minsdk != nullptr) {
+        char *p = nullptr;
+        int sdk = strtol(minsdk, &p, 0);
+        if (p == minsdk || sdk < 0) {
+            ALOGE("minsdk parsing '%s' yielded %d, mapping to 0", minsdk, sdk);
+            sdk = 0;
+        }
+        // minsdk="#" means: "enable if sdk is >= #, disable otherwise"
+        if (mysdk < sdk) {
+            ALOGI("codec %s disabled, device sdk %d < required %d",
+                mState->codecName().c_str(), mysdk, sdk);
+            codec.quirkSet.emplace("attribute::disabled");
+        } else {
+            ALOGI("codec %s enabled, device sdk %d >= required %d",
+                mState->codecName().c_str(), mysdk, sdk);
+            codec.quirkSet.erase("attribute::disabled");
+        }
+    }
+
     return OK;
 }
 
@@ -1383,6 +1469,92 @@ status_t MediaCodecsXmlParser::Impl::Parser::addFeature(const char **attrs) {
     }
 
     mState->addDetail(std::string("feature-") + a_name, a_value ? : "0");
+    return OK;
+}
+
+status_t MediaCodecsXmlParser::Impl::Parser::addMapping(const char **attrs) {
+    CHECK(mState->inType());
+    size_t i = 0;
+    const char *a_name = nullptr;
+    const char *a_value = nullptr;
+    const char *a_kind = nullptr;
+
+    while (attrs[i] != nullptr) {
+        CHECK((i & 1) == 0);
+        if (attrs[i + 1] == nullptr) {
+            PLOGD("Mapping: attribute '%s' is null", attrs[i]);
+            return BAD_VALUE;
+        }
+
+        if (strEq(attrs[i], "name")) {
+            a_name = attrs[++i];
+        } else if (strEq(attrs[i], "kind")) {
+            a_kind = attrs[++i];
+        } else if (strEq(attrs[i], "value")) {
+            a_value = attrs[++i];
+        } else {
+            PLOGD("Mapping: ignoring unrecognized attribute '%s'", attrs[i]);
+            ++i;
+        }
+        ++i;
+    }
+
+    // Every mapping must have all 3 fields
+    if (a_name == nullptr) {
+        PLOGD("Mapping with no 'name' attribute");
+        return BAD_VALUE;
+    }
+
+    if (a_kind == nullptr) {
+        PLOGD("Mapping with no 'kind' attribute");
+        return BAD_VALUE;
+    }
+
+    if (a_value == nullptr) {
+        PLOGD("Mapping with no 'value' attribute");
+        return BAD_VALUE;
+    }
+
+    mState->addDetail(std::string("mapping-") + a_kind + "-" + a_name, a_value);
+    return OK;
+}
+
+status_t MediaCodecsXmlParser::Impl::Parser::addTuning(const char **attrs) {
+    CHECK(mState->inType());
+    size_t i = 0;
+    const char *a_name = nullptr;
+    const char *a_value = nullptr;
+
+    while (attrs[i] != nullptr) {
+        CHECK((i & 1) == 0);
+        if (attrs[i + 1] == nullptr) {
+            PLOGD("Mapping: attribute '%s' is null", attrs[i]);
+            return BAD_VALUE;
+        }
+
+        if (strEq(attrs[i], "name")) {
+            a_name = attrs[++i];
+        } else if (strEq(attrs[i], "value")) {
+            a_value = attrs[++i];
+        } else {
+            PLOGD("Tuning: ignoring unrecognized attribute '%s'", attrs[i]);
+            ++i;
+        }
+        ++i;
+    }
+
+    // Every tuning must have both fields
+    if (a_name == nullptr) {
+        PLOGD("Tuning with no 'name' attribute");
+        return BAD_VALUE;
+    }
+
+    if (a_value == nullptr) {
+        PLOGD("Tuning with no 'value' attribute");
+        return BAD_VALUE;
+    }
+
+    mState->addDetail(std::string("tuning-") + a_name, a_value);
     return OK;
 }
 

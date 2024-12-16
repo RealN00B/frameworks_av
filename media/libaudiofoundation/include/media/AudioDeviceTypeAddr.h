@@ -19,9 +19,11 @@
 #include <string>
 #include <vector>
 
+#include <android/media/audio/common/AudioDevice.h>
 #include <binder/Parcelable.h>
 #include <binder/Parcel.h>
 #include <media/AudioContainers.h>
+#include <media/AidlConversionUtil.h>
 #include <system/audio.h>
 #include <utils/Errors.h>
 
@@ -30,6 +32,7 @@ namespace android {
 class AudioDeviceTypeAddr : public Parcelable {
 public:
     AudioDeviceTypeAddr() = default;
+    AudioDeviceTypeAddr(const AudioDeviceTypeAddr&) = default;
 
     AudioDeviceTypeAddr(audio_devices_t type, const std::string& address);
 
@@ -81,7 +84,21 @@ AudioDeviceTypeAddrVector excludeDeviceTypeAddrsFrom(
         const AudioDeviceTypeAddrVector& devices,
         const AudioDeviceTypeAddrVector& devicesToExclude);
 
+/**
+ * Return a collection of AudioDeviceTypeAddrs that is the union of `devices` and
+ * `devicesToJoin`
+ */
+AudioDeviceTypeAddrVector joinDeviceTypeAddrs(
+        const AudioDeviceTypeAddrVector& devices,
+        const AudioDeviceTypeAddrVector& devicesToJoin);
+
 std::string dumpAudioDeviceTypeAddrVector(const AudioDeviceTypeAddrVector& deviceTypeAddrs,
                                           bool includeSensitiveInfo=false);
+
+// Conversion routines, according to AidlConversion.h conventions.
+ConversionResult<AudioDeviceTypeAddr>
+aidl2legacy_AudioDeviceTypeAddress(const media::audio::common::AudioDevice& aidl);
+ConversionResult<media::audio::common::AudioDevice>
+legacy2aidl_AudioDeviceTypeAddress(const AudioDeviceTypeAddr& legacy);
 
 } // namespace android

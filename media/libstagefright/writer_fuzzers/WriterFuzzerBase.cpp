@@ -174,10 +174,13 @@ void WriterFuzzerBase::addWriterSource(int32_t trackIndex) {
             params.sampleRate = 16000;
         } else {
             params.sampleRate = max(1, params.sampleRate);
+            params.channelCount = max(0, params.channelCount);
         }
         format->setInt32("channel-count", params.channelCount);
         format->setInt32("sample-rate", params.sampleRate);
     } else if (!strncmp(params.mime, "video/", 6)) {
+        params.width = max(1, params.width);
+        params.height = max(1, params.height);
         format->setInt32("width", params.width);
         format->setInt32("height", params.height);
     }
@@ -189,7 +192,9 @@ void WriterFuzzerBase::addWriterSource(int32_t trackIndex) {
     sp<MetaData> trackMeta = new MetaData;
     convertMessageToMetaData(format, trackMeta);
     mCurrentTrack[trackIndex] = new MediaAdapter(trackMeta);
-    mWriter->addSource(mCurrentTrack[trackIndex]);
+    if (mWriter->addSource(mCurrentTrack[trackIndex]) != OK) {
+        mCurrentTrack[trackIndex] = nullptr;
+    }
 }
 
 void WriterFuzzerBase::start() {
@@ -199,13 +204,17 @@ void WriterFuzzerBase::start() {
 
 void WriterFuzzerBase::sendBuffersToWriter(sp<MediaAdapter> &currentTrack, int32_t trackIndex,
                                            int32_t startFrameIndex, int32_t endFrameIndex) {
+    if (!mCurrentTrack[trackIndex]) {
+        return;
+    }
     vector<FrameData> bufferInfo = mBufferSource->getFrameList(trackIndex);
     for (int idx = startFrameIndex; idx < endFrameIndex; ++idx) {
+        if (!mWriter->isSampleMetadataValid(trackIndex, bufferInfo[idx].timeUs)) {
+            continue;
+        }
         sp<ABuffer> buffer = new ABuffer((void *)bufferInfo[idx].buf, bufferInfo[idx].size);
         MediaBuffer *mediaBuffer = new MediaBuffer(buffer);
 
-        // Released in MediaAdapter::signalBufferReturned().
-        mediaBuffer->add_ref();
         mediaBuffer->set_range(buffer->offset(), buffer->size());
         MetaDataBase &sampleMetaData = mediaBuffer->meta_data();
         sampleMetaData.setInt64(kKeyTime, bufferInfo[idx].timeUs);
@@ -216,8 +225,19 @@ void WriterFuzzerBase::sendBuffersToWriter(sp<MediaAdapter> &currentTrack, int32
             sampleMetaData.setInt32(kKeyIsSyncFrame, true);
         }
 
+        // Released in MediaAdapter::signalBufferReturned().
+        mediaBuffer->add_ref();
+
         // This pushBuffer will wait until the mediaBuffer is consumed.
-        currentTrack->pushBuffer(mediaBuffer);
+        android::status_t pushStatus = currentTrack->pushBuffer(mediaBuffer);
+
+        if (pushStatus != OK) {
+            if (pushStatus == INVALID_OPERATION) {
+                // In Case of INVALID_OPERATION, mObserver needs to be set before calling release()
+                mediaBuffer->setObserver(currentTrack.get());
+            }
+            mediaBuffer->release();
+        }
     }
 }
 

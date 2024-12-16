@@ -14,29 +14,34 @@
  * limitations under the License.
  */
 
+#include <cstdint>
+#include <istream>
+#include <map>
+#include <sstream>
+#include <stdarg.h>
+#include <string>
+#include <vector>
+#include <unordered_map>
+
 #define LOG_TAG "APM::AudioPolicyEngine/Config"
 //#define LOG_NDEBUG 0
 
 #include "EngineConfig.h"
+#include <TypeConverter.h>
+#include <Volume.h>
 #include <cutils/properties.h>
+#include <libxml/parser.h>
+#include <libxml/xinclude.h>
+#include <media/AidlConversion.h>
+#include <media/AidlConversionUtil.h>
 #include <media/TypeConverter.h>
 #include <media/convert.h>
 #include <system/audio_config.h>
 #include <utils/Log.h>
-#include <libxml/parser.h>
-#include <libxml/xinclude.h>
-#include <string>
-#include <vector>
-#include <map>
-#include <sstream>
-#include <istream>
-
-#include <cstdint>
-#include <stdarg.h>
-#include <string>
 
 namespace android {
 
+using media::audio::common::AudioStreamType;
 using utilities::convertTo;
 
 namespace engineConfig {
@@ -44,6 +49,114 @@ namespace engineConfig {
 static constexpr const char *gVersionAttribute = "version";
 static const char *const gReferenceElementName = "reference";
 static const char *const gReferenceAttributeName = "name";
+
+namespace {
+
+ConversionResult<std::string> aidl2legacy_AudioHalProductStrategy_ProductStrategyType(int id) {
+    using AudioProductStrategyType = media::audio::common::AudioProductStrategyType;
+
+#define STRATEGY_ENTRY(name) {static_cast<int>(AudioProductStrategyType::name), "STRATEGY_" #name}
+    static const std::unordered_map<int, std::string> productStrategyMap = {STRATEGY_ENTRY(MEDIA),
+                            STRATEGY_ENTRY(PHONE),
+                            STRATEGY_ENTRY(SONIFICATION),
+                            STRATEGY_ENTRY(SONIFICATION_RESPECTFUL),
+                            STRATEGY_ENTRY(DTMF),
+                            STRATEGY_ENTRY(ENFORCED_AUDIBLE),
+                            STRATEGY_ENTRY(TRANSMITTED_THROUGH_SPEAKER),
+                            STRATEGY_ENTRY(ACCESSIBILITY)};
+#undef STRATEGY_ENTRY
+
+    if (id >= media::audio::common::AudioHalProductStrategy::VENDOR_STRATEGY_ID_START) {
+        return std::to_string(id);
+    }
+    auto it = productStrategyMap.find(id);
+    if (it == productStrategyMap.end()) {
+        return base::unexpected(BAD_VALUE);
+    }
+    return it->second;
+}
+
+ConversionResult<AttributesGroup> aidl2legacy_AudioHalAttributeGroup_AttributesGroup(
+        const media::audio::common::AudioHalAttributesGroup& aidl) {
+    AttributesGroup legacy;
+    // StreamType may only be set to AudioStreamType.INVALID when using the
+    // Configurable Audio Policy (CAP) engine. An AudioHalAttributesGroup with
+    // AudioStreamType.INVALID is used when the volume group and attributes are
+    // not associated to any AudioStreamType.
+    legacy.stream = ((aidl.streamType == AudioStreamType::INVALID) ? AUDIO_STREAM_DEFAULT :
+            VALUE_OR_RETURN(aidl2legacy_AudioStreamType_audio_stream_type_t(aidl.streamType)));
+    legacy.volumeGroup = aidl.volumeGroupName;
+    legacy.attributesVect = VALUE_OR_RETURN(convertContainer<AttributesVector>(
+                    aidl.attributes, aidl2legacy_AudioAttributes_audio_attributes_t));
+    return legacy;
+}
+
+ConversionResult<ProductStrategy> aidl2legacy_AudioHalProductStrategy_ProductStrategy(
+        const media::audio::common::AudioHalProductStrategy& aidl) {
+    ProductStrategy legacy;
+    legacy.name = aidl.name.value_or(VALUE_OR_RETURN(
+                    aidl2legacy_AudioHalProductStrategy_ProductStrategyType(aidl.id)));
+    legacy.id = aidl.id;
+    legacy.attributesGroups = VALUE_OR_RETURN(convertContainer<AttributesGroups>(
+                    aidl.attributesGroups,
+                    aidl2legacy_AudioHalAttributeGroup_AttributesGroup));
+    return legacy;
+}
+
+ConversionResult<std::string> legacy_device_category_to_string(device_category legacy) {
+    std::string s;
+    if (DeviceCategoryConverter::toString(legacy, s)) {
+        return s;
+    }
+    return base::unexpected(BAD_VALUE);
+}
+
+ConversionResult<std::string> aidl2legacy_DeviceCategory(
+        const media::audio::common::AudioHalVolumeCurve::DeviceCategory aidl) {
+    using DeviceCategory = media::audio::common::AudioHalVolumeCurve::DeviceCategory;
+    switch (aidl) {
+        case DeviceCategory::HEADSET:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_HEADSET);
+        case DeviceCategory::SPEAKER:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_SPEAKER);
+        case DeviceCategory::EARPIECE:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_EARPIECE);
+        case DeviceCategory::EXT_MEDIA:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_EXT_MEDIA);
+        case DeviceCategory::HEARING_AID:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_HEARING_AID);
+    }
+    return base::unexpected(BAD_VALUE);
+}
+
+ConversionResult<CurvePoint> aidl2legacy_AudioHalCurvePoint_CurvePoint(
+        const media::audio::common::AudioHalVolumeCurve::CurvePoint& aidl) {
+    CurvePoint legacy;
+    legacy.index = VALUE_OR_RETURN(convertIntegral<int>(aidl.index));
+    legacy.attenuationInMb = aidl.attenuationMb;
+    return legacy;
+}
+
+ConversionResult<VolumeCurve> aidl2legacy_AudioHalVolumeCurve_VolumeCurve(
+        const media::audio::common::AudioHalVolumeCurve& aidl) {
+    VolumeCurve legacy;
+    legacy.deviceCategory = VALUE_OR_RETURN(aidl2legacy_DeviceCategory(aidl.deviceCategory));
+    legacy.curvePoints = VALUE_OR_RETURN(convertContainer<CurvePoints>(
+                    aidl.curvePoints, aidl2legacy_AudioHalCurvePoint_CurvePoint));
+    return legacy;
+}
+
+ConversionResult<VolumeGroup> aidl2legacy_AudioHalVolumeGroup_VolumeGroup(
+        const media::audio::common::AudioHalVolumeGroup& aidl) {
+    VolumeGroup legacy;
+    legacy.name = aidl.name;
+    legacy.indexMin = aidl.minIndex;
+    legacy.indexMax = aidl.maxIndex;
+    legacy.volumeCurves = VALUE_OR_RETURN(convertContainer<VolumeCurves>(
+                    aidl.volumeCurves, aidl2legacy_AudioHalVolumeCurve_VolumeCurve));
+    return legacy;
+}
+}  // namespace
 
 template<typename E, typename C>
 struct BaseSerializerTraits {
@@ -57,7 +170,6 @@ struct AttributesGroupTraits : public BaseSerializerTraits<AttributesGroup, Attr
     static constexpr const char *collectionTag = "AttributesGroups";
 
     struct Attributes {
-        static constexpr const char *name = "name";
         static constexpr const char *streamType = "streamType";
         static constexpr const char *volumeGroup = "volumeGroup";
     };
@@ -70,6 +182,7 @@ struct ProductStrategyTraits : public BaseSerializerTraits<ProductStrategy, Prod
 
     struct Attributes {
         static constexpr const char *name = "name";
+        static constexpr const char *id = "id";
     };
     static android::status_t deserialize(_xmlDoc *doc, const _xmlNode *root, Collection &ps);
 };
@@ -80,6 +193,7 @@ struct ValueTraits : public BaseSerializerTraits<ValuePair, ValuePairs> {
     struct Attributes {
         static constexpr const char *literal = "literal";
         static constexpr const char *numerical = "numerical";
+        static constexpr const char *androidType = "android_type";
     };
 
     static android::status_t deserialize(_xmlDoc *doc, const _xmlNode *root,
@@ -139,11 +253,24 @@ struct VolumeGroupTraits : public BaseSerializerTraits<VolumeGroup, VolumeGroups
                                          Collection &collection);
 };
 
-using xmlCharUnique = std::unique_ptr<xmlChar, decltype(xmlFree)>;
+template <class T>
+constexpr void (*xmlDeleter)(T* t);
+template <>
+constexpr auto xmlDeleter<xmlDoc> = xmlFreeDoc;
+template <>
+constexpr auto xmlDeleter<xmlChar> = [](xmlChar *s) { xmlFree(s); };
+
+/** @return a unique_ptr with the correct deleter for the libxml2 object. */
+template <class T>
+constexpr auto make_xmlUnique(T *t) {
+    // Wrap deleter in lambda to enable empty base optimization
+    auto deleter = [](T *t) { xmlDeleter<T>(t); };
+    return std::unique_ptr<T, decltype(deleter)>{t, deleter};
+}
 
 std::string getXmlAttribute(const xmlNode *cur, const char *attribute)
 {
-    xmlCharUnique charPtr(xmlGetProp(cur, reinterpret_cast<const xmlChar *>(attribute)), xmlFree);
+    auto charPtr = make_xmlUnique(xmlGetProp(cur, reinterpret_cast<const xmlChar *>(attribute)));
     if (charPtr == NULL) {
         return "";
     }
@@ -299,12 +426,6 @@ static status_t deserializeAttributesCollection(_xmlDoc *doc, const _xmlNode *cu
 status_t AttributesGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
                                             Collection &attributesGroup)
 {
-    std::string name = getXmlAttribute(child, Attributes::name);
-    if (name.empty()) {
-        ALOGV("AttributesGroupTraits No attribute %s found", Attributes::name);
-    }
-    ALOGV("%s: %s = %s", __FUNCTION__, Attributes::name, name.c_str());
-
     std::string volumeGroup = getXmlAttribute(child, Attributes::volumeGroup);
     if (volumeGroup.empty()) {
         ALOGE("%s: No attribute %s found", __FUNCTION__, Attributes::volumeGroup);
@@ -325,7 +446,7 @@ status_t AttributesGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
     AttributesVector attributesVect;
     deserializeAttributesCollection(doc, child, attributesVect);
 
-    attributesGroup.push_back({name, streamType, volumeGroup, attributesVect});
+    attributesGroup.push_back({streamType, volumeGroup, attributesVect});
     return NO_ERROR;
 }
 
@@ -336,7 +457,16 @@ status_t ValueTraits::deserialize(_xmlDoc */*doc*/, const _xmlNode *child, Colle
         ALOGE("%s: No attribute %s found", __FUNCTION__, Attributes::literal);
         return BAD_VALUE;
     }
-    uint32_t numerical = 0;
+    uint32_t androidType = 0;
+    std::string androidTypeliteral = getXmlAttribute(child, Attributes::androidType);
+    if (!androidTypeliteral.empty()) {
+        ALOGV("%s: androidType %s", __FUNCTION__, androidTypeliteral.c_str());
+        if (!convertTo(androidTypeliteral, androidType)) {
+            ALOGE("%s: : Invalid typeset value(%s)", __FUNCTION__, androidTypeliteral.c_str());
+            return BAD_VALUE;
+        }
+    }
+    uint64_t numerical = 0;
     std::string numericalTag = getXmlAttribute(child, Attributes::numerical);
     if (numericalTag.empty()) {
         ALOGE("%s: No attribute %s found", __FUNCTION__, Attributes::literal);
@@ -346,7 +476,7 @@ status_t ValueTraits::deserialize(_xmlDoc */*doc*/, const _xmlNode *child, Colle
         ALOGE("%s: : Invalid value(%s)", __FUNCTION__, numericalTag.c_str());
         return BAD_VALUE;
     }
-    values.push_back({numerical, literal});
+    values.push_back({numerical,  androidType, literal});
     return NO_ERROR;
 }
 
@@ -411,13 +541,21 @@ status_t ProductStrategyTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
         ALOGE("ProductStrategyTraits No attribute %s found", Attributes::name);
         return BAD_VALUE;
     }
+    int id = PRODUCT_STRATEGY_NONE;
+    std::string idLiteral = getXmlAttribute(child, Attributes::id);
+    if (!idLiteral.empty()) {
+        if (!convertTo(idLiteral, id)) {
+            return BAD_VALUE;
+        }
+        ALOGV("%s: %s, %s = %d", __FUNCTION__, name.c_str(), Attributes::id, id);
+    }
     ALOGV("%s: %s = %s", __FUNCTION__, Attributes::name, name.c_str());
 
     size_t skipped = 0;
     AttributesGroups attrGroups;
     deserializeCollection<AttributesGroupTraits>(doc, child, attrGroups, skipped);
 
-    strategies.push_back({name, attrGroups});
+    strategies.push_back({name, id, attrGroups});
     return NO_ERROR;
 }
 
@@ -441,7 +579,7 @@ status_t VolumeTraits::deserialize(_xmlDoc *doc, const _xmlNode *root, Collectio
     for (const xmlNode *child = referenceName.empty() ?
          root->xmlChildrenNode : ref->xmlChildrenNode; child != NULL; child = child->next) {
         if (!xmlStrcmp(child->name, (const xmlChar *)volumePointTag)) {
-            xmlCharUnique pointXml(xmlNodeListGetString(doc, child->xmlChildrenNode, 1), xmlFree);
+            auto pointXml = make_xmlUnique(xmlNodeListGetString(doc, child->xmlChildrenNode, 1));
             if (pointXml == NULL) {
                 return BAD_VALUE;
             }
@@ -471,14 +609,14 @@ status_t VolumeGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *root, Coll
 
     for (const xmlNode *child = root->xmlChildrenNode; child != NULL; child = child->next) {
         if (not xmlStrcmp(child->name, (const xmlChar *)Attributes::name)) {
-            xmlCharUnique nameXml(xmlNodeListGetString(doc, child->xmlChildrenNode, 1), xmlFree);
+            auto nameXml = make_xmlUnique(xmlNodeListGetString(doc, child->xmlChildrenNode, 1));
             if (nameXml == nullptr) {
                 return BAD_VALUE;
             }
             name = reinterpret_cast<const char*>(nameXml.get());
         }
         if (not xmlStrcmp(child->name, (const xmlChar *)Attributes::indexMin)) {
-            xmlCharUnique indexMinXml(xmlNodeListGetString(doc, child->xmlChildrenNode, 1), xmlFree);
+            auto indexMinXml = make_xmlUnique(xmlNodeListGetString(doc, child->xmlChildrenNode, 1));
             if (indexMinXml == nullptr) {
                 return BAD_VALUE;
             }
@@ -488,7 +626,7 @@ status_t VolumeGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *root, Coll
             }
         }
         if (not xmlStrcmp(child->name, (const xmlChar *)Attributes::indexMax)) {
-            xmlCharUnique indexMaxXml(xmlNodeListGetString(doc, child->xmlChildrenNode, 1), xmlFree);
+            auto indexMaxXml = make_xmlUnique(xmlNodeListGetString(doc, child->xmlChildrenNode, 1));
             if (indexMaxXml == nullptr) {
                 return BAD_VALUE;
             }
@@ -548,7 +686,7 @@ status_t deserializeLegacyVolume(_xmlDoc *doc, const _xmlNode *cur,
     for (const xmlNode *child = referenceName.empty() ?
          cur->xmlChildrenNode : ref->xmlChildrenNode; child != NULL; child = child->next) {
         if (!xmlStrcmp(child->name, (const xmlChar *)VolumeTraits::volumePointTag)) {
-            xmlCharUnique pointXml(xmlNodeListGetString(doc, child->xmlChildrenNode, 1), xmlFree);
+            auto pointXml = make_xmlUnique(xmlNodeListGetString(doc, child->xmlChildrenNode, 1));
             if (pointXml == NULL) {
                 return BAD_VALUE;
             }
@@ -640,19 +778,21 @@ private:
 
 ParsingResult parse(const char* path) {
     XmlErrorHandler errorHandler;
-    xmlDocPtr doc;
-    doc = xmlParseFile(path);
+    auto doc = make_xmlUnique(xmlParseFile(path));
     if (doc == NULL) {
-        ALOGE("%s: Could not parse document %s", __FUNCTION__, path);
+        // It is OK not to find an engine config file at the default location
+        // as the caller will default to hardcoded default config
+        if (strncmp(path, DEFAULT_PATH, strlen(DEFAULT_PATH))) {
+            ALOGW("%s: Could not parse document %s", __FUNCTION__, path);
+        }
         return {nullptr, 0};
     }
-    xmlNodePtr cur = xmlDocGetRootElement(doc);
+    xmlNodePtr cur = xmlDocGetRootElement(doc.get());
     if (cur == NULL) {
         ALOGE("%s: Could not parse: empty document %s", __FUNCTION__, path);
-        xmlFreeDoc(doc);
         return {nullptr, 0};
     }
-    if (xmlXIncludeProcess(doc) < 0) {
+    if (xmlXIncludeProcess(doc.get()) < 0) {
         ALOGE("%s: libxml failed to resolve XIncludes on document %s", __FUNCTION__, path);
         return {nullptr, 0};
     }
@@ -665,37 +805,35 @@ ParsingResult parse(const char* path) {
     auto config = std::make_unique<Config>();
     config->version = std::stof(version);
     deserializeCollection<ProductStrategyTraits>(
-                doc, cur, config->productStrategies, nbSkippedElements);
+                doc.get(), cur, config->productStrategies, nbSkippedElements);
     deserializeCollection<CriterionTraits>(
-                doc, cur, config->criteria, nbSkippedElements);
+                doc.get(), cur, config->criteria, nbSkippedElements);
     deserializeCollection<CriterionTypeTraits>(
-                doc, cur, config->criterionTypes, nbSkippedElements);
+                doc.get(), cur, config->criterionTypes, nbSkippedElements);
     deserializeCollection<VolumeGroupTraits>(
-                doc, cur, config->volumeGroups, nbSkippedElements);
+                doc.get(), cur, config->volumeGroups, nbSkippedElements);
 
     return {std::move(config), nbSkippedElements};
 }
 
 android::status_t parseLegacyVolumeFile(const char* path, VolumeGroups &volumeGroups) {
     XmlErrorHandler errorHandler;
-    xmlDocPtr doc;
-    doc = xmlParseFile(path);
+    auto doc = make_xmlUnique(xmlParseFile(path));
     if (doc == NULL) {
         ALOGE("%s: Could not parse document %s", __FUNCTION__, path);
         return BAD_VALUE;
     }
-    xmlNodePtr cur = xmlDocGetRootElement(doc);
+    xmlNodePtr cur = xmlDocGetRootElement(doc.get());
     if (cur == NULL) {
         ALOGE("%s: Could not parse: empty document %s", __FUNCTION__, path);
-        xmlFreeDoc(doc);
         return BAD_VALUE;
     }
-    if (xmlXIncludeProcess(doc) < 0) {
+    if (xmlXIncludeProcess(doc.get()) < 0) {
         ALOGE("%s: libxml failed to resolve XIncludes on document %s", __FUNCTION__, path);
         return BAD_VALUE;
     }
     size_t nbSkippedElements = 0;
-    return deserializeLegacyVolumeCollection(doc, cur, volumeGroups, nbSkippedElements);
+    return deserializeLegacyVolumeCollection(doc.get(), cur, volumeGroups, nbSkippedElements);
 }
 
 android::status_t parseLegacyVolumes(VolumeGroups &volumeGroups) {
@@ -707,6 +845,26 @@ android::status_t parseLegacyVolumes(VolumeGroups &volumeGroups) {
         return BAD_VALUE;
     }
 }
+
+ParsingResult convert(const ::android::media::audio::common::AudioHalEngineConfig& aidlConfig) {
+    auto config = std::make_unique<engineConfig::Config>();
+    config->version = 1.0f;
+    if (auto conv = convertContainer<engineConfig::ProductStrategies>(
+                    aidlConfig.productStrategies,
+                    aidl2legacy_AudioHalProductStrategy_ProductStrategy); conv.ok()) {
+        config->productStrategies = std::move(conv.value());
+    } else {
+        return ParsingResult{};
+    }
+    if (auto conv = convertContainer<engineConfig::VolumeGroups>(
+                    aidlConfig.volumeGroups,
+                    aidl2legacy_AudioHalVolumeGroup_VolumeGroup); conv.ok()) {
+        config->volumeGroups = std::move(conv.value());
+    } else {
+        return ParsingResult{};
+    }
+    return {.parsedConfig=std::move(config), .nbSkippedElement=0};
+ }
 
 } // namespace engineConfig
 } // namespace android

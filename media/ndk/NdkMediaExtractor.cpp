@@ -125,6 +125,7 @@ EXPORT
 AMediaFormat* AMediaExtractor_getFileFormat(AMediaExtractor *mData) {
     sp<AMessage> format;
     mData->mImpl->getFileFormat(&format);
+    // ignore any error, we want to return the empty format
     return AMediaFormat_fromMsg(&format);
 }
 
@@ -247,7 +248,10 @@ PsshInfo* AMediaExtractor_getPsshInfo(AMediaExtractor *ex) {
     }
 
     sp<AMessage> format;
-    ex->mImpl->getFileFormat(&format);
+    if (ex->mImpl->getFileFormat(&format) != OK) {
+        android_errorWriteWithInfoLog(0x534e4554, "243222985", -1, nullptr, 0);
+        return NULL;
+    }
     sp<ABuffer> buffer;
     if(!format->findBuffer("pssh", &buffer)) {
         return NULL;
@@ -388,9 +392,11 @@ AMediaCodecCryptoInfo *AMediaExtractor_getSampleCryptoInfo(AMediaExtractor *ex) 
         mode = CryptoPlugin::kMode_AES_CTR;
     }
 
+    sp<ABuffer> clearbuf;
+    sp<ABuffer> cryptedbuf;
     if (sizeof(uint32_t) != sizeof(size_t)) {
-        sp<ABuffer> clearbuf   = U32ArrayToSizeBuf(numSubSamples, (uint32_t *)cleardata);
-        sp<ABuffer> cryptedbuf = U32ArrayToSizeBuf(numSubSamples, (uint32_t *)crypteddata);
+        clearbuf   = U32ArrayToSizeBuf(numSubSamples, (uint32_t *)cleardata);
+        cryptedbuf = U32ArrayToSizeBuf(numSubSamples, (uint32_t *)crypteddata);
         cleardata   = clearbuf    == NULL ? NULL : clearbuf->data();
         crypteddata = crypteddata == NULL ? NULL : cryptedbuf->data();
         if(crypteddata == NULL || cleardata == NULL) {
@@ -419,6 +425,7 @@ int64_t AMediaExtractor_getCachedDuration(AMediaExtractor *ex) {
 
 EXPORT
 media_status_t AMediaExtractor_getSampleFormat(AMediaExtractor *ex, AMediaFormat *fmt) {
+    ALOGV("AMediaExtractor_getSampleFormat");
     if (fmt == NULL) {
         return AMEDIA_ERROR_INVALID_PARAMETER;
     }
@@ -428,6 +435,9 @@ media_status_t AMediaExtractor_getSampleFormat(AMediaExtractor *ex, AMediaFormat
     if (err != OK) {
         return translate_error(err);
     }
+#ifdef LOG_NDEBUG
+    sampleMeta->dumpToLog();
+#endif
 
     sp<AMessage> meta;
     AMediaFormat_getFormat(fmt, &meta);
@@ -482,6 +492,19 @@ media_status_t AMediaExtractor_getSampleFormat(AMediaExtractor *ex, AMediaFormat
                 audioPresentationsPointer, audioPresentationsLength);
         meta->setBuffer(AMEDIAFORMAT_KEY_AUDIO_PRESENTATION_INFO, audioPresentationsData);
     }
+
+    int64_t val64;
+    if (sampleMeta->findInt64(kKeySampleFileOffset, &val64)) {
+        meta->setInt64("sample-file-offset", val64);
+        ALOGV("SampleFileOffset Found");
+    }
+    if (sampleMeta->findInt64(kKeyLastSampleIndexInChunk, &val64)) {
+        meta->setInt64("last-sample-index-in-chunk" /*AMEDIAFORMAT_KEY_LAST_SAMPLE_INDEX_IN_CHUNK*/,
+                       val64);
+        ALOGV("kKeyLastSampleIndexInChunk Found");
+    }
+
+    ALOGV("AMediaFormat_toString:%s", AMediaFormat_toString(fmt));
 
     return AMEDIA_OK;
 }

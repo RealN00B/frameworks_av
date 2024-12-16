@@ -19,12 +19,13 @@
 
 #include <vector>
 
+#include <android/media/MicrophoneInfoFw.h>
 #include <media/audiohal/EffectHalInterface.h>
-#include <media/MicrophoneInfo.h>
 #include <system/audio.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
 #include <utils/String8.h>
+#include <utils/Vector.h>
 
 namespace android {
 
@@ -69,7 +70,7 @@ class StreamHalInterface : public virtual RefBase
     // Put the audio hardware input/output into standby mode.
     virtual status_t standby() = 0;
 
-    virtual status_t dump(int fd) = 0;
+    virtual status_t dump(int fd, const Vector<String16>& args = {}) = 0;
 
     // Start a stream operating in mmap mode.
     virtual status_t start() = 0;
@@ -88,6 +89,12 @@ class StreamHalInterface : public virtual RefBase
     // (must match the priority of the audioflinger's thread that calls 'read' / 'write')
     virtual status_t setHalThreadPriority(int priority) = 0;
 
+    virtual status_t legacyCreateAudioPatch(const struct audio_port_config& port,
+                                            std::optional<audio_source_t> source,
+                                            audio_devices_t type) = 0;
+
+    virtual status_t legacyReleaseAudioPatch() = 0;
+
   protected:
     // Subclasses can not be constructed directly by clients.
     StreamHalInterface() {}
@@ -100,22 +107,66 @@ class StreamOutHalInterfaceCallback : public virtual RefBase {
   public:
     virtual void onWriteReady() {}
     virtual void onDrainReady() {}
-    virtual void onError() {}
+    virtual void onError(bool /*isHardError*/) {}
 
   protected:
-    StreamOutHalInterfaceCallback() {}
-    virtual ~StreamOutHalInterfaceCallback() {}
+    StreamOutHalInterfaceCallback() = default;
+    virtual ~StreamOutHalInterfaceCallback() = default;
 };
 
 class StreamOutHalInterfaceEventCallback : public virtual RefBase {
 public:
-    virtual void onCodecFormatChanged(const std::basic_string<uint8_t>& metadataBs) = 0;
+    virtual void onCodecFormatChanged(const std::vector<uint8_t>& metadataBs) = 0;
 
 protected:
-    StreamOutHalInterfaceEventCallback() {}
-    virtual ~StreamOutHalInterfaceEventCallback() {}
+    StreamOutHalInterfaceEventCallback() = default;
+    virtual ~StreamOutHalInterfaceEventCallback() = default;
 };
 
+class StreamOutHalInterfaceLatencyModeCallback : public virtual RefBase {
+public:
+    /**
+     * Called with the new list of supported latency modes when a change occurs.
+     */
+    virtual void onRecommendedLatencyModeChanged(std::vector<audio_latency_mode_t> modes) = 0;
+
+protected:
+    StreamOutHalInterfaceLatencyModeCallback() = default;
+    virtual ~StreamOutHalInterfaceLatencyModeCallback() = default;
+};
+
+/**
+ * On position reporting. There are two methods: 'getRenderPosition' and
+ * 'getPresentationPosition'. The first difference is that they may have a
+ * time offset because "render" position relates to what happens between
+ * ADSP and DAC, while "observable" position is relative to the external
+ * observer. The second difference is that 'getRenderPosition' always
+ * resets on standby (for all types of stream data) according to its
+ * definition. Since the original C definition of 'getRenderPosition' used
+ * 32-bit frame counters, and also because in complex playback chains that
+ * include wireless devices the "observable" position has more practical
+ * meaning, 'getRenderPosition' does not exist in the AIDL HAL interface.
+ * The table below summarizes frame count behavior for 'getPresentationPosition':
+ *
+ *               | Mixed      | Direct       | Direct
+ *               |            | non-offload  | offload
+ * ==============|============|==============|==============
+ *  PCM and      | Continuous |              |
+ *  encapsulated |            |              |
+ *  bitstream    |            |              |
+ * --------------|------------| Continuous†  |
+ *  Bitstream    |            |              | Reset on
+ *  encapsulated |            |              | flush, drain
+ *  into PCM     |            |              | and standby
+ *               | Not        |              |
+ * --------------| supported  |--------------|
+ *  Bitstream    |            | Reset on     |
+ *               |            | flush, drain |
+ *               |            | and standby  |
+ *               |            |              |
+ *
+ * † - on standby, reset of the frame count happens at the framework level.
+ */
 class StreamOutHalInterface : public virtual StreamHalInterface {
   public:
     // Return the audio hardware driver estimated latency in milliseconds.
@@ -132,10 +183,7 @@ class StreamOutHalInterface : public virtual StreamHalInterface {
 
     // Return the number of audio frames written by the audio dsp to DAC since
     // the output has exited standby.
-    virtual status_t getRenderPosition(uint32_t *dspFrames) = 0;
-
-    // Get the local time at which the next write to the audio driver will be presented.
-    virtual status_t getNextWriteTimestamp(int64_t *timestamp) = 0;
+    virtual status_t getRenderPosition(uint64_t *dspFrames) = 0;
 
     // Set the callback for notifying completion of non-blocking write and drain.
     // The callback must be owned by someone else. The output stream does not own it
@@ -157,11 +205,18 @@ class StreamOutHalInterface : public virtual StreamHalInterface {
     // Requests notification when data buffered by the driver/hardware has been played.
     virtual status_t drain(bool earlyNotify) = 0;
 
-    // Notifies to the audio driver to flush the queued data.
+    // Notifies to the audio driver to flush (that is, drop) the queued data. Stream must
+    // already be paused before calling 'flush'.
     virtual status_t flush() = 0;
 
     // Return a recent count of the number of audio frames presented to an external observer.
+    // This excludes frames which have been written but are still in the pipeline. See the
+    // table at the start of the 'StreamOutHalInterface' for the specification of the frame
+    // count behavior w.r.t. 'flush', 'drain' and 'standby' operations.
     virtual status_t getPresentationPosition(uint64_t *frames, struct timespec *timestamp) = 0;
+
+    // Notifies the HAL layer that the framework considers the current playback as completed.
+    virtual status_t presentationComplete() = 0;
 
     struct SourceMetadata {
         std::vector<playback_track_metadata_v7_t> tracks;
@@ -193,6 +248,47 @@ class StreamOutHalInterface : public virtual StreamHalInterface {
 
     virtual status_t setEventCallback(const sp<StreamOutHalInterfaceEventCallback>& callback) = 0;
 
+    /**
+     * Indicates the requested latency mode for this output stream.
+     *
+     * The requested mode can be one of the modes returned by
+     * getRecommendedLatencyModes() API.
+     *
+     * @param mode the requested latency mode.
+     * @return operation completion status.
+     */
+    virtual status_t setLatencyMode(audio_latency_mode_t mode) = 0;
+
+    /**
+     * Indicates which latency modes are currently supported on this output stream.
+     * If the transport protocol (e.g Bluetooth A2DP) used by this output stream to reach
+     * the output device supports variable latency modes, the HAL indicates which
+     * modes are currently supported.
+     * The framework can then call setLatencyMode() with one of the supported modes to select
+     * the desired operation mode.
+     *
+     * @param modes currrently supported latency modes.
+     * @return operation completion status.
+     */
+    virtual status_t getRecommendedLatencyModes(std::vector<audio_latency_mode_t> *modes) = 0;
+
+    /**
+     * Set the callback interface for notifying changes in supported latency modes.
+     *
+     * Calling this method with a null pointer will result in releasing
+     * the callback.
+     *
+     * @param callback the registered callback or null to unregister.
+     * @return operation completion status.
+     */
+    virtual status_t setLatencyModeCallback(
+            const sp<StreamOutHalInterfaceLatencyModeCallback>& callback) = 0;
+
+    /**
+     * Signal the end of audio output, interrupting an ongoing 'write' operation.
+     */
+    virtual status_t exit() = 0;
+
   protected:
     virtual ~StreamOutHalInterface() {}
 };
@@ -210,10 +306,11 @@ class StreamInHalInterface : public virtual StreamHalInterface {
 
     // Return a recent count of the number of audio frames received and
     // the clock time associated with that frame count.
+    // The count must not reset to zero when a PCM input enters standby.
     virtual status_t getCapturePosition(int64_t *frames, int64_t *time) = 0;
 
     // Get active microphones
-    virtual status_t getActiveMicrophones(std::vector<media::MicrophoneInfo> *microphones) = 0;
+    virtual status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw> *microphones) = 0;
 
     // Set direction for capture processing
     virtual status_t setPreferredMicrophoneDirection(audio_microphone_direction_t) = 0;

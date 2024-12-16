@@ -17,17 +17,18 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <binder/Parcel.h>
-#include <binder/Parcelable.h>
+#include <android/media/AudioProfileSys.h>
+#include <media/AidlConversion.h>
 #include <media/AudioContainers.h>
 #include <system/audio.h>
 #include <utils/RefBase.h>
 
 namespace android {
 
-class AudioProfile final : public RefBase, public Parcelable
+class AudioProfile final : public RefBase
 {
 public:
     static sp<AudioProfile> createFullDynamic(audio_format_t dynamicFormat = AUDIO_FORMAT_DEFAULT);
@@ -36,6 +37,10 @@ public:
     AudioProfile(audio_format_t format,
                  const ChannelMaskSet &channelMasks,
                  const SampleRateSet &samplingRateCollection);
+    AudioProfile(audio_format_t format,
+                 const ChannelMaskSet &channelMasks,
+                 const SampleRateSet &samplingRateCollection,
+                 audio_encapsulation_type_t encapsulationType);
 
     audio_format_t getFormat() const { return mFormat; }
     const ChannelMaskSet &getChannels() const { return mChannelMasks; }
@@ -64,16 +69,29 @@ public:
     void setDynamicFormat(bool dynamic) { mIsDynamicFormat = dynamic; }
     bool isDynamicFormat() const { return mIsDynamicFormat; }
 
-    bool isDynamic() { return mIsDynamicFormat || mIsDynamicChannels || mIsDynamicRate; }
+    bool isDynamic() const { return mIsDynamicFormat || mIsDynamicChannels || mIsDynamicRate; }
+
+    audio_encapsulation_type_t getEncapsulationType() const { return mEncapsulationType; }
+    void setEncapsulationType(audio_encapsulation_type_t encapsulationType) {
+        mEncapsulationType = encapsulationType;
+    }
 
     void dump(std::string *dst, int spaces) const;
 
-    bool equals(const sp<AudioProfile>& other) const;
+    bool equals(const sp<AudioProfile>& other, bool ignoreDynamicFlags = false) const;
 
-    status_t writeToParcel(Parcel* parcel) const override;
-    status_t readFromParcel(const Parcel* parcel) override;
+    using Aidl = std::pair<media::audio::common::AudioProfile, media::AudioProfileSys>;
+    ConversionResult<Aidl> toParcelable(bool isInput) const;
+    static ConversionResult<sp<AudioProfile>> fromParcelable(
+            const Aidl& aidl, bool isInput);
+
+    ConversionResult<media::audio::common::AudioProfile>
+            toCommonParcelable(bool isInput) const;
+    static ConversionResult<sp<AudioProfile>> fromCommonParcelable(
+        const media::audio::common::AudioProfile& aidl, bool isInput);
 
 private:
+
     std::string  mName;
     audio_format_t mFormat; // The format for an audio profile should only be set when initialized.
     ChannelMaskSet mChannelMasks;
@@ -82,9 +100,25 @@ private:
     bool mIsDynamicFormat = false;
     bool mIsDynamicChannels = false;
     bool mIsDynamicRate = false;
+
+    audio_encapsulation_type_t mEncapsulationType = AUDIO_ENCAPSULATION_TYPE_NONE;
+
+    AudioProfile() = default;
+    AudioProfile& operator=(const AudioProfile& other);
 };
 
-class AudioProfileVector : public std::vector<sp<AudioProfile>>, public Parcelable
+// Conversion routines, according to AidlConversion.h conventions.
+ConversionResult<sp<AudioProfile>>
+aidl2legacy_AudioProfile(const AudioProfile::Aidl& aidl, bool isInput);
+ConversionResult<AudioProfile::Aidl>
+legacy2aidl_AudioProfile(const sp<AudioProfile>& legacy, bool isInput);
+
+ConversionResult<sp<AudioProfile>>
+aidl2legacy_AudioProfile_common(const media::audio::common::AudioProfile& aidl, bool isInput);
+ConversionResult<media::audio::common::AudioProfile>
+legacy2aidl_AudioProfile_common(const sp<AudioProfile>& legacy, bool isInput);
+
+class AudioProfileVector : public std::vector<sp<AudioProfile>>
 {
 public:
     virtual ~AudioProfileVector() = default;
@@ -105,14 +139,32 @@ public:
     bool hasDynamicProfile() const;
     bool hasDynamicRateFor(audio_format_t format) const;
 
+    const SampleRateSet getSampleRatesFor(audio_format_t format) const;
+    const ChannelMaskSet getChannelMasksFor(audio_format_t format) const;
+
+    bool contains(const sp<AudioProfile>& profile, bool ignoreDynamicFlags = false) const;
+
     virtual void dump(std::string *dst, int spaces) const;
 
     bool equals(const AudioProfileVector& other) const;
+    void addAllValidProfiles(const AudioProfileVector& audioProfiles);
 
-    status_t writeToParcel(Parcel* parcel) const override;
-    status_t readFromParcel(const Parcel* parcel) override;
+    ChannelMaskSet getSupportedChannelMasks() const;
+
+    using Aidl = std::pair<
+            std::vector<media::audio::common::AudioProfile>,
+            std::vector<media::AudioProfileSys>>;
 };
 
 bool operator == (const AudioProfile &left, const AudioProfile &right);
+
+// Conversion routines, according to AidlConversion.h conventions.
+ConversionResult<AudioProfileVector>
+aidl2legacy_AudioProfileVector(const AudioProfileVector::Aidl& aidl, bool isInput);
+ConversionResult<AudioProfileVector::Aidl>
+legacy2aidl_AudioProfileVector(const AudioProfileVector& legacy, bool isInput);
+
+AudioProfileVector intersectAudioProfiles(const AudioProfileVector& profiles1,
+                                          const AudioProfileVector& profiles2);
 
 } // namespace android

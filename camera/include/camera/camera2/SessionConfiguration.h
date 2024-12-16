@@ -17,15 +17,16 @@
 #ifndef ANDROID_HARDWARE_CAMERA2_SESSIONCONFIGURATION_H
 #define ANDROID_HARDWARE_CAMERA2_SESSIONCONFIGURATION_H
 
+#include "OutputConfiguration.h"
+
 #include <binder/Parcelable.h>
+#include <camera/CameraMetadata.h>
 
 namespace android {
 
 namespace hardware {
 namespace camera2 {
 namespace params {
-
-class OutputConfiguration;
 
 class SessionConfiguration : public android::Parcelable {
 public:
@@ -38,6 +39,9 @@ public:
     int getInputHeight() const { return mInputHeight; }
     int getInputFormat() const { return mInputFormat; }
     int getOperatingMode() const { return mOperatingMode; }
+    bool inputIsMultiResolution() const { return mInputIsMultiResolution; }
+    bool hasSessionParameters() const { return mHasSessionParameters; }
+    const CameraMetadata& getSessionParameters() const { return mSessionParameters; }
 
     virtual status_t writeToParcel(android::Parcel* parcel) const override;
     virtual status_t readFromParcel(const android::Parcel* parcel) override;
@@ -61,7 +65,8 @@ public:
                 mInputWidth == other.mInputWidth &&
                 mInputHeight == other.mInputHeight &&
                 mInputFormat == other.mInputFormat &&
-                mOperatingMode == other.mOperatingMode);
+                mOperatingMode == other.mOperatingMode &&
+                mInputIsMultiResolution == other.mInputIsMultiResolution);
     }
 
     bool operator != (const SessionConfiguration& other) const {
@@ -81,6 +86,10 @@ public:
 
         if (mInputFormat != other.mInputFormat) {
             return mInputFormat < other.mInputFormat;
+        }
+
+        if (mInputIsMultiResolution != other.mInputIsMultiResolution) {
+            return mInputIsMultiResolution < other.mInputIsMultiResolution;
         }
 
         if (mOperatingMode != other.mOperatingMode) {
@@ -104,6 +113,9 @@ private:
 
     std::vector<OutputConfiguration> mOutputStreams;
     int                              mInputWidth, mInputHeight, mInputFormat, mOperatingMode;
+    bool                             mInputIsMultiResolution = false;
+    bool                             mHasSessionParameters = false;
+    CameraMetadata                   mSessionParameters;
 };
 } // namespace params
 } // namespace camera2

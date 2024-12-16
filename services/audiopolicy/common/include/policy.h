@@ -17,6 +17,7 @@
 #pragma once
 
 #include <system/audio.h>
+#include <set>
 #include <vector>
 
 #include <media/AudioContainers.h>
@@ -25,7 +26,32 @@ namespace android {
 
 using StreamTypeVector = std::vector<audio_stream_type_t>;
 
+/**
+ * Legacy audio policy product strategies IDs. These strategies are supported by the default
+ * policy engine.
+ * IMPORTANT NOTE: the order of this enum is important as it determines the priority
+ * between active strategies for routing decisions: lower enum value => higher prioriy
+ */
+enum legacy_strategy {
+    STRATEGY_NONE = -1,
+    STRATEGY_PHONE,
+    STRATEGY_SONIFICATION,
+    STRATEGY_ENFORCED_AUDIBLE,
+    STRATEGY_ACCESSIBILITY,
+    STRATEGY_SONIFICATION_RESPECTFUL,
+    STRATEGY_MEDIA,
+    STRATEGY_DTMF,
+    STRATEGY_CALL_ASSISTANT,
+    STRATEGY_TRANSMITTED_THROUGH_SPEAKER,
+    STRATEGY_REROUTING,
+    STRATEGY_PATCH,
+};
+
 static const audio_attributes_t defaultAttr = AUDIO_ATTRIBUTES_INITIALIZER;
+
+static const std::set<audio_usage_t > gHighPriorityUseCases = {
+        AUDIO_USAGE_ALARM, AUDIO_USAGE_NOTIFICATION_TELEPHONY_RINGTONE
+};
 
 } // namespace android
 
@@ -33,16 +59,12 @@ static const audio_format_t gDynamicFormat = AUDIO_FORMAT_DEFAULT;
 
 static const uint32_t SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY = 5000;
 
-// For mixed output and inputs, the policy will use max mixer sampling rates.
-// Do not limit sampling rate otherwise
-#define SAMPLE_RATE_HZ_MAX 192000
-
 // Used when a client opens a capture stream, without specifying a desired sample rate.
 #define SAMPLE_RATE_HZ_DEFAULT 48000
 
 // For mixed output and inputs, the policy will use max mixer channel count.
 // Do not limit channel count otherwise
-#define MAX_MIXER_CHANNEL_COUNT FCC_8
+#define MAX_MIXER_CHANNEL_COUNT FCC_LIMIT
 
 /**
  * Alias to AUDIO_DEVICE_OUT_DEFAULT defined for clarification when this value is used by volume
@@ -115,7 +137,7 @@ static inline bool device_distinguishes_on_address(audio_devices_t device)
  */
 static inline bool device_has_encoding_capability(audio_devices_t device)
 {
-    return audio_is_a2dp_out_device(device);
+    return audio_is_a2dp_out_device(device) || audio_is_ble_out_device(device);
 }
 
 /**
@@ -133,6 +155,7 @@ static inline bool device_has_encoding_capability(audio_devices_t device)
  * - AUDIO_SOURCE_FM_TUNER
  * - AUDIO_SOURCE_VOICE_RECOGNITION
  * - AUDIO_SOURCE_HOTWORD
+ * - AUDIO_SOURCE_ULTRASOUND
  *
  * @return the corresponding input source priority or 0 if priority is irrelevant for this source.
  *      This happens when the specified source cannot share a given input stream (e.g remote submix)
@@ -142,22 +165,24 @@ static inline int32_t source_priority(audio_source_t inputSource)
 {
     switch (inputSource) {
     case AUDIO_SOURCE_VOICE_COMMUNICATION:
-        return 9;
+        return 10;
     case AUDIO_SOURCE_CAMCORDER:
-        return 8;
+        return 9;
     case AUDIO_SOURCE_VOICE_PERFORMANCE:
-        return 7;
+        return 8;
     case AUDIO_SOURCE_UNPROCESSED:
-        return 6;
+        return 7;
     case AUDIO_SOURCE_MIC:
-        return 5;
+        return 6;
     case AUDIO_SOURCE_ECHO_REFERENCE:
-        return 4;
+        return 5;
     case AUDIO_SOURCE_FM_TUNER:
-        return 3;
+        return 4;
     case AUDIO_SOURCE_VOICE_RECOGNITION:
-        return 2;
+        return 3;
     case AUDIO_SOURCE_HOTWORD:
+        return 2;
+    case AUDIO_SOURCE_ULTRASOUND:
         return 1;
     default:
         break;
@@ -215,17 +240,22 @@ static inline audio_devices_t apm_extract_one_audio_device(
         return *(deviceTypes.begin());
     } else {
         // Multiple device selection is either:
+        //  - dock + one other device: give priority to dock in this case.
         //  - speaker + one other device: give priority to speaker in this case.
         //  - one A2DP device + another device: happens with duplicated output. In this case
         // retain the device on the A2DP output as the other must not correspond to an active
         // selection if not the speaker.
         //  - HDMI-CEC system audio mode only output: give priority to available item in order.
-        if (deviceTypes.count(AUDIO_DEVICE_OUT_SPEAKER) != 0) {
+        if (deviceTypes.count(AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET) != 0) {
+            return AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET;
+        } else if (deviceTypes.count(AUDIO_DEVICE_OUT_SPEAKER) != 0) {
             return AUDIO_DEVICE_OUT_SPEAKER;
         } else if (deviceTypes.count(AUDIO_DEVICE_OUT_SPEAKER_SAFE) != 0) {
             return AUDIO_DEVICE_OUT_SPEAKER_SAFE;
         } else if (deviceTypes.count(AUDIO_DEVICE_OUT_HDMI_ARC) != 0) {
             return AUDIO_DEVICE_OUT_HDMI_ARC;
+        } else if (deviceTypes.count(AUDIO_DEVICE_OUT_HDMI_EARC) != 0) {
+            return AUDIO_DEVICE_OUT_HDMI_EARC;
         } else if (deviceTypes.count(AUDIO_DEVICE_OUT_AUX_LINE) != 0) {
             return AUDIO_DEVICE_OUT_AUX_LINE;
         } else if (deviceTypes.count(AUDIO_DEVICE_OUT_SPDIF) != 0) {
@@ -240,4 +270,17 @@ static inline audio_devices_t apm_extract_one_audio_device(
             return a2dpDevices.empty() ? AUDIO_DEVICE_NONE : a2dpDevices[0];
         }
     }
+}
+
+/**
+ * Indicates if two given audio output flags are considered as matched, which means that
+ * 1) the `supersetFlags` and `subsetFlags` both contain or both don't contain must match flags and
+ * 2) `supersetFlags` contains all flags from `subsetFlags`.
+ */
+static inline bool audio_output_flags_is_subset(audio_output_flags_t supersetFlags,
+                                                audio_output_flags_t subsetFlags,
+                                                uint32_t mustMatchFlags)
+{
+    return ((supersetFlags ^ subsetFlags) & mustMatchFlags) == AUDIO_OUTPUT_FLAG_NONE
+            && (supersetFlags & subsetFlags) == subsetFlags;
 }

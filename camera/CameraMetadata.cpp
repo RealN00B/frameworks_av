@@ -22,6 +22,7 @@
 
 #include <binder/Parcel.h>
 #include <camera/CameraMetadata.h>
+#include <camera_metadata_hidden.h>
 
 namespace android {
 
@@ -288,7 +289,7 @@ status_t CameraMetadata::update(uint32_t tag,
         return res;
     }
     // string.size() doesn't count the null termination character.
-    return updateImpl(tag, (const void*)string.string(), string.size() + 1);
+    return updateImpl(tag, (const void*)string.c_str(), string.size() + 1);
 }
 
 status_t CameraMetadata::update(const camera_metadata_ro_entry &entry) {
@@ -527,6 +528,8 @@ status_t CameraMetadata::resizeIfNeeded(size_t extraEntries, size_t extraData) {
             mBuffer = allocate_camera_metadata(newEntryCount,
                     newDataCount);
             if (mBuffer == NULL) {
+                // Maintain old buffer to avoid potential memory leak.
+                mBuffer = oldBuffer;
                 ALOGE("%s: Can't allocate larger metadata buffer", __FUNCTION__);
                 return NO_MEMORY;
             }
@@ -806,7 +809,7 @@ status_t CameraMetadata::getTagFromName(const char *name,
     for (size_t i = 0; i < totalSectionCount; ++i) {
 
         const char *str = (i < ANDROID_SECTION_COUNT) ? camera_metadata_section_names[i] :
-                (*vendorSections)[i - ANDROID_SECTION_COUNT].string();
+                (*vendorSections)[i - ANDROID_SECTION_COUNT].c_str();
 
         ALOGV("%s: Trying to match against section '%s'", __FUNCTION__, str);
 
@@ -877,5 +880,8 @@ status_t CameraMetadata::getTagFromName(const char *name,
     return OK;
 }
 
+metadata_vendor_id_t CameraMetadata::getVendorId() const {
+    return get_camera_metadata_vendor_id(mBuffer);
+}
 
 }; // namespace android

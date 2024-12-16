@@ -255,7 +255,7 @@ public:
 
     status_t setParameters(const String8& params)
     {
-        ALOGV("setParameter(%s)", params.string());
+        ALOGV("setParameter(%s)", params.c_str());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         data.writeString8(params);
@@ -275,7 +275,7 @@ public:
 
     status_t setClientName(const String16& clientName)
     {
-        ALOGV("setClientName(%s)", String8(clientName).string());
+        ALOGV("setClientName(%s)", String8(clientName).c_str());
         Parcel data, reply;
         data.writeInterfaceToken(IMediaRecorder::getInterfaceDescriptor());
         data.writeString16(clientName);
@@ -428,7 +428,7 @@ public:
         return reply.readInt32();
     }
 
-    status_t getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones)
+    status_t getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones)
     {
         ALOGV("getActiveMicrophones");
         Parcel data, reply;
@@ -756,7 +756,7 @@ status_t BnMediaRecorder::onTransact(
         case GET_ACTIVE_MICROPHONES: {
             ALOGV("GET_ACTIVE_MICROPHONES");
             CHECK_INTERFACE(IMediaRecorder, data, reply);
-            std::vector<media::MicrophoneInfo> activeMicrophones;
+            std::vector<media::MicrophoneInfoFw> activeMicrophones;
             status_t status = getActiveMicrophones(&activeMicrophones);
             reply->writeInt32(status);
             if (status != NO_ERROR) {

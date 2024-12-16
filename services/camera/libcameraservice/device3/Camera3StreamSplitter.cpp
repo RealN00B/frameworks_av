@@ -20,10 +20,12 @@
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
 
+#include <camera/StringUtils.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
+#include <gui/BufferQueue.h>
 #include <gui/IGraphicBufferConsumer.h>
 #include <gui/IGraphicBufferProducer.h>
-#include <gui/BufferQueue.h>
 #include <gui/Surface.h>
 
 #include <ui/GraphicBuffer.h>
@@ -34,13 +36,16 @@
 
 #include <cutils/atomic.h>
 
+#include "Camera3Stream.h"
+
 #include "Camera3StreamSplitter.h"
 
 namespace android {
 
 status_t Camera3StreamSplitter::connect(const std::unordered_map<size_t, sp<Surface>> &surfaces,
         uint64_t consumerUsage, uint64_t producerUsage, size_t halMaxBuffers, uint32_t width,
-        uint32_t height, android::PixelFormat format, sp<Surface>* consumer) {
+        uint32_t height, android::PixelFormat format, sp<Surface>* consumer,
+        int64_t dynamicRangeProfile) {
     ATRACE_CALL();
     if (consumer == nullptr) {
         SP_LOGE("%s: consumer pointer is NULL", __FUNCTION__);
@@ -61,6 +66,7 @@ status_t Camera3StreamSplitter::connect(const std::unordered_map<size_t, sp<Surf
 
     mMaxHalBuffers = halMaxBuffers;
     mConsumerName = getUniqueConsumerName();
+    mDynamicRangeProfile = dynamicRangeProfile;
     // Add output surfaces. This has to be before creating internal buffer queue
     // in order to get max consumer side buffers.
     for (auto &it : surfaces) {
@@ -76,19 +82,29 @@ status_t Camera3StreamSplitter::connect(const std::unordered_map<size_t, sp<Surf
         }
     }
 
+#if !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     // Create BufferQueue for input
     BufferQueue::createBufferQueue(&mProducer, &mConsumer);
+#endif  // !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     // Allocate 1 extra buffer to handle the case where all buffers are detached
     // from input, and attached to the outputs. In this case, the input queue's
     // dequeueBuffer can still allocate 1 extra buffer before being blocked by
     // the output's attachBuffer().
     mMaxConsumerBuffers++;
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mBufferItemConsumer = new BufferItemConsumer(consumerUsage, mMaxConsumerBuffers);
+#else
     mBufferItemConsumer = new BufferItemConsumer(mConsumer, consumerUsage, mMaxConsumerBuffers);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     if (mBufferItemConsumer == nullptr) {
         return NO_MEMORY;
     }
-    mConsumer->setConsumerName(mConsumerName);
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mProducer = mBufferItemConsumer->getSurface()->getIGraphicBufferProducer();
+    mConsumer = mBufferItemConsumer->getIGraphicBufferConsumer();
+#endif  //  COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mConsumer->setConsumerName(toString8(mConsumerName));
 
     *consumer = new Surface(mProducer);
     if (*consumer == nullptr) {
@@ -136,6 +152,7 @@ void Camera3StreamSplitter::disconnect() {
         }
     }
     mOutputs.clear();
+    mOutputSurfaces.clear();
     mOutputSlots.clear();
     mConsumerBufferCount.clear();
 
@@ -176,6 +193,11 @@ status_t Camera3StreamSplitter::addOutput(size_t surfaceId, const sp<Surface>& o
     }
 
     return res;
+}
+
+void Camera3StreamSplitter::setHalBufferManager(bool enabled) {
+    Mutex::Autolock lock(mMutex);
+    mUseHalBufManager = enabled;
 }
 
 status_t Camera3StreamSplitter::addOutputLocked(size_t surfaceId, const sp<Surface>& outputQueue) {
@@ -258,6 +280,7 @@ status_t Camera3StreamSplitter::addOutputLocked(size_t surfaceId, const sp<Surfa
 
     // Add new entry into mOutputs
     mOutputs[surfaceId] = gbp;
+    mOutputSurfaces[surfaceId] = outputQueue;
     mConsumerBufferCount[surfaceId] = maxConsumerBuffers;
     if (mConsumerBufferCount[surfaceId] > mMaxHalBuffers) {
         SP_LOGW("%s: Consumer buffer count %zu larger than max. Hal buffers: %zu", __FUNCTION__,
@@ -316,6 +339,7 @@ status_t Camera3StreamSplitter::removeOutputLocked(size_t surfaceId) {
         }
     }
     mOutputs[surfaceId] = nullptr;
+    mOutputSurfaces[surfaceId] = nullptr;
     mOutputSlots[gbp] = nullptr;
     for (const auto &id : pendingBufferIds) {
         decrementBufRefCountLocked(id, surfaceId);
@@ -356,6 +380,14 @@ status_t Camera3StreamSplitter::outputBufferLocked(const sp<IGraphicBufferProduc
     const BufferTracker& tracker = *(mBuffers[bufferId]);
     int slot = getSlotForOutputLocked(output, tracker.getBuffer());
 
+    if (mOutputSurfaces[surfaceId] != nullptr) {
+        sp<ANativeWindow> anw = mOutputSurfaces[surfaceId];
+        camera3::Camera3Stream::queueHDRMetadata(
+                bufferItem.mGraphicBuffer->getNativeBuffer()->handle, anw, mDynamicRangeProfile);
+    } else {
+        SP_LOGE("%s: Invalid surface id: %zu!", __FUNCTION__, surfaceId);
+    }
+
     // In case the output BufferQueue has its own lock, if we hold splitter lock while calling
     // queueBuffer (which will try to acquire the output lock), the output could be holding its
     // own lock calling releaseBuffer (which  will try to acquire the splitter lock), running into
@@ -393,9 +425,9 @@ status_t Camera3StreamSplitter::outputBufferLocked(const sp<IGraphicBufferProduc
     return res;
 }
 
-String8 Camera3StreamSplitter::getUniqueConsumerName() {
+std::string Camera3StreamSplitter::getUniqueConsumerName() {
     static volatile int32_t counter = 0;
-    return String8::format("Camera3StreamSplitter-%d", android_atomic_inc(&counter));
+    return fmt::sprintf("Camera3StreamSplitter-%d", android_atomic_inc(&counter));
 }
 
 status_t Camera3StreamSplitter::notifyBufferReleased(const sp<GraphicBuffer>& buffer) {

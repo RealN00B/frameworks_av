@@ -29,6 +29,7 @@
 #include <media/IMediaPlayer.h>
 #include <media/IMediaDeathNotifier.h>
 #include <media/IStreamSource.h>
+#include <android/content/AttributionSourceState.h>
 
 #include <utils/KeyedVector.h>
 #include <utils/String8.h>
@@ -194,7 +195,8 @@ enum media_player_invoke_ids {
     INVOKE_ID_SELECT_TRACK = 4,
     INVOKE_ID_UNSELECT_TRACK = 5,
     INVOKE_ID_SET_VIDEO_SCALING_MODE = 6,
-    INVOKE_ID_GET_SELECTED_TRACK = 7
+    INVOKE_ID_GET_SELECTED_TRACK = 7,
+    INVOKE_ID_SET_PLAYER_IID = 8,
 };
 
 // ----------------------------------------------------------------------------
@@ -211,7 +213,9 @@ class MediaPlayer : public BnMediaPlayerClient,
                     public virtual IMediaDeathNotifier
 {
 public:
-    MediaPlayer(const std::string opPackageName = "");
+    explicit MediaPlayer(const android::content::AttributionSourceState& mAttributionSource =
+        android::content::AttributionSourceState(),
+        audio_session_t sessionId = AUDIO_SESSION_ALLOCATE);
     ~MediaPlayer();
             void            died();
             void            disconnect();
@@ -315,7 +319,7 @@ private:
     float                       mSendLevel;
     struct sockaddr_in          mRetransmitEndpoint;
     bool                        mRetransmitEndpointValid;
-    const std::string           mOpPackageName;
+    const android::content::AttributionSourceState mAttributionSource;
 };
 
 }; // namespace android

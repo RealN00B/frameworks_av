@@ -19,18 +19,22 @@
 #include <gui/Surface.h>
 #include <gui/bufferqueue/1.0/H2BGraphicBufferProducer.h>
 
+#include <aidl/AidlUtils.h>
 #include <hidl/AidlCameraDeviceCallbacks.h>
-#include <hidl/Convert.h>
 #include <hidl/HidlCameraDeviceUser.h>
+#include <hidl/Utils.h>
 #include <android/hardware/camera/device/3.2/types.h>
+#include <android-base/properties.h>
+#include <utils/Utils.h>
 
 namespace android {
 namespace frameworks {
 namespace cameraservice {
 namespace device {
-namespace V2_0 {
+namespace V2_1 {
 namespace implementation {
 
+using hardware::cameraservice::utils::conversion::aidl::filterVndkKeys;
 using hardware::cameraservice::utils::conversion::convertToHidl;
 using hardware::cameraservice::utils::conversion::convertFromHidl;
 using hardware::cameraservice::utils::conversion::B2HStatus;
@@ -55,6 +59,7 @@ HidlCameraDeviceUser::HidlCameraDeviceUser(
     const sp<hardware::camera2::ICameraDeviceUser> &deviceRemote)
   : mDeviceRemote(deviceRemote) {
     mInitSuccess = initDevice();
+    mVndkVersion = getVNDKVersionFromProp(__ANDROID_API_FUTURE__);
 }
 
 bool HidlCameraDeviceUser::initDevice() {
@@ -108,14 +113,14 @@ bool HidlCameraDeviceUser::copyPhysicalCameraSettings(
         physicalCameraSettings->emplace_back();
         CaptureRequest::PhysicalCameraSettings &physicalCameraSetting =
             physicalCameraSettings->back();
-        physicalCameraSetting.id = e.id.c_str();
+        physicalCameraSetting.id = e.id;
 
         // Read the settings either from the fmq or straightaway from the
         // request. We don't need any synchronization, since submitRequestList
         // is guaranteed to be called serially by the client if it decides to
         // use fmq.
         if (e.settings.getDiscriminator() ==
-            FmqSizeOrMetadata::hidl_discriminator::fmqMetadataSize) {
+            V2_0::FmqSizeOrMetadata::hidl_discriminator::fmqMetadataSize) {
             /**
              * Get settings from the fmq.
              */
@@ -196,6 +201,12 @@ Return<HStatus> HidlCameraDeviceUser::beginConfigure() {
 
 Return<HStatus> HidlCameraDeviceUser::endConfigure(StreamConfigurationMode operatingMode,
                                                    const hidl_vec<uint8_t>& sessionParams) {
+    return endConfigure_2_1(operatingMode, sessionParams, systemTime());
+}
+
+Return<HStatus> HidlCameraDeviceUser::endConfigure_2_1(StreamConfigurationMode operatingMode,
+                                                   const hidl_vec<uint8_t>& sessionParams,
+                                                   nsecs_t startTimeNs) {
     android::CameraMetadata cameraMetadata;
     if (!convertFromHidl(sessionParams, &cameraMetadata)) {
         return HStatus::ILLEGAL_ARGUMENT;
@@ -203,7 +214,8 @@ Return<HStatus> HidlCameraDeviceUser::endConfigure(StreamConfigurationMode opera
 
     std::vector<int> offlineStreamIds;
     binder::Status ret = mDeviceRemote->endConfigure(convertFromHidl(operatingMode),
-                                                     cameraMetadata, &offlineStreamIds);
+                                                     cameraMetadata, ns2ms(startTimeNs),
+                                                     &offlineStreamIds);
     return B2HStatus(ret);
 }
 
@@ -228,8 +240,16 @@ Return<void> HidlCameraDeviceUser::createDefaultRequest(TemplateId templateId,
     android::CameraMetadata cameraMetadata;
     binder::Status ret = mDeviceRemote->createDefaultRequest(convertFromHidl(templateId),
                                                              &cameraMetadata);
-    HStatus hStatus = B2HStatus(ret);
+
     HCameraMetadata hidlMetadata;
+    if (filterVndkKeys(mVndkVersion, cameraMetadata, /*isStatic*/false) != OK) {
+        ALOGE("%s: Unable to filter vndk metadata keys for version %d",
+              __FUNCTION__, mVndkVersion);
+        _hidl_cb(HStatus::UNKNOWN_ERROR, hidlMetadata);
+        return Void();
+    }
+
+    HStatus hStatus = B2HStatus(ret);
     const camera_metadata_t *rawMetadata = cameraMetadata.getAndLock();
     convertToHidl(rawMetadata, &hidlMetadata);
     _hidl_cb(hStatus, hidlMetadata);

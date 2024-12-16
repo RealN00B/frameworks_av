@@ -18,11 +18,35 @@
 #define LOG_TAG "ACameraMetadata"
 
 #include "ACameraMetadata.h"
+
+#include <camera_metadata_hidden.h>
 #include <utils/Vector.h>
 #include <system/graphics.h>
 #include <media/NdkImage.h>
 
 using namespace android;
+
+// Formats not listed in the public API, but still available to AImageReader
+// Enum value must match corresponding enum in ui/PublicFormat.h (which is not
+// available to VNDK)
+enum AIMAGE_PRIVATE_FORMATS {
+    /**
+     * Unprocessed implementation-dependent raw
+     * depth measurements, opaque with 16 bit
+     * samples.
+     *
+     */
+
+    AIMAGE_FORMAT_RAW_DEPTH = 0x1002,
+
+    /**
+     * Device specific 10 bits depth RAW image format.
+     *
+     * <p>Unprocessed implementation-dependent raw depth measurements, opaque with 10 bit samples
+     * and device specific bit layout.</p>
+     */
+    AIMAGE_FORMAT_RAW_DEPTH10 = 0x1003,
+};
 
 /**
  * ACameraMetadata Implementation
@@ -63,6 +87,19 @@ ACameraMetadata::init() {
         filterDurations(ANDROID_DEPTH_AVAILABLE_DYNAMIC_DEPTH_STALL_DURATIONS);
     }
     // TODO: filter request/result keys
+    const CameraMetadata& metadata = *mData;
+    const camera_metadata_t *rawMetadata = metadata.getAndLock();
+    metadata_vendor_id_t vendorTagId = get_camera_metadata_vendor_id(rawMetadata);
+    metadata.unlock(rawMetadata);
+    sp<VendorTagDescriptorCache> vtCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    if (vtCache == nullptr) {
+        ALOGE("%s: error vendor tag descriptor cache is not initialized", __FUNCTION__);
+        return;
+    }
+    vtCache->getVendorTagDescriptor(vendorTagId, &mVTags);
+    if (mVTags == nullptr) {
+        ALOGE("%s: error retrieving vendor tag descriptor", __FUNCTION__);
+    }
 }
 
 bool
@@ -120,7 +157,7 @@ ACameraMetadata::derivePhysicalCameraIds() {
         if (ids[i] == '\0') {
             if (start != i) {
                 mStaticPhysicalCameraIdValues.push_back(String8((const char *)ids+start));
-                mStaticPhysicalCameraIds.push_back(mStaticPhysicalCameraIdValues.back().string());
+                mStaticPhysicalCameraIds.push_back(mStaticPhysicalCameraIdValues.back().c_str());
             }
             start = i+1;
         }
@@ -160,7 +197,7 @@ ACameraMetadata::filterDurations(uint32_t tag) {
         int64_t format = entry.data.i64[i + STREAM_FORMAT_OFFSET];
         int64_t width = entry.data.i64[i + STREAM_WIDTH_OFFSET];
         int64_t height = entry.data.i64[i + STREAM_HEIGHT_OFFSET];
-        int64_t duration = entry.data.i32[i + STREAM_DURATION_OFFSET];
+        int64_t duration = entry.data.i64[i + STREAM_DURATION_OFFSET];
 
         // Leave the unfiltered format in so apps depending on previous wrong
         // filter behavior continue to work
@@ -290,6 +327,10 @@ ACameraMetadata::filterStreamConfigurations() {
             format = AIMAGE_FORMAT_DEPTH_POINT_CLOUD;
         } else if (format == HAL_PIXEL_FORMAT_Y16) {
             format = AIMAGE_FORMAT_DEPTH16;
+        } else if (format == HAL_PIXEL_FORMAT_RAW16) {
+            format = static_cast<int32_t>(AIMAGE_FORMAT_RAW_DEPTH);
+        } else if (format == HAL_PIXEL_FORMAT_RAW10) {
+            format = static_cast<int32_t>(AIMAGE_FORMAT_RAW_DEPTH10);
         }
 
         filteredDepthStreamConfigs.push_back(format);
@@ -374,7 +415,6 @@ ACameraMetadata::getConstEntry(uint32_t tag, ACameraMetadata_const_entry* entry)
 
     camera_metadata_ro_entry rawEntry = static_cast<const CameraMetadata*>(mData.get())->find(tag);
     if (rawEntry.count == 0) {
-        ALOGE("%s: cannot find metadata tag %d", __FUNCTION__, tag);
         return ACAMERA_ERROR_METADATA_NOT_FOUND;
     }
     entry->tag = tag;
@@ -426,6 +466,7 @@ ACameraMetadata::getTags(/*out*/int32_t* numTags,
             camera_metadata_ro_entry_t entry;
             int ret = get_camera_metadata_ro_entry(rawMetadata, i, &entry);
             if (ret != 0) {
+                mData->unlock(rawMetadata);
                 ALOGE("%s: error reading metadata index %zu", __FUNCTION__, i);
                 return ACAMERA_ERROR_UNKNOWN;
             }
@@ -445,6 +486,13 @@ ACameraMetadata::getTags(/*out*/int32_t* numTags,
 const CameraMetadata&
 ACameraMetadata::getInternalData() const {
     return (*mData);
+}
+
+camera_status_t
+ACameraMetadata::getTagFromName(const char *name, uint32_t *tag) const {
+    Mutex::Autolock _l(mLock);
+    status_t status = CameraMetadata::getTagFromName(name, mVTags.get(), tag);
+    return status == OK ? ACAMERA_OK : ACAMERA_ERROR_METADATA_NOT_FOUND;
 }
 
 bool
@@ -510,8 +558,11 @@ ACameraMetadata::isCaptureRequestTag(const uint32_t tag) {
         case ACAMERA_CONTROL_ENABLE_ZSL:
         case ACAMERA_CONTROL_EXTENDED_SCENE_MODE:
         case ACAMERA_CONTROL_ZOOM_RATIO:
+        case ACAMERA_CONTROL_SETTINGS_OVERRIDE:
+        case ACAMERA_CONTROL_AUTOFRAMING:
         case ACAMERA_EDGE_MODE:
         case ACAMERA_FLASH_MODE:
+        case ACAMERA_FLASH_STRENGTH_LEVEL:
         case ACAMERA_HOT_PIXEL_MODE:
         case ACAMERA_JPEG_GPS_COORDINATES:
         case ACAMERA_JPEG_GPS_PROCESSING_METHOD:
@@ -527,11 +578,13 @@ ACameraMetadata::isCaptureRequestTag(const uint32_t tag) {
         case ACAMERA_LENS_OPTICAL_STABILIZATION_MODE:
         case ACAMERA_NOISE_REDUCTION_MODE:
         case ACAMERA_SCALER_CROP_REGION:
+        case ACAMERA_SCALER_ROTATE_AND_CROP:
         case ACAMERA_SENSOR_EXPOSURE_TIME:
         case ACAMERA_SENSOR_FRAME_DURATION:
         case ACAMERA_SENSOR_SENSITIVITY:
         case ACAMERA_SENSOR_TEST_PATTERN_DATA:
         case ACAMERA_SENSOR_TEST_PATTERN_MODE:
+        case ACAMERA_SENSOR_PIXEL_MODE:
         case ACAMERA_SHADING_MODE:
         case ACAMERA_STATISTICS_FACE_DETECT_MODE:
         case ACAMERA_STATISTICS_HOT_PIXEL_MAP_MODE:
@@ -556,6 +609,7 @@ std::unordered_set<uint32_t> ACameraMetadata::sSystemTags ({
     ANDROID_CONTROL_SCENE_MODE_OVERRIDES,
     ANDROID_CONTROL_AE_PRECAPTURE_ID,
     ANDROID_CONTROL_AF_TRIGGER_ID,
+    ANDROID_CONTROL_SETTINGS_OVERRIDING_FRAME_NUMBER,
     ANDROID_DEMOSAIC_MODE,
     ANDROID_EDGE_STRENGTH,
     ANDROID_FLASH_FIRING_POWER,
@@ -582,6 +636,7 @@ std::unordered_set<uint32_t> ACameraMetadata::sSystemTags ({
     ANDROID_SENSOR_PROFILE_HUE_SAT_MAP,
     ANDROID_SENSOR_PROFILE_TONE_CURVE,
     ANDROID_SENSOR_OPAQUE_RAW_SIZE,
+    ANDROID_SENSOR_OPAQUE_RAW_SIZE_MAXIMUM_RESOLUTION,
     ANDROID_SHADING_STRENGTH,
     ANDROID_STATISTICS_HISTOGRAM_MODE,
     ANDROID_STATISTICS_SHARPNESS_MAP_MODE,

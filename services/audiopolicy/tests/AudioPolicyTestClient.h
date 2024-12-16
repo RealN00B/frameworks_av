@@ -25,15 +25,20 @@ public:
     virtual ~AudioPolicyTestClient() = default;
 
     // AudioPolicyClientInterface Implementation
+    status_t getAudioPolicyConfig(media::AudioPolicyConfig* /*config*/) override {
+        return INVALID_OPERATION;
+    }
     audio_module_handle_t loadHwModule(const char* /*name*/) override {
         return AUDIO_MODULE_HANDLE_NONE;
     }
     status_t openOutput(audio_module_handle_t /*module*/,
                         audio_io_handle_t* /*output*/,
-                        audio_config_t* /*config*/,
+                        audio_config_t* /*halConfig*/,
+                        audio_config_base_t* /*mixerConfig*/,
                         const sp<DeviceDescriptorBase>& /*device*/,
                         uint32_t* /*latencyMs*/,
-                        audio_output_flags_t /*flags*/) override { return NO_INIT; }
+                        audio_output_flags_t /*flags*/,
+                        audio_attributes_t /*attributes*/) override { return NO_INIT; }
     audio_io_handle_t openDuplicateOutput(audio_io_handle_t /*output1*/,
                                           audio_io_handle_t /*output2*/) override {
         return AUDIO_IO_HANDLE_NONE;
@@ -53,7 +58,10 @@ public:
                              float /*volume*/,
                              audio_io_handle_t /*output*/,
                              int /*delayMs*/) override { return NO_INIT; }
-    status_t invalidateStream(audio_stream_type_t /*stream*/) override { return NO_INIT; }
+
+    status_t setPortsVolume(const std::vector<audio_port_handle_t>& /*ports*/, float /*volume*/,
+            audio_io_handle_t /*output*/, int /*delayMs*/) override { return NO_INIT; }
+
     void setParameters(audio_io_handle_t /*ioHandle*/,
                        const String8& /*keyValuePairs*/,
                        int /*delayMs*/) override { }
@@ -83,10 +91,35 @@ public:
                                         std::vector<effect_descriptor_t> effects __unused,
                                         audio_patch_handle_t patchHandle __unused,
                                         audio_source_t source __unused) override { }
+    void onRoutingUpdated() override { }
+    void onVolumeRangeInitRequest() override { }
     void setEffectSuspended(int effectId __unused,
                             audio_session_t sessionId __unused,
                             bool suspended __unused) {}
     void setSoundTriggerCaptureState(bool active __unused) override {};
+    status_t getAudioPort(struct audio_port_v7 *port __unused) override {
+        return INVALID_OPERATION;
+    };
+    status_t updateSecondaryOutputs(
+            const TrackSecondaryOutputsMap& trackSecondaryOutputs __unused) override {
+        return NO_INIT;
+    }
+    status_t setDeviceConnectedState(const struct audio_port_v7 *port __unused,
+                                     media::DeviceConnectedState state __unused) override {
+        return NO_INIT;
+    }
+    status_t invalidateTracks(const std::vector<audio_port_handle_t>& /*portIds*/) override {
+        return NO_INIT;
+    }
+    status_t getAudioMixPort(const struct audio_port_v7 *devicePort __unused,
+                             struct audio_port_v7 *mixPort __unused) override {
+        return INVALID_OPERATION;
+    }
+
+    status_t setTracksInternalMute(
+            const std::vector<media::TrackInternalMuteInfo>& /*tracksInternalMute*/) override {
+        return INVALID_OPERATION;
+    }
 };
 
 } // namespace android

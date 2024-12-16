@@ -27,6 +27,19 @@ namespace android {
 
 namespace camera3 {
 
+void RotateAndCropMapper::initRemappedKeys() {
+    mRemappedKeys.insert(
+            kMeteringRegionsToCorrect.begin(),
+            kMeteringRegionsToCorrect.end());
+    mRemappedKeys.insert(
+            kResultPointsToCorrectNoClamp.begin(),
+            kResultPointsToCorrectNoClamp.end());
+
+    mRemappedKeys.insert(ANDROID_SCALER_ROTATE_AND_CROP);
+    mRemappedKeys.insert(ANDROID_SCALER_CROP_REGION);
+    mRemappedKeys.insert(ANDROID_LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_SENSOR_CROP_REGION);
+}
+
 bool RotateAndCropMapper::isNeeded(const CameraMetadata* deviceInfo) {
     auto entry = deviceInfo->find(ANDROID_SCALER_AVAILABLE_ROTATE_AND_CROP_MODES);
     for (size_t i = 0; i < entry.count; i++) {
@@ -36,6 +49,8 @@ bool RotateAndCropMapper::isNeeded(const CameraMetadata* deviceInfo) {
 }
 
 RotateAndCropMapper::RotateAndCropMapper(const CameraMetadata* deviceInfo) {
+    initRemappedKeys();
+
     auto entry = deviceInfo->find(ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE);
     if (entry.count != 4) return;
 
@@ -128,13 +143,13 @@ status_t RotateAndCropMapper::updateCaptureRequest(CameraMetadata *request) {
                    ch :                 // pillarbox or 1:1, full height
                    cw / mRotateAspect;  // letterbox, not full height
         switch (rotateMode) {
-            case ANDROID_SCALER_ROTATE_AND_CROP_90:
+            case ANDROID_SCALER_ROTATE_AND_CROP_270:
                 transformMat[1] = -rw / ch; // +y -> -x
                 transformMat[2] =  rh / cw; // +x -> +y
                 xShift = (cw + rw) / 2; // left edge of crop to right edge of rotated
                 yShift = (ch - rh) / 2; // top edge of crop to top edge of rotated
                 break;
-            case ANDROID_SCALER_ROTATE_AND_CROP_270:
+            case ANDROID_SCALER_ROTATE_AND_CROP_90:
                 transformMat[1] =  rw / ch; // +y -> +x
                 transformMat[2] = -rh / cw; // +x -> -y
                 xShift = (cw - rw) / 2; // left edge of crop to left edge of rotated
@@ -257,13 +272,13 @@ status_t RotateAndCropMapper::updateCaptureResult(CameraMetadata *result) {
         rx = cx + (cw - rw) / 2;
         ry = cy + (ch - rh) / 2;
         switch (rotateMode) {
-            case ANDROID_SCALER_ROTATE_AND_CROP_90:
+            case ANDROID_SCALER_ROTATE_AND_CROP_270:
                 transformMat[1] =  ch / rw; // +y -> +x
                 transformMat[2] = -cw / rh; // +x -> -y
                 xShift = -(cw - rw) / 2; // left edge of rotated to left edge of cropped
                 yShift = ry - cy + ch;   // top edge of rotated to bottom edge of cropped
                 break;
-            case ANDROID_SCALER_ROTATE_AND_CROP_270:
+            case ANDROID_SCALER_ROTATE_AND_CROP_90:
                 transformMat[1] = -ch / rw; // +y -> -x
                 transformMat[2] =  cw / rh; // +x -> +y
                 xShift = (cw + rw) / 2; // left edge of rotated to left edge of cropped

@@ -19,7 +19,6 @@
 
 #include <queue>
 
-#include <gui/IProducerListener.h>
 #include <gui/CpuConsumer.h>
 
 #include <media/hardware/VideoAPI.h>
@@ -42,11 +41,14 @@ public:
     ~HeicCompositeStream() override;
 
     static bool isHeicCompositeStream(const sp<Surface> &surface);
+    static bool isHeicCompositeStreamInfo(const OutputStreamInfo& streamInfo);
 
     status_t createInternalStreams(const std::vector<sp<Surface>>& consumers,
             bool hasDeferredConsumer, uint32_t width, uint32_t height, int format,
-            camera3_stream_rotation_t rotation, int *id, const String8& physicalCameraId,
-            std::vector<int> *surfaceIds, int streamSetId, bool isShared) override;
+            camera_stream_rotation_t rotation, int *id, const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed,
+            std::vector<int> *surfaceIds, int streamSetId, bool isShared, int32_t colorSpace,
+            int64_t dynamicProfile, int64_t streamUseCase, bool useReadoutTimestamp) override;
 
     status_t deleteInternalStreams() override;
 
@@ -72,6 +74,9 @@ public:
     // Return stream information about the internal camera streams
     static status_t getCompositeStreamInfo(const OutputStreamInfo &streamInfo,
             const CameraMetadata& ch, std::vector<OutputStreamInfo>* compositeOutput /*out*/);
+
+    // Get composite stream stats
+    void getStreamStats(hardware::CameraStreamStats*) override {};
 
     static bool isSizeSupportedByHeifEncoder(int32_t width, int32_t height,
             bool* useHeic, bool* useGrid, int64_t* stall, AString* hevcName = nullptr);
@@ -228,10 +233,10 @@ private:
     bool              mYuvBufferAcquired; // Only applicable to HEVC codec
     std::queue<int64_t> mMainImageFrameNumbers;
 
-    static const int32_t kMaxOutputSurfaceProducerCount = 1;
-    sp<Surface>       mOutputSurface;
-    sp<ProducerListener> mProducerListener;
-    int32_t           mDequeuedOutputBufferCnt;
+    static const int32_t        kMaxOutputSurfaceProducerCount = 1;
+    sp<Surface>                 mOutputSurface;
+    sp<StreamSurfaceListener>   mStreamSurfaceListener;
+    int32_t                     mDequeuedOutputBufferCnt;
 
     // Map from frame number to JPEG setting of orientation+quality
     struct HeicSettings {

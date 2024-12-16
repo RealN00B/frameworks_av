@@ -185,6 +185,8 @@ DownmixerBufferProvider::DownmixerBufferProvider(
      mDownmixConfig.inputCfg.mask = EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS |
              EFFECT_CONFIG_FORMAT | EFFECT_CONFIG_ACC_MODE;
      mDownmixConfig.outputCfg.mask = mDownmixConfig.inputCfg.mask;
+     mDownmixConfig.inputCfg.buffer.frameCount = bufferFrameCount;
+     mDownmixConfig.outputCfg.buffer.frameCount = bufferFrameCount;
 
      mInFrameSize =
              audio_bytes_per_sample(format) * audio_channel_count_from_out_mask(inputChannelMask);
@@ -362,6 +364,34 @@ void RemixBufferProvider::copyFrames(void *dst, const void *src, size_t frames)
 {
     memcpy_by_index_array(dst, mOutputChannels,
             src, mInputChannels, mIdxAry, mSampleSize, frames);
+}
+
+ChannelMixBufferProvider::ChannelMixBufferProvider(audio_channel_mask_t inputChannelMask,
+        audio_channel_mask_t outputChannelMask, audio_format_t format,
+        size_t bufferFrameCount) :
+        CopyBufferProvider(
+                audio_bytes_per_sample(format)
+                    * audio_channel_count_from_out_mask(inputChannelMask),
+                audio_bytes_per_sample(format)
+                    * audio_channel_count_from_out_mask(outputChannelMask),
+                bufferFrameCount)
+        , mChannelMix{format == AUDIO_FORMAT_PCM_FLOAT
+                ? audio_utils::channels::IChannelMix::create(outputChannelMask) : nullptr}
+        , mIsValid{mChannelMix && mChannelMix->setInputChannelMask(inputChannelMask)}
+{
+    ALOGV("ChannelMixBufferProvider(%p)(%#x, %#x, %#x)",
+            this, format, inputChannelMask, outputChannelMask);
+}
+
+void ChannelMixBufferProvider::copyFrames(void *dst, const void *src, size_t frames)
+{
+    if (mIsValid) {
+        mChannelMix->process(static_cast<const float *>(src), static_cast<float *>(dst),
+                frames, false /* accumulate */);
+    } else {
+        // Should fall back to a different BufferProvider if not valid.
+        ALOGE("%s: Use without being valid!", __func__);
+    }
 }
 
 ReformatBufferProvider::ReformatBufferProvider(int32_t channelCount,
@@ -630,7 +660,8 @@ void TimestretchBufferProvider::processFrames(void *dstBuffer, size_t *dstFrames
 
 AdjustChannelsBufferProvider::AdjustChannelsBufferProvider(
         audio_format_t format, size_t inChannelCount, size_t outChannelCount,
-        size_t frameCount, audio_format_t contractedFormat, void* contractedBuffer) :
+        size_t frameCount, audio_format_t contractedFormat, void* contractedBuffer,
+        size_t contractedOutChannelCount) :
         CopyBufferProvider(
                 audio_bytes_per_frame(inChannelCount, format),
                 audio_bytes_per_frame(std::max(inChannelCount, outChannelCount), format),
@@ -640,15 +671,22 @@ AdjustChannelsBufferProvider::AdjustChannelsBufferProvider(
         mOutChannelCount(outChannelCount),
         mSampleSizeInBytes(audio_bytes_per_sample(format)),
         mFrameCount(frameCount),
-        mContractedChannelCount(inChannelCount - outChannelCount),
-        mContractedFormat(contractedFormat),
+        mContractedFormat(inChannelCount > outChannelCount
+                ? contractedFormat : AUDIO_FORMAT_INVALID),
+        mContractedInChannelCount(inChannelCount > outChannelCount
+                ? inChannelCount - outChannelCount : 0),
+        mContractedOutChannelCount(contractedOutChannelCount),
+        mContractedSampleSizeInBytes(audio_bytes_per_sample(contractedFormat)),
+        mContractedInputFrameSize(mContractedInChannelCount * mContractedSampleSizeInBytes),
         mContractedBuffer(contractedBuffer),
         mContractedWrittenFrames(0)
 {
-    ALOGV("AdjustChannelsBufferProvider(%p)(%#x, %zu, %zu, %zu, %#x, %p)", this, format,
-            inChannelCount, outChannelCount, frameCount, contractedFormat, contractedBuffer);
+    ALOGV("AdjustChannelsBufferProvider(%p)(%#x, %zu, %zu, %zu, %#x, %p, %zu)",
+          this, format, inChannelCount, outChannelCount, frameCount, contractedFormat,
+          contractedBuffer, contractedOutChannelCount);
     if (mContractedFormat != AUDIO_FORMAT_INVALID && mInChannelCount > mOutChannelCount) {
-        mContractedFrameSize = audio_bytes_per_frame(mContractedChannelCount, mContractedFormat);
+        mContractedOutputFrameSize =
+                audio_bytes_per_frame(mContractedOutChannelCount, mContractedFormat);
     }
 }
 
@@ -667,25 +705,39 @@ status_t AdjustChannelsBufferProvider::getNextBuffer(AudioBufferProvider::Buffer
 
 void AdjustChannelsBufferProvider::copyFrames(void *dst, const void *src, size_t frames)
 {
-    if (mInChannelCount > mOutChannelCount) {
-        // For case multi to mono, adjust_channels has special logic that will mix first two input
-        // channels into a single output channel. In that case, use adjust_channels_non_destructive
-        // to keep only one channel data even when contracting to mono.
-        adjust_channels_non_destructive(src, mInChannelCount, dst, mOutChannelCount,
-                mSampleSizeInBytes, frames * mInChannelCount * mSampleSizeInBytes);
-        if (mContractedFormat != AUDIO_FORMAT_INVALID
-            && mContractedBuffer != nullptr) {
-            const size_t contractedIdx = frames * mOutChannelCount * mSampleSizeInBytes;
+    // For case multi to mono, adjust_channels has special logic that will mix first two input
+    // channels into a single output channel. In that case, use adjust_channels_non_destructive
+    // to keep only one channel data even when contracting to mono.
+    adjust_channels_non_destructive(src, mInChannelCount, dst, mOutChannelCount,
+            mSampleSizeInBytes, frames * mInChannelCount * mSampleSizeInBytes);
+    if (mContractedFormat != AUDIO_FORMAT_INVALID
+        && mContractedBuffer != nullptr) {
+        const size_t contractedIdx = frames * mOutChannelCount * mSampleSizeInBytes;
+        uint8_t* oriBuf = (uint8_t*) dst + contractedIdx;
+        uint8_t* buf = (uint8_t*) mContractedBuffer
+                + mContractedWrittenFrames * mContractedOutputFrameSize;
+        if (mContractedInChannelCount > mContractedOutChannelCount) {
+            // Adjust the channels first as the contracted buffer may not have enough
+            // space for the data.
+            // Use adjust_channels_non_destructive to avoid mix first two channels into one single
+            // output channel when it is multi to mono.
+            adjust_channels_non_destructive(
+                    oriBuf, mContractedInChannelCount, oriBuf, mContractedOutChannelCount,
+                    mSampleSizeInBytes, frames * mContractedInChannelCount * mSampleSizeInBytes);
             memcpy_by_audio_format(
-                    (uint8_t*) mContractedBuffer + mContractedWrittenFrames * mContractedFrameSize,
-                    mContractedFormat, (uint8_t*) dst + contractedIdx, mFormat,
-                    mContractedChannelCount * frames);
-            mContractedWrittenFrames += frames;
+                    buf, mContractedFormat, oriBuf, mFormat, mContractedOutChannelCount * frames);
+        } else {
+            // Copy the data first as the dst buffer may not have enough space for extra channel.
+            memcpy_by_audio_format(
+                buf, mContractedFormat, oriBuf, mFormat, mContractedInChannelCount * frames);
+            // Note that if the contracted data is from MONO to MULTICHANNEL, the first 2 channels
+            // will be duplicated with the original single input channel and all the other channels
+            // will be 0-filled.
+            adjust_channels(
+                    buf, mContractedInChannelCount, buf, mContractedOutChannelCount,
+                    mContractedSampleSizeInBytes, mContractedInputFrameSize * frames);
         }
-    } else {
-        // Prefer expanding data from the end of each audio frame.
-        adjust_channels(src, mInChannelCount, dst, mOutChannelCount,
-                mSampleSizeInBytes, frames * mInChannelCount * mSampleSizeInBytes);
+        mContractedWrittenFrames += frames;
     }
 }
 
@@ -694,5 +746,21 @@ void AdjustChannelsBufferProvider::reset()
     mContractedWrittenFrames = 0;
     CopyBufferProvider::reset();
 }
+
+void TeeBufferProvider::copyFrames(void *dst, const void *src, size_t frames) {
+    memcpy(dst, src, frames * mInputFrameSize);
+    if (int teeBufferFrameLeft = mTeeBufferFrameCount - mFrameCopied; teeBufferFrameLeft < frames) {
+        ALOGW("Unable to copy all frames to tee buffer, %d frames dropped",
+              (int)frames - teeBufferFrameLeft);
+        frames = teeBufferFrameLeft;
+    }
+    memcpy(mTeeBuffer + mFrameCopied * mInputFrameSize, src, frames * mInputFrameSize);
+    mFrameCopied += frames;
+}
+
+void TeeBufferProvider::clearFramesCopied() {
+    mFrameCopied = 0;
+}
+
 // ----------------------------------------------------------------------------
 } // namespace android

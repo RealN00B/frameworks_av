@@ -23,6 +23,7 @@
 #include <cutils/properties.h>
 
 #include <android/hardware/ICameraService.h>
+#include <com/android/internal/compat/IPlatformCompatNative.h>
 
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
@@ -30,6 +31,7 @@
 
 #include <camera/CameraBase.h>
 #include <camera/CameraUtils.h>
+#include <camera/StringUtils.h>
 
 // needed to instantiate
 #include <camera/Camera.h>
@@ -57,7 +59,7 @@ status_t CameraInfo::readFromParcel(const android::Parcel* parcel) {
 }
 
 status_t CameraStatus::writeToParcel(android::Parcel* parcel) const {
-    auto res = parcel->writeString16(String16(cameraId));
+    auto res = parcel->writeString16(toString16(cameraId));
     if (res != OK) return res;
 
     res = parcel->writeInt32(status);
@@ -65,9 +67,15 @@ status_t CameraStatus::writeToParcel(android::Parcel* parcel) const {
 
     std::vector<String16> unavailablePhysicalIds16;
     for (auto& id8 : unavailablePhysicalIds) {
-        unavailablePhysicalIds16.push_back(String16(id8));
+        unavailablePhysicalIds16.push_back(toString16(id8));
     }
     res = parcel->writeString16Vector(unavailablePhysicalIds16);
+    if (res != OK) return res;
+
+    res = parcel->writeString16(toString16(clientPackage));
+    if (res != OK) return res;
+
+    res = parcel->writeInt32(deviceId);
     return res;
 }
 
@@ -75,7 +83,7 @@ status_t CameraStatus::readFromParcel(const android::Parcel* parcel) {
     String16 tempCameraId;
     auto res = parcel->readString16(&tempCameraId);
     if (res != OK) return res;
-    cameraId = String8(tempCameraId);
+    cameraId = toString8(tempCameraId);
 
     res = parcel->readInt32(&status);
     if (res != OK) return res;
@@ -84,8 +92,15 @@ status_t CameraStatus::readFromParcel(const android::Parcel* parcel) {
     res = parcel->readString16Vector(&unavailablePhysicalIds16);
     if (res != OK) return res;
     for (auto& id16 : unavailablePhysicalIds16) {
-        unavailablePhysicalIds.push_back(String8(id16));
+        unavailablePhysicalIds.push_back(toStdString(id16));
     }
+
+    String16 tempClientPackage;
+    res = parcel->readString16(&tempClientPackage);
+    if (res != OK) return res;
+    clientPackage = toStdString(tempClientPackage);
+
+    res = parcel->readInt32(&deviceId);
     return res;
 }
 
@@ -93,7 +108,6 @@ status_t CameraStatus::readFromParcel(const android::Parcel* parcel) {
 
 namespace {
     sp<::android::hardware::ICameraService> gCameraService;
-    const int                 kCameraServicePollDelay = 500000; // 0.5s
     const char*               kCameraServiceName      = "media.camera";
 
     Mutex                     gLock;
@@ -113,7 +127,7 @@ namespace {
     };
 
     sp<DeathNotifier>         gDeathNotifier;
-}; // namespace anonymous
+} // namespace anonymous
 
 ///////////////////////////////////////////////////////////
 // CameraBase definition
@@ -131,14 +145,10 @@ const sp<::android::hardware::ICameraService> CameraBase<TCam, TCamTraits>::getC
 
         sp<IServiceManager> sm = defaultServiceManager();
         sp<IBinder> binder;
-        do {
-            binder = sm->getService(String16(kCameraServiceName));
-            if (binder != 0) {
-                break;
-            }
-            ALOGW("CameraService not published, waiting...");
-            usleep(kCameraServicePollDelay);
-        } while(true);
+        binder = sm->waitForService(toString16(kCameraServiceName));
+        if (binder == nullptr) {
+            return nullptr;
+        }
         if (gDeathNotifier == NULL) {
             gDeathNotifier = new DeathNotifier();
         }
@@ -151,8 +161,10 @@ const sp<::android::hardware::ICameraService> CameraBase<TCam, TCamTraits>::getC
 
 template <typename TCam, typename TCamTraits>
 sp<TCam> CameraBase<TCam, TCamTraits>::connect(int cameraId,
-                                               const String16& clientPackageName,
-                                               int clientUid, int clientPid)
+                                               int targetSdkVersion, int rotationOverride,
+                                               bool forceSlowJpegMode,
+                                               const AttributionSourceState& clientAttribution,
+                                               int32_t devicePolicy)
 {
     ALOGV("%s: connect", __FUNCTION__);
     sp<TCam> c = new TCam(cameraId);
@@ -162,15 +174,18 @@ sp<TCam> CameraBase<TCam, TCamTraits>::connect(int cameraId,
     binder::Status ret;
     if (cs != nullptr) {
         TCamConnectService fnConnectService = TCamTraits::fnConnectService;
-        ret = (cs.get()->*fnConnectService)(cl, cameraId, clientPackageName, clientUid,
-                                               clientPid, /*out*/ &c->mCamera);
+        ALOGI("Connect camera (legacy API) - rotationOverride %d, forceSlowJpegMode %d",
+                rotationOverride, forceSlowJpegMode);
+        ret = (cs.get()->*fnConnectService)(cl, cameraId, targetSdkVersion,
+                rotationOverride, forceSlowJpegMode, clientAttribution, devicePolicy,
+                /*out*/ &c->mCamera);
     }
     if (ret.isOk() && c->mCamera != nullptr) {
         IInterface::asBinder(c->mCamera)->linkToDeath(c);
         c->mStatus = NO_ERROR;
     } else {
         ALOGW("An error occurred while connecting to camera %d: %s", cameraId,
-                (cs == nullptr) ? "Service not available" : ret.toString8().string());
+                (cs == nullptr) ? "Service not available" : ret.toString8().c_str());
         c.clear();
     }
     return c;
@@ -242,7 +257,8 @@ void CameraBase<TCam, TCamTraits>::notifyCallback(int32_t msgType,
 }
 
 template <typename TCam, typename TCamTraits>
-int CameraBase<TCam, TCamTraits>::getNumberOfCameras() {
+int CameraBase<TCam, TCamTraits>::getNumberOfCameras(
+        const AttributionSourceState& clientAttribution, int32_t devicePolicy) {
     const sp<::android::hardware::ICameraService> cs = getCameraService();
 
     if (!cs.get()) {
@@ -251,11 +267,11 @@ int CameraBase<TCam, TCamTraits>::getNumberOfCameras() {
     }
     int32_t count;
     binder::Status res = cs->getNumberOfCameras(
-            ::android::hardware::ICameraService::CAMERA_TYPE_BACKWARD_COMPATIBLE,
-            &count);
+            ::android::hardware::ICameraService::CAMERA_TYPE_BACKWARD_COMPATIBLE, clientAttribution,
+            devicePolicy, &count);
     if (!res.isOk()) {
         ALOGE("Error reading number of cameras: %s",
-                res.toString8().string());
+                res.toString8().c_str());
         count = 0;
     }
     return count;
@@ -264,10 +280,12 @@ int CameraBase<TCam, TCamTraits>::getNumberOfCameras() {
 // this can be in BaseCamera but it should be an instance method
 template <typename TCam, typename TCamTraits>
 status_t CameraBase<TCam, TCamTraits>::getCameraInfo(int cameraId,
+        int rotationOverride, const AttributionSourceState& clientAttribution, int32_t devicePolicy,
         struct hardware::CameraInfo* cameraInfo) {
     const sp<::android::hardware::ICameraService> cs = getCameraService();
     if (cs == 0) return UNKNOWN_ERROR;
-    binder::Status res = cs->getCameraInfo(cameraId, cameraInfo);
+    binder::Status res = cs->getCameraInfo(cameraId, rotationOverride, clientAttribution,
+            devicePolicy, cameraInfo);
     return res.isOk() ? OK : res.serviceSpecificErrorCode();
 }
 

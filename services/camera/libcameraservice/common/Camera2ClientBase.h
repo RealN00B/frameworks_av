@@ -18,7 +18,11 @@
 #define ANDROID_SERVERS_CAMERA_CAMERA2CLIENT_BASE_H
 
 #include "common/CameraDeviceBase.h"
+#include "camera/CameraMetadata.h"
 #include "camera/CaptureResult.h"
+#include "utils/CameraServiceProxyWrapper.h"
+#include "utils/AttributionAndPermissionUtils.h"
+#include "CameraServiceWatchdog.h"
 
 namespace android {
 
@@ -47,18 +51,29 @@ public:
     // TODO: too many params, move into a ClientArgs<T>
     Camera2ClientBase(const sp<CameraService>& cameraService,
                       const sp<TCamCallbacks>& remoteCallback,
-                      const String16& clientPackageName,
-                      const std::optional<String16>& clientFeatureId,
-                      const String8& cameraId,
+                      std::shared_ptr<CameraServiceProxyWrapper> cameraServiceProxyWrapper,
+                      std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+                      const std::string& clientPackageName,
+                      bool systemNativeClient,
+                      const std::optional<std::string>& clientFeatureId,
+                      const std::string& cameraId,
                       int api1CameraId,
                       int cameraFacing,
+                      int sensorOrientation,
                       int clientPid,
                       uid_t clientUid,
-                      int servicePid);
+                      int servicePid,
+                      bool overrideForPerfClass,
+                      int rotationOverride,
+                      bool legacyClient = false);
     virtual ~Camera2ClientBase();
 
-    virtual status_t      initialize(sp<CameraProviderManager> manager, const String8& monitorTags);
-    virtual status_t      dumpClient(int fd, const Vector<String16>& args);
+    virtual status_t      initialize(sp<CameraProviderManager> manager,
+            const std::string& monitorTags) override;
+    virtual status_t      dumpClient(int fd, const Vector<String16>& args) override;
+    virtual status_t      startWatchingTags(const std::string &tags, int out) override;
+    virtual status_t      stopWatchingTags(int out) override;
+    virtual status_t      dumpWatchedEventsToVector(std::vector<std::string> &out) override;
 
     /**
      * NotificationListener implementation
@@ -66,7 +81,13 @@ public:
 
     virtual void          notifyError(int32_t errorCode,
                                       const CaptureResultExtras& resultExtras);
-    virtual void          notifyIdle();
+    virtual void          notifyPhysicalCameraChange(const std::string &physicalId) override;
+    // Returns errors on app ops permission failures
+    virtual status_t      notifyActive(float maxPreviewFps);
+    virtual void          notifyIdle(int64_t /*requestCount*/, int64_t /*resultErrorCount*/,
+                                     bool /*deviceError*/,
+                                     std::pair<int32_t, int32_t> /*mostRequestedFpsRange*/,
+                                     const std::vector<hardware::CameraStreamStats>&) {}
     virtual void          notifyShutter(const CaptureResultExtras& resultExtras,
                                         nsecs_t timestamp);
     virtual void          notifyAutoFocus(uint8_t newState, int triggerId);
@@ -76,6 +97,13 @@ public:
     virtual void          notifyPrepared(int streamId);
     virtual void          notifyRequestQueueEmpty();
     virtual void          notifyRepeatingRequestError(long lastFrameNumber);
+
+    void                  notifyIdleWithUserTag(int64_t requestCount, int64_t resultErrorCount,
+                                     bool deviceError,
+                                     std::pair<int32_t, int32_t> mostRequestedFpsRange,
+                                     const std::vector<hardware::CameraStreamStats>& streamStats,
+                                     const std::string& userTag, int videoStabilizationMode,
+                                     bool usedUltraWide, bool usedZoomOverride);
 
     int                   getCameraId() const;
     const sp<CameraDeviceBase>&
@@ -109,10 +137,19 @@ public:
         mutable Mutex mRemoteCallbackLock;
     } mSharedCameraCallbacks;
 
+    status_t      injectCamera(const std::string& injectedCamId,
+                               sp<CameraProviderManager> manager) override;
+    status_t      stopInjection() override;
+
+    status_t      injectSessionParams(const CameraMetadata& sessionParams) override;
+
 protected:
 
     // The PID provided in the constructor call
     pid_t mInitialClientPid;
+    bool mOverrideForPerfClass = false;
+    bool mLegacyClient = false;
+    std::shared_ptr<CameraServiceProxyWrapper> mCameraServiceProxyWrapper;
 
     virtual sp<IBinder> asBinderWrapper() {
         return IInterface::asBinder(this);
@@ -130,11 +167,12 @@ protected:
 
     /** CameraDeviceBase instance wrapping HAL3+ entry */
 
-    const int mDeviceVersion;
-
-    // Set to const to avoid mDevice being updated (update of sp<> is racy) during
-    // dumpDevice (which is important to be lock free for debugging purpose)
-    const sp<CameraDeviceBase>  mDevice;
+    // Note: This was previously set to const to avoid mDevice being updated -
+    // b/112639939 (update of sp<> is racy) during dumpDevice (which is important to be lock free
+    // for debugging purpose). The const has been removed since CameraDeviceBase
+    // needs to be set during initializeImpl(). This must not be set / cleared
+    // anywhere else.
+    sp<CameraDeviceBase>  mDevice;
 
     /** Utility members */
 
@@ -149,7 +187,10 @@ protected:
 
 private:
     template<typename TProviderPtr>
-    status_t              initializeImpl(TProviderPtr providerPtr, const String8& monitorTags);
+    status_t              initializeImpl(TProviderPtr providerPtr, const std::string& monitorTags);
+
+    binder::Status disconnectImpl();
+
 };
 
 }; // namespace android

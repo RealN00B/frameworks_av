@@ -29,39 +29,39 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <statslog.h>
+#include <stats_media_metrics.h>
 
 #include "MediaMetricsService.h"
-#include "frameworks/proto_logging/stats/enums/stats/mediametrics/mediametrics.pb.h"
+#include "ValidateId.h"
+#include "frameworks/proto_logging/stats/message/mediametrics_message.pb.h"
 #include "iface_statsd.h"
 
 namespace android {
 
-bool statsd_audiorecord(const mediametrics::Item *item)
-{
+bool statsd_audiorecord(const std::shared_ptr<const mediametrics::Item>& item,
+        const std::shared_ptr<mediametrics::StatsdLog>& statsdLog) {
     if (item == nullptr) return false;
 
     // these go into the statsd wrapper
-    const nsecs_t timestamp = MediaMetricsService::roundTime(item->getTimestamp());
-    std::string pkgName = item->getPkgName();
-    int64_t pkgVersionCode = item->getPkgVersionCode();
-    int64_t mediaApexVersion = 0;
-
+    const nsecs_t timestamp_nanos = MediaMetricsService::roundTime(item->getTimestamp());
+    const std::string package_name = item->getPkgName();
+    const int64_t package_version_code = item->getPkgVersionCode();
+    const int64_t media_apex_version = 0;
 
     // the rest into our own proto
     //
-    ::android::stats::mediametrics::AudioRecordData metrics_proto;
+    ::android::stats::mediametrics_message::AudioRecordData metrics_proto;
 
     // flesh out the protobuf we'll hand off with our data
     //
     std::string encoding;
     if (item->getString("android.media.audiorecord.encoding", &encoding)) {
-        metrics_proto.set_encoding(std::move(encoding));
+        metrics_proto.set_encoding(encoding);
     }
 
     std::string source;
     if (item->getString("android.media.audiorecord.source", &source)) {
-        metrics_proto.set_source(std::move(source));
+        metrics_proto.set_source(source);
     }
 
     int32_t latency = -1;
@@ -79,61 +79,61 @@ bool statsd_audiorecord(const mediametrics::Item *item)
         metrics_proto.set_channels(channels);
     }
 
-    int64_t createdMs = -1;
-    if (item->getInt64("android.media.audiorecord.createdMs", &createdMs)) {
-        metrics_proto.set_created_millis(createdMs);
+    int64_t created_millis = -1;
+    // not currently sent from client.
+    if (item->getInt64("android.media.audiorecord.createdMs", &created_millis)) {
+        metrics_proto.set_created_millis(created_millis);
     }
 
-    int64_t durationMs = -1;
-    if (item->getInt64("android.media.audiorecord.durationMs", &durationMs)) {
-        metrics_proto.set_duration_millis(durationMs);
+    int64_t duration_millis = -1;
+    double durationMs = 0.;
+    if (item->getDouble("android.media.audiorecord.durationMs", &durationMs)) {
+        duration_millis = (int64_t)durationMs;
+        metrics_proto.set_duration_millis(duration_millis);
     }
 
     int32_t count = -1;
+    // not currently sent from client.  (see start count instead).
     if (item->getInt32("android.media.audiorecord.n", &count)) {
         metrics_proto.set_count(count);
     }
 
-    int32_t errcode = -1;
-    if (item->getInt32("android.media.audiorecord.errcode", &errcode)) {
-        metrics_proto.set_error_code(errcode);
-    } else if (item->getInt32("android.media.audiorecord.lastError.code", &errcode)) {
-        metrics_proto.set_error_code(errcode);
+    int32_t error_code = -1;
+    if (item->getInt32("android.media.audiorecord.errcode", &error_code) ||
+        item->getInt32("android.media.audiorecord.lastError.code", &error_code)) {
+        metrics_proto.set_error_code(error_code);
     }
 
-    std::string errfunc;
-    if (item->getString("android.media.audiorecord.errfunc", &errfunc)) {
-        metrics_proto.set_error_function(std::move(errfunc));
-    } else if (item->getString("android.media.audiorecord.lastError.at", &errfunc)) {
-        metrics_proto.set_error_function(std::move(errfunc));
+    std::string error_function;
+    if (item->getString("android.media.audiorecord.errfunc", &error_function) ||
+        item->getString("android.media.audiorecord.lastError.at", &error_function)) {
+        metrics_proto.set_error_function(error_function);
     }
 
-    // portId (int32)
     int32_t port_id = -1;
     if (item->getInt32("android.media.audiorecord.portId", &port_id)) {
         metrics_proto.set_port_id(count);
     }
-    // frameCount (int32)
-    int32_t frameCount = -1;
-    if (item->getInt32("android.media.audiorecord.frameCount", &frameCount)) {
-        metrics_proto.set_frame_count(frameCount);
-    }
-    // attributes (string)
-    std::string attributes;
-    if (item->getString("android.media.audiorecord.attributes", &attributes)) {
-        metrics_proto.set_attributes(std::move(attributes));
-    }
-    // channelMask (int64)
-    int64_t channelMask = -1;
-    if (item->getInt64("android.media.audiorecord.channelMask", &channelMask)) {
-        metrics_proto.set_channel_mask(channelMask);
-    }
-    // startcount (int64)
-    int64_t startcount = -1;
-    if (item->getInt64("android.media.audiorecord.startcount", &startcount)) {
-        metrics_proto.set_start_count(startcount);
+
+    int32_t frame_count = -1;
+    if (item->getInt32("android.media.audiorecord.frameCount", &frame_count)) {
+        metrics_proto.set_frame_count(frame_count);
     }
 
+    std::string attributes;
+    if (item->getString("android.media.audiorecord.attributes", &attributes)) {
+        metrics_proto.set_attributes(attributes);
+    }
+
+    int64_t channel_mask = -1;
+    if (item->getInt64("android.media.audiorecord.channelMask", &channel_mask)) {
+        metrics_proto.set_channel_mask(channel_mask);
+    }
+
+    int64_t start_count = -1;
+    if (item->getInt64("android.media.audiorecord.startCount", &start_count)) {
+        metrics_proto.set_start_count(start_count);
+    }
 
     std::string serialized;
     if (!metrics_proto.SerializeToString(&serialized)) {
@@ -141,17 +141,48 @@ bool statsd_audiorecord(const mediametrics::Item *item)
         return false;
     }
 
-    if (enabled_statsd) {
-        android::util::BytesField bf_serialized( serialized.c_str(), serialized.size());
-        (void)android::util::stats_write(android::util::MEDIAMETRICS_AUDIORECORD_REPORTED,
-                                   timestamp, pkgName.c_str(), pkgVersionCode,
-                                   mediaApexVersion,
-                                   bf_serialized);
+    // Android S
+    // log_session_id (string)
+    std::string logSessionId;
+    (void)item->getString("android.media.audiorecord.logSessionId", &logSessionId);
+    const auto log_session_id = mediametrics::ValidateId::get()->validateId(logSessionId);
 
-    } else {
-        ALOGV("NOT sending: private data (len=%zu)", strlen(serialized.c_str()));
-    }
+    const stats::media_metrics::BytesField bf_serialized( serialized.c_str(), serialized.size());
+    const int result = stats::media_metrics::stats_write(
+        stats::media_metrics::MEDIAMETRICS_AUDIORECORD_REPORTED,
+        timestamp_nanos, package_name.c_str(), package_version_code,
+        media_apex_version,
+        bf_serialized,
+        log_session_id.c_str());
+    std::stringstream log;
+    log << "result:" << result << " {"
+            << " mediametrics_audiorecord_reported:"
+            << stats::media_metrics::MEDIAMETRICS_AUDIORECORD_REPORTED
+            << " timestamp_nanos:" << timestamp_nanos
+            << " package_name:" << package_name
+            << " package_version_code:" << package_version_code
+            << " media_apex_version:" << media_apex_version
 
+            << " encoding:" << encoding
+            << " source:" << source
+            << " latency:" << latency
+            << " samplerate:" << samplerate
+            << " channels:" << channels
+            << " created_millis:" << created_millis
+            << " duration_millis:" << duration_millis
+            << " count:" << count
+            << " error_code:" << error_code
+            << " error_function:" << error_function
+
+            << " port_id:" << port_id
+            << " frame_count:" << frame_count
+            << " attributes:" << attributes
+            << " channel_mask:" << channel_mask
+            << " start_count:" << start_count
+
+            << " log_session_id:" << log_session_id
+            << " }";
+    statsdLog->log(stats::media_metrics::MEDIAMETRICS_AUDIORECORD_REPORTED, log.str());
     return true;
 }
 

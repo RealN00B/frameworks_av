@@ -21,16 +21,16 @@
 #include <sys/types.h>
 
 #include <media/IAudioFlinger.h>
-#include <media/IAudioPolicyService.h>
-#include <media/IEffect.h>
-#include <media/IEffectClient.h>
 #include <media/AudioSystem.h>
 #include <system/audio_effect.h>
+#include <android/content/AttributionSourceState.h>
 
 #include <utils/RefBase.h>
 #include <utils/Errors.h>
 #include <binder/IInterface.h>
 
+#include "android/media/IEffect.h"
+#include "android/media/BnEffectClient.h"
 
 namespace android {
 
@@ -40,7 +40,7 @@ struct effect_param_cblk_t;
 
 // ----------------------------------------------------------------------------
 
-class AudioEffect : public RefBase
+class AudioEffect : public virtual RefBase
 {
 public:
 
@@ -136,7 +136,7 @@ public:
      *                      indicated by count.
      *      PERMISSION_DENIED could not get AudioFlinger interface
      *      NO_INIT         effect library failed to initialize
-     *      BAD_VALUE       invalid audio session or descriptor pointers
+     *      BAD_VALUE       invalid audio session, or invalid descriptor or count pointers
      *
      * Returned value
      *   *descriptor updated with descriptors of pre processings enabled by default
@@ -160,6 +160,7 @@ public:
      *      NO_ERROR        successful operation.
      *      PERMISSION_DENIED could not get AudioFlinger interface
      *                        or caller lacks required permissions.
+     *      BAD_VALUE       invalid pointer to id
      * Returned value
      *   *id:  The new unique system-wide effect id.
      */
@@ -194,7 +195,7 @@ public:
      *      PERMISSION_DENIED could not get AudioFlinger interface
      *                        or caller lacks required permissions.
      *      NO_INIT         effect library failed to initialize.
-     *      BAD_VALUE       invalid source, type uuid or implementation uuid.
+     *      BAD_VALUE       invalid source, type uuid or implementation uuid, or id pointer
      *      NAME_NOT_FOUND  no effect with this uuid or type found.
      *
      * Returned value
@@ -233,7 +234,7 @@ public:
      *      PERMISSION_DENIED could not get AudioFlinger interface
      *                        or caller lacks required permissions.
      *      NO_INIT         effect library failed to initialize.
-     *      BAD_VALUE       invalid type uuid or implementation uuid.
+     *      BAD_VALUE       invalid type uuid or implementation uuid, or id pointer
      *      NAME_NOT_FOUND  no effect with this uuid or type found.
      *
      * Returned value
@@ -277,13 +278,55 @@ public:
     static status_t removeStreamDefaultEffect(audio_unique_id_t id);
 
     /*
-     * Events used by callback function (effect_callback_t).
+     * Events used by callback function (legacy_callback_t).
      */
     enum event_type {
         EVENT_CONTROL_STATUS_CHANGED = 0,
         EVENT_ENABLE_STATUS_CHANGED = 1,
         EVENT_PARAMETER_CHANGED = 2,
-        EVENT_ERROR = 3
+        EVENT_ERROR = 3,
+        EVENT_FRAMES_PROCESSED = 4,
+    };
+
+    class IAudioEffectCallback : public virtual RefBase {
+        friend AudioEffect;
+     protected:
+        /* The event is received when an application loses or
+         * gains the control of the effect engine. Loss of control happens
+         * if another application requests the use of the engine by creating an AudioEffect for
+         * the same effect type but with a higher priority. Control is returned when the
+         * application having the control deletes its AudioEffect object.
+         * @param isGranted: True if control has been granted. False if stolen.
+         */
+        virtual void onControlStatusChanged([[maybe_unused]] bool isGranted) {}
+
+        /* The event is received by all applications not having the
+         * control of the effect engine when the effect is enabled or disabled.
+         * @param isEnabled: True if enabled. False if disabled.
+         */
+        virtual void onEnableStatusChanged([[maybe_unused]] bool isEnabled) {}
+
+        /* The event is received by all applications not having the
+         * control of the effect engine when an effect parameter is changed.
+         * @param param: A vector containing the raw bytes of a effect_param_type containing
+         *   raw data representing a param type, value pair.
+         */
+        // TODO pass an AIDL parcel instead of effect_param_type
+        virtual void onParameterChanged([[maybe_unused]] std::vector<uint8_t> param) {}
+
+        /* The event is received when the binder connection to the mediaserver
+         * is no longer valid. Typically the server has been killed.
+         * @param errorCode: A code representing the type of error.
+         */
+        virtual void onError([[maybe_unused]] status_t errorCode) {}
+
+
+        /* The event is received when the audio server has processed a block of
+         * data.
+         * @param framesProcessed: The number of frames the audio server has
+         *   processed.
+         */
+        virtual void onFramesProcessed([[maybe_unused]] int32_t framesProcessed) {}
     };
 
     /* Callback function notifying client application of a change in effect engine state or
@@ -314,7 +357,7 @@ public:
      *  - EVENT_ERROR:  status_t indicating the error (DEAD_OBJECT when media server dies).
      */
 
-    typedef void (*effect_callback_t)(int32_t event, void* user, void *info);
+    typedef void (*legacy_callback_t)(int32_t event, void* user, void *info);
 
 
     /* Constructor.
@@ -337,9 +380,9 @@ public:
      *
      * Parameters:
      *
-     * opPackageName:      The package name used for app op checks.
+     * client:      Attribution source for app-op checks
      */
-    explicit AudioEffect(const String16& opPackageName);
+    explicit AudioEffect(const android::content::AttributionSourceState& client);
 
     /* Terminates the AudioEffect and unregisters it from AudioFlinger.
      * The effect engine is also destroyed if this AudioEffect was the last controlling
@@ -359,7 +402,7 @@ public:
      * priority:    requested priority for effect control: the priority level corresponds to the
      *      value of priority parameter: negative values indicate lower priorities, positive values
      *      higher priorities, 0 being the normal priority.
-     * cbf:         optional callback function (see effect_callback_t)
+     * cbf:         optional callback function (see legacy_callback_t)
      * user:        pointer to context for use by the callback receiver.
      * sessionId:   audio session this effect is associated to.
      *      If equal to AUDIO_SESSION_OUTPUT_MIX, the effect will be global to
@@ -382,26 +425,49 @@ public:
      *  - NO_INIT: audio flinger or audio hardware not initialized
      */
             status_t    set(const effect_uuid_t *type,
-                            const effect_uuid_t *uuid = NULL,
+                            const effect_uuid_t *uuid = nullptr,
                             int32_t priority = 0,
-                            effect_callback_t cbf = NULL,
-                            void* user = NULL,
+                            const wp<IAudioEffectCallback>& callback = nullptr,
                             audio_session_t sessionId = AUDIO_SESSION_OUTPUT_MIX,
                             audio_io_handle_t io = AUDIO_IO_HANDLE_NONE,
                             const AudioDeviceTypeAddr& device = {},
-                            bool probe = false);
+                            bool probe = false,
+                            bool notifyFramesProcessed = false);
+
+            status_t    set(const effect_uuid_t *type,
+                            const effect_uuid_t *uuid,
+                            int32_t priority,
+                            legacy_callback_t cbf,
+                            void* user,
+                            audio_session_t sessionId = AUDIO_SESSION_OUTPUT_MIX,
+                            audio_io_handle_t io = AUDIO_IO_HANDLE_NONE,
+                            const AudioDeviceTypeAddr& device = {},
+                            bool probe = false,
+                            bool notifyFramesProcessed = false);
     /*
      * Same as above but with type and uuid specified by character strings.
      */
             status_t    set(const char *typeStr,
-                            const char *uuidStr = NULL,
+                            const char *uuidStr = nullptr,
                             int32_t priority = 0,
-                            effect_callback_t cbf = NULL,
-                            void* user = NULL,
+                            const wp<IAudioEffectCallback>& callback = nullptr,
                             audio_session_t sessionId = AUDIO_SESSION_OUTPUT_MIX,
                             audio_io_handle_t io = AUDIO_IO_HANDLE_NONE,
                             const AudioDeviceTypeAddr& device = {},
-                            bool probe = false);
+                            bool probe = false,
+                            bool notifyFramesProcessed = false);
+
+
+            status_t    set(const char *typeStr,
+                            const char *uuidStr,
+                            int32_t priority,
+                            legacy_callback_t cbf,
+                            void* user,
+                            audio_session_t sessionId = AUDIO_SESSION_OUTPUT_MIX,
+                            audio_io_handle_t io = AUDIO_IO_HANDLE_NONE,
+                            const AudioDeviceTypeAddr& device = {},
+                            bool probe = false,
+                            bool notifyFramesProcessed = false);
 
     /* Result of constructing the AudioEffect. This must be checked
      * before using any AudioEffect API.
@@ -452,7 +518,7 @@ public:
      * Returned status (from utils/Errors.h) can be:
      *  - NO_ERROR: successful operation.
      *  - INVALID_OPERATION: the application does not have control of the effect engine.
-     *  - BAD_VALUE: invalid parameter identifier or value.
+     *  - BAD_VALUE: invalid parameter structure pointer, or invalid identifier or value.
      *  - DEAD_OBJECT: the effect engine has been deleted.
      */
      virtual status_t   setParameter(effect_param_t *param);
@@ -497,7 +563,7 @@ public:
      * Returned status (from utils/Errors.h) can be:
      *  - NO_ERROR: successful operation.
      *  - INVALID_OPERATION: the AudioEffect was not successfully initialized.
-     *  - BAD_VALUE: invalid parameter identifier.
+     *  - BAD_VALUE: invalid parameter structure pointer, or invalid parameter identifier.
      *  - DEAD_OBJECT: the effect engine has been deleted.
      */
      virtual status_t   getParameter(effect_param_t *param);
@@ -512,6 +578,25 @@ public:
                               uint32_t *replySize,
                               void *replyData);
 
+    /* Retrieves the configuration of the effect.
+     *
+     * Parameters:
+     *      inputCfg:  pointer to audio_config_base_t structure receiving input
+     *          configuration of the effect
+     *      outputCfg: pointer to audio_config_base_t structure receiving output
+     *          configuration of the effect
+     *
+     * Channel masks of the returned configs are "input" or "output" depending
+     * on the direction of the stream that the effect is attached to.
+     *
+     * Returned status (from utils/Errors.h) can be:
+     *  - NO_ERROR: successful operation.
+     *  - INVALID_OPERATION: the AudioEffect was not successfully initialized.
+     *  - BAD_VALUE: null config pointers
+     *  - DEAD_OBJECT: the effect engine has been deleted.
+     */
+     virtual status_t   getConfigs(audio_config_base_t *inputCfg,
+                                   audio_config_base_t *outputCfg);
 
      /*
       * Utility functions.
@@ -531,64 +616,72 @@ public:
      static const uint32_t kMaxPreProcessing = 10;
 
 protected:
-     const String16          mOpPackageName;     // The package name used for app op checks.
-     bool                    mEnabled = false;   // enable state
-     audio_session_t         mSessionId = AUDIO_SESSION_OUTPUT_MIX; // audio session ID
-     int32_t                 mPriority = 0;      // priority for effect control
-     status_t                mStatus = NO_INIT;  // effect status
-     bool                    mProbe = false;     // effect created in probe mode: all commands
-                                                 // are no ops because mIEffect is NULL
-     effect_callback_t       mCbf = nullptr;     // callback function for status, control and
-                                                 // parameter changes notifications
-     void*                   mUserData = nullptr;// client context for callback function
-     effect_descriptor_t     mDescriptor = {};   // effect descriptor
-     int32_t                 mId = -1;           // system wide unique effect engine instance ID
-     Mutex                   mLock;              // Mutex for mEnabled access
+     android::content::AttributionSourceState mClientAttributionSource; // source for app op checks.
+     bool                     mEnabled = false;   // enable state
+     audio_session_t          mSessionId = AUDIO_SESSION_OUTPUT_MIX; // audio session ID
+     int32_t                  mPriority = 0;      // priority for effect control
+     status_t                 mStatus = NO_INIT;  // effect status
+     bool                     mProbe = false;     // effect created in probe mode: all commands
+                                                 // are no ops because mIEffect is nullptr
+
+     wp<IAudioEffectCallback> mCallback = nullptr; // callback interface for status, control and
+                                                   // parameter changes notifications
+     sp<IAudioEffectCallback> mLegacyWrapper = nullptr;
+     effect_descriptor_t      mDescriptor = {};   // effect descriptor
+     int32_t                  mId = -1;           // system wide unique effect engine instance ID
+     Mutex                    mLock;              // Mutex for mEnabled access
 
 
      // IEffectClient
      virtual void controlStatusChanged(bool controlGranted);
      virtual void enableStatusChanged(bool enabled);
-     virtual void commandExecuted(uint32_t cmdCode,
-             uint32_t cmdSize,
-             void *pCmdData,
-             uint32_t replySize,
-             void *pReplyData);
+     virtual void commandExecuted(int32_t cmdCode,
+                                  const std::vector<uint8_t>& cmdData,
+                                  const std::vector<uint8_t>& replyData);
+     virtual void framesProcessed(int32_t frames);
 
 private:
 
      // Implements the IEffectClient interface
     class EffectClient :
-        public android::BnEffectClient, public android::IBinder::DeathRecipient
+        public media::BnEffectClient, public android::IBinder::DeathRecipient
     {
     public:
 
-        EffectClient(AudioEffect *effect) : mEffect(effect){}
+        explicit EffectClient(const sp<AudioEffect>& effect) : mEffect(effect){}
 
         // IEffectClient
-        virtual void controlStatusChanged(bool controlGranted) {
+        binder::Status controlStatusChanged(bool controlGranted) override {
             sp<AudioEffect> effect = mEffect.promote();
             if (effect != 0) {
                 effect->controlStatusChanged(controlGranted);
             }
+            return binder::Status::ok();
         }
-        virtual void enableStatusChanged(bool enabled) {
+        binder::Status enableStatusChanged(bool enabled) override {
             sp<AudioEffect> effect = mEffect.promote();
             if (effect != 0) {
                 effect->enableStatusChanged(enabled);
             }
+            return binder::Status::ok();
         }
-        virtual void commandExecuted(uint32_t cmdCode,
-                                     uint32_t cmdSize,
-                                     void *pCmdData,
-                                     uint32_t replySize,
-                                     void *pReplyData) {
+        binder::Status commandExecuted(int32_t cmdCode,
+                             const std::vector<uint8_t>& cmdData,
+                             const std::vector<uint8_t>& replyData) override {
             sp<AudioEffect> effect = mEffect.promote();
             if (effect != 0) {
-                effect->commandExecuted(
-                    cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+                effect->commandExecuted(cmdCode, cmdData, replyData);
             }
+            return binder::Status::ok();
         }
+        binder::Status framesProcessed(int32_t frames) override {
+            sp<AudioEffect> effect = mEffect.promote();
+            if (effect != 0) {
+                effect->framesProcessed(frames);
+            }
+            return binder::Status::ok();
+        }
+
 
         // IBinder::DeathRecipient
         virtual void binderDied(const wp<IBinder>& /*who*/) {
@@ -604,12 +697,10 @@ private:
 
     void binderDied();
 
-    sp<IEffect>             mIEffect;           // IEffect binder interface
+    sp<media::IEffect>      mIEffect;           // IEffect binder interface
     sp<EffectClient>        mIEffectClient;     // IEffectClient implementation
     sp<IMemory>             mCblkMemory;        // shared memory for deferred parameter setting
     effect_param_cblk_t*    mCblk = nullptr;    // control block for deferred parameter setting
-    pid_t                   mClientPid = (pid_t)-1;
-    uid_t                   mClientUid = (uid_t)-1;
 };
 
 

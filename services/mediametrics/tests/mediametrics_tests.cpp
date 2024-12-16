@@ -17,19 +17,21 @@
 #define LOG_TAG "mediametrics_tests"
 #include <utils/Log.h>
 
-#include "MediaMetricsService.h"
-
 #include <stdio.h>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <media/MediaMetricsItem.h>
+#include <mediametricsservice/AudioTypes.h>
+#include <mediametricsservice/MediaMetricsService.h>
+#include <mediametricsservice/StringUtils.h>
+#include <mediametricsservice/ValidateId.h>
 #include <system/audio.h>
 
-#include "AudioTypes.h"
-#include "StringUtils.h"
-
 using namespace android;
+using android::mediametrics::stringutils::parseVector;
 
 static size_t countNewlines(const char *s) {
     size_t count = 0;
@@ -55,6 +57,35 @@ TEST(mediametrics_tests, startsWith) {
   ASSERT_EQ(true, android::mediametrics::startsWith(s, std::string("tes")));
   ASSERT_EQ(false, android::mediametrics::startsWith(s, "ts"));
   ASSERT_EQ(false, android::mediametrics::startsWith(s, std::string("est")));
+}
+
+TEST(mediametrics_tests, parseVector) {
+    {
+        std::vector<int32_t> values;
+        EXPECT_EQ(true, parseVector("0{4,300,0,-112343,350}9", &values));
+        EXPECT_EQ(values, std::vector<int32_t>({0, 4, 300, 0, -112343, 350, 9}));
+    }
+    {
+        std::vector<int32_t> values;
+        EXPECT_EQ(true, parseVector("53", &values));
+        EXPECT_EQ(values, std::vector<int32_t>({53}));
+    }
+    {
+        std::vector<int32_t> values;
+        EXPECT_EQ(false, parseVector("5{3,6*3}3", &values));
+        EXPECT_EQ(values, std::vector<int32_t>({}));
+    }
+    {
+        std::vector<int32_t> values = {1}; // should still be this when parsing fails
+        std::vector<int32_t> expected = {1};
+        EXPECT_EQ(false, parseVector("51342abcd,1232", &values));
+        EXPECT_EQ(values, std::vector<int32_t>({1}));
+    }
+    {
+        std::vector<int32_t> values = {2}; // should still be this when parsing fails
+        EXPECT_EQ(false, parseVector("12345678901234,12345678901234", &values));
+        EXPECT_EQ(values, std::vector<int32_t>({2}));
+    }
 }
 
 TEST(mediametrics_tests, defer) {
@@ -809,7 +840,9 @@ TEST(mediametrics_tests, audio_analytics_permission) {
   (*item3).set("four", (int32_t)4)
           .setTimestamp(12);
 
-  android::mediametrics::AudioAnalytics audioAnalytics;
+  std::shared_ptr<mediametrics::StatsdLog> statsdLog =
+          std::make_shared<mediametrics::StatsdLog>(10);
+  android::mediametrics::AudioAnalytics audioAnalytics{statsdLog};
 
   // untrusted entities cannot create a new key.
   ASSERT_EQ(PERMISSION_DENIED, audioAnalytics.submit(item, false /* isTrusted */));
@@ -817,14 +850,14 @@ TEST(mediametrics_tests, audio_analytics_permission) {
 
   // TODO: Verify contents of AudioAnalytics.
   // Currently there is no getter API in AudioAnalytics besides dump.
-  ASSERT_EQ(11, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_EQ(10, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item, true /* isTrusted */));
   // untrusted entities can add to an existing key
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item2, false /* isTrusted */));
 
   // Check that we have some info in the dump.
-  ASSERT_LT(9, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_LT(9, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 }
 
 TEST(mediametrics_tests, audio_analytics_permission2) {
@@ -845,7 +878,9 @@ TEST(mediametrics_tests, audio_analytics_permission2) {
   (*item3).set("four", (int32_t)4)
           .setTimestamp(12);
 
-  android::mediametrics::AudioAnalytics audioAnalytics;
+  std::shared_ptr<mediametrics::StatsdLog> statsdLog =
+          std::make_shared<mediametrics::StatsdLog>(10);
+  android::mediametrics::AudioAnalytics audioAnalytics{statsdLog};
 
   // untrusted entities cannot create a new key.
   ASSERT_EQ(PERMISSION_DENIED, audioAnalytics.submit(item, false /* isTrusted */));
@@ -853,14 +888,14 @@ TEST(mediametrics_tests, audio_analytics_permission2) {
 
   // TODO: Verify contents of AudioAnalytics.
   // Currently there is no getter API in AudioAnalytics besides dump.
-  ASSERT_EQ(11, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_EQ(10, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item, true /* isTrusted */));
   // untrusted entities can add to an existing key
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item2, false /* isTrusted */));
 
   // Check that we have some info in the dump.
-  ASSERT_LT(9, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_LT(9, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 }
 
 TEST(mediametrics_tests, audio_analytics_dump) {
@@ -877,7 +912,9 @@ TEST(mediametrics_tests, audio_analytics_dump) {
   (*item3).set("four", (int32_t)4)
           .setTimestamp(12);
 
-  android::mediametrics::AudioAnalytics audioAnalytics;
+  std::shared_ptr<mediametrics::StatsdLog> statsdLog =
+          std::make_shared<mediametrics::StatsdLog>(10);
+  android::mediametrics::AudioAnalytics audioAnalytics{statsdLog};
 
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item, true /* isTrusted */));
   // untrusted entities can add to an existing key
@@ -885,13 +922,13 @@ TEST(mediametrics_tests, audio_analytics_dump) {
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item3, true /* isTrusted */));
 
   // find out how many lines we have.
-  auto [string, lines] = audioAnalytics.dump(1000);
+  auto [string, lines] = audioAnalytics.dump(true /* details */, 1000);
   ASSERT_EQ(lines, (int32_t) countNewlines(string.c_str()));
 
   printf("AudioAnalytics: %s", string.c_str());
   // ensure that dump operates over those lines.
   for (int32_t ll = 0; ll < lines; ++ll) {
-      auto [s, l] = audioAnalytics.dump(ll);
+      auto [s, l] = audioAnalytics.dump(true /* details */, ll);
       ASSERT_EQ(ll, l);
       ASSERT_EQ(ll, (int32_t) countNewlines(s.c_str()));
   }
@@ -1082,3 +1119,208 @@ TEST(mediametrics_tests, gc_same_key) {
   //mediaMetrics->dump(fileno(stdout), {} /* args */);
 }
 #endif
+
+// Base64Url and isLogSessionId string utilities can be tested by static asserts.
+static_assert(mediametrics::stringutils::isBase64Url("abc"));
+static_assert(mediametrics::stringutils::InverseBase64UrlTable['A'] == 0);
+static_assert(mediametrics::stringutils::InverseBase64UrlTable['a'] == 26);
+static_assert(mediametrics::stringutils::InverseBase64UrlTable['!'] ==
+        mediametrics::stringutils::Transpose::INVALID_CHAR);
+static_assert(mediametrics::stringutils::InverseBase64UrlTable['@'] ==
+        mediametrics::stringutils::Transpose::INVALID_CHAR);
+static_assert(mediametrics::stringutils::InverseBase64UrlTable['#'] ==
+        mediametrics::stringutils::Transpose::INVALID_CHAR);
+static_assert(!mediametrics::stringutils::isBase64Url("!@#"));
+
+static_assert(mediametrics::stringutils::isLogSessionId("0123456789abcdef"));
+static_assert(!mediametrics::stringutils::isLogSessionId("abc"));
+static_assert(!mediametrics::stringutils::isLogSessionId("!@#"));
+static_assert(!mediametrics::stringutils::isLogSessionId("0123456789abcde!"));
+
+TEST(mediametrics_tests, sanitizeLogSessionId) {
+   // invalid id returns empty string.
+   ASSERT_EQ("", mediametrics::stringutils::sanitizeLogSessionId("abc"));
+
+   // valid id passes through.
+   std::string validId = "fedcba9876543210";
+   ASSERT_EQ(validId, mediametrics::stringutils::sanitizeLogSessionId(validId));
+
+   // one more char makes the id invalid
+   ASSERT_EQ("", mediametrics::stringutils::sanitizeLogSessionId(validId + "A"));
+
+   std::string validId2 = "ZYXWVUT123456789";
+   ASSERT_EQ(validId2, mediametrics::stringutils::sanitizeLogSessionId(validId2));
+
+   // one fewer char makes the id invalid
+   ASSERT_EQ("", mediametrics::stringutils::sanitizeLogSessionId(validId.c_str() + 1));
+
+   // replacing one character with an invalid character makes an invalid id.
+   validId2[3] = '!';
+   ASSERT_EQ("", mediametrics::stringutils::sanitizeLogSessionId(validId2));
+}
+
+TEST(mediametrics_tests, LruSet) {
+    constexpr size_t LRU_SET_SIZE = 2;
+    mediametrics::LruSet<std::string> lruSet(LRU_SET_SIZE);
+
+    // test adding a couple strings.
+    lruSet.add("abc");
+    ASSERT_EQ(1u, lruSet.size());
+    ASSERT_TRUE(lruSet.check("abc"));
+    lruSet.add("def");
+    ASSERT_EQ(2u, lruSet.size());
+
+    // now adding the third string causes eviction of the oldest.
+    lruSet.add("ghi");
+    ASSERT_FALSE(lruSet.check("abc"));
+    ASSERT_TRUE(lruSet.check("ghi"));
+    ASSERT_TRUE(lruSet.check("def"));  // "def" is most recent.
+    ASSERT_EQ(2u, lruSet.size());      // "abc" is correctly discarded.
+
+    // adding another string will evict the oldest.
+    lruSet.add("foo");
+    ASSERT_FALSE(lruSet.check("ghi")); // note: "ghi" discarded when "foo" added.
+    ASSERT_TRUE(lruSet.check("foo"));
+    ASSERT_TRUE(lruSet.check("def"));
+
+    // manual removing of a string works, too.
+    ASSERT_TRUE(lruSet.remove("def"));
+    ASSERT_FALSE(lruSet.check("def")); // we manually removed "def".
+    ASSERT_TRUE(lruSet.check("foo"));  // "foo" is still there.
+    ASSERT_EQ(1u, lruSet.size());
+
+    // you can't remove a string that has not been added.
+    ASSERT_FALSE(lruSet.remove("bar")); // Note: "bar" doesn't exist, so remove returns false.
+    ASSERT_EQ(1u, lruSet.size());
+
+    lruSet.add("foo");   // adding "foo" (which already exists) doesn't change size.
+    ASSERT_EQ(1u, lruSet.size());
+    lruSet.add("bar");   // add "bar"
+    ASSERT_EQ(2u, lruSet.size());
+    lruSet.add("glorp"); // add "glorp" evicts "foo".
+    ASSERT_EQ(2u, lruSet.size());
+    ASSERT_TRUE(lruSet.check("bar"));
+    ASSERT_TRUE(lruSet.check("glorp"));
+    ASSERT_FALSE(lruSet.check("foo"));
+}
+
+TEST(mediametrics_tests, LruSet0) {
+    constexpr size_t LRU_SET_SIZE = 0;
+    mediametrics::LruSet<std::string> lruSet(LRU_SET_SIZE);
+
+    lruSet.add("a");
+    ASSERT_EQ(0u, lruSet.size());
+    ASSERT_FALSE(lruSet.check("a"));
+    ASSERT_FALSE(lruSet.remove("a")); // never added.
+    ASSERT_EQ(0u, lruSet.size());
+}
+
+// Returns a 16 Base64Url string representing the decimal representation of value
+// (with leading 0s) e.g. 0000000000000000, 0000000000000001, 0000000000000002, ...
+static std::string generateId(size_t value)
+{
+    char id[16 + 1]; // to be filled with 16 Base64Url chars (and zero termination)
+    char *sptr = id + 16; // start at the end.
+    *sptr-- = 0; // zero terminate.
+    // output the digits from least significant to most significant.
+    while (value) {
+        *sptr-- = value % 10;
+        value /= 10;
+    }
+    // add leading 0's
+    while (sptr > id) {
+        *sptr-- = '0';
+    }
+    return std::string(id);
+}
+
+TEST(mediametrics_tests, ValidateId) {
+    constexpr size_t LRU_SET_SIZE = 3;
+    constexpr size_t IDS = 10;
+    static_assert(IDS > LRU_SET_SIZE);  // IDS must be greater than LRU_SET_SIZE.
+    mediametrics::ValidateId validateId(LRU_SET_SIZE);
+
+
+    // register IDs as integer strings counting from 0.
+    for (size_t i = 0; i < IDS; ++i) {
+        validateId.registerId(generateId(i));
+    }
+
+    // only the last LRU_SET_SIZE exist.
+    for (size_t i = 0; i < IDS - LRU_SET_SIZE; ++i) {
+        ASSERT_EQ("", validateId.validateId(generateId(i)));
+    }
+    for (size_t i = IDS - LRU_SET_SIZE; i < IDS; ++i) {
+        const std::string id = generateId(i);
+        ASSERT_EQ(id, validateId.validateId(id));
+    }
+}
+
+TEST(mediametrics_tests, StatusConversion) {
+    constexpr status_t statuses[] = {
+        NO_ERROR,
+        BAD_VALUE,
+        DEAD_OBJECT,
+        NO_MEMORY,
+        PERMISSION_DENIED,
+        INVALID_OPERATION,
+        WOULD_BLOCK,
+        UNKNOWN_ERROR,
+    };
+
+    auto roundTrip = [](status_t status) {
+        return android::mediametrics::statusStringToStatus(
+                android::mediametrics::statusToStatusString(status));
+    };
+
+    // Primary status error categories.
+    for (const auto status : statuses) {
+        ASSERT_EQ(status, roundTrip(status));
+    }
+
+    // Status errors specially considered.
+    ASSERT_EQ(DEAD_OBJECT, roundTrip(FAILED_TRANSACTION));
+}
+
+TEST(mediametrics_tests, HeatMap) {
+    constexpr size_t SIZE = 2;
+    android::mediametrics::HeatMap heatMap{SIZE};
+    constexpr uid_t UID = 0;
+    constexpr int32_t SUBCODE = 1;
+
+    ASSERT_EQ((size_t)0, heatMap.size());
+    heatMap.add("someKey", "someSuffix", "someEvent",
+            AMEDIAMETRICS_PROP_STATUS_VALUE_OK, UID, "message", SUBCODE);
+    ASSERT_EQ((size_t)1, heatMap.size());
+    heatMap.add("someKey", "someSuffix", "someEvent",
+            AMEDIAMETRICS_PROP_STATUS_VALUE_OK, UID, "message", SUBCODE);
+    heatMap.add("someKey", "someSuffix", "anotherEvent",
+            AMEDIAMETRICS_PROP_STATUS_VALUE_ARGUMENT, UID, "message", SUBCODE);
+    ASSERT_EQ((size_t)1, heatMap.size());
+    heatMap.add("anotherKey", "someSuffix", "someEvent",
+            AMEDIAMETRICS_PROP_STATUS_VALUE_OK, UID, "message", SUBCODE);
+    ASSERT_EQ((size_t)2, heatMap.size());
+    ASSERT_EQ((size_t)0, heatMap.rejected());
+
+    heatMap.add("thirdKey", "someSuffix", "someEvent",
+            AMEDIAMETRICS_PROP_STATUS_VALUE_OK, UID, "message", SUBCODE);
+    ASSERT_EQ((size_t)2, heatMap.size());
+    ASSERT_EQ((size_t)1, heatMap.rejected());
+
+    android::mediametrics::HeatData heatData = heatMap.getData("someKey");
+    ASSERT_EQ((size_t)2, heatData.size());
+    auto count = heatData.heatCount();
+    ASSERT_EQ((size_t)3, count.size()); // pairs in order { total, "anotherEvent", "someEvent" }
+    // check total value
+    ASSERT_EQ((size_t)2, count[0].first);  // OK
+    ASSERT_EQ((size_t)1, count[0].second); // ERROR;
+    // first key "anotherEvent"
+    ASSERT_EQ((size_t)0, count[1].first);  // OK
+    ASSERT_EQ((size_t)1, count[1].second); // ERROR;
+    // second key "someEvent"
+    ASSERT_EQ((size_t)2, count[2].first);  // OK
+    ASSERT_EQ((size_t)0, count[2].second); // ERROR;
+
+    heatMap.clear();
+    ASSERT_EQ((size_t)0, heatMap.size());
+}

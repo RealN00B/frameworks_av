@@ -42,7 +42,7 @@
 #include <gui/Surface.h>
 
 #include <fcntl.h>
-#include <ui/DisplayConfig.h>
+#include <ui/DisplayMode.h>
 
 using namespace android;
 
@@ -318,13 +318,19 @@ int main(int argc, char **argv) {
     sp<SurfaceComposerClient> composerClient = new SurfaceComposerClient;
     CHECK_EQ(composerClient->initCheck(), (status_t)OK);
 
-    const sp<IBinder> display = SurfaceComposerClient::getInternalDisplayToken();
+    const std::vector<PhysicalDisplayId> ids = SurfaceComposerClient::getPhysicalDisplayIds();
+    if (ids.empty()) {
+        SLOGE("Failed to get ID for any displays\n");
+        return 1;
+    }
+
+    const sp<IBinder> display = SurfaceComposerClient::getPhysicalDisplayToken(ids.front());
     CHECK(display != nullptr);
 
-    DisplayConfig config;
-    CHECK_EQ(SurfaceComposerClient::getActiveDisplayConfig(display, &config), NO_ERROR);
+    ui::DisplayMode mode;
+    CHECK_EQ(SurfaceComposerClient::getActiveDisplayMode(display, &mode), NO_ERROR);
 
-    const ui::Size& resolution = config.resolution;
+    const ui::Size& resolution = mode.resolution;
     const ssize_t displayWidth = resolution.getWidth();
     const ssize_t displayHeight = resolution.getHeight();
 

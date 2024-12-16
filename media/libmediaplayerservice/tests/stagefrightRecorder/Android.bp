@@ -33,10 +33,6 @@ cc_test {
         "StagefrightRecorderTest.cpp",
     ],
 
-    include_dirs: [
-        "frameworks/av/media/libmediaplayerservice",
-    ],
-
     static_libs: [
         "libmediaplayerservice",
         "libstagefright_httplive",
@@ -73,6 +69,8 @@ cc_test {
         "libstagefright",
         "libstagefright_foundation",
         "libutils",
+        "framework-permission-aidl-cpp",
+        "libaudioclient_aidl_conversion",
     ],
 
     cflags: [

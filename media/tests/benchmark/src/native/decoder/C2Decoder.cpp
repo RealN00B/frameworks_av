@@ -53,8 +53,8 @@ int32_t C2Decoder::createCodec2Component(string compName, AMediaFormat *format) 
     }
 
     int64_t sTime = mStats->getCurTime();
-    mComponent = mClient->CreateComponentByName(compName.c_str(), mListener, &mClient);
-    if (mComponent == nullptr) {
+    if (mClient->CreateComponentByName(compName.c_str(), mListener, &mComponent, &mClient) !=
+        C2_OK) {
         ALOGE("Create component failed for %s", compName.c_str());
         return -1;
     }
@@ -106,7 +106,7 @@ int32_t C2Decoder::decodeFrames(uint8_t *inputBuffer, vector<AMediaCodecBufferIn
         work->input.ordinal.frameIndex = mNumInputFrame;
         work->input.buffers.clear();
         int size = frameInfo[mNumInputFrame].size;
-        int alignedSize = ALIGN(size, PAGE_SIZE);
+        int alignedSize = ALIGN(size, getpagesize());
         if (size) {
             std::shared_ptr<C2LinearBlock> block;
             status = mLinearPool->fetchLinearBlock(

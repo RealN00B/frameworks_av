@@ -31,6 +31,7 @@
 #include <gui/BufferItem.h>
 #include <gui/Surface.h>
 #include <media/hardware/HardwareAPI.h>
+#include <camera/StringUtils.h>
 
 #include "common/CameraDeviceBase.h"
 #include "api1/Camera2Client.h"
@@ -39,6 +40,10 @@
 
 namespace android {
 namespace camera2 {
+
+using android::camera3::CAMERA_STREAM_ROTATION_0;
+using android::camera3::CAMERA_TEMPLATE_PREVIEW;
+using android::camera3::CAMERA_TEMPLATE_ZERO_SHUTTER_LAG;
 
 StreamingProcessor::StreamingProcessor(sp<Camera2Client> client):
         mClient(client),
@@ -113,12 +118,12 @@ status_t StreamingProcessor::updatePreviewRequest(const Parameters &params) {
             return INVALID_OPERATION;
         }
 
-        // Use CAMERA3_TEMPLATE_ZERO_SHUTTER_LAG for ZSL streaming case.
+        // Use CAMERA_TEMPLATE_ZERO_SHUTTER_LAG for ZSL streaming case.
         if (params.useZeroShutterLag() && !params.recordingHint) {
             res = device->createDefaultRequest(
-                    CAMERA3_TEMPLATE_ZERO_SHUTTER_LAG, &mPreviewRequest);
+                    CAMERA_TEMPLATE_ZERO_SHUTTER_LAG, &mPreviewRequest);
         } else {
-            res = device->createDefaultRequest(CAMERA3_TEMPLATE_PREVIEW,
+            res = device->createDefaultRequest(CAMERA_TEMPLATE_PREVIEW,
                     &mPreviewRequest);
         }
 
@@ -194,7 +199,8 @@ status_t StreamingProcessor::updatePreviewStream(const Parameters &params) {
         res = device->createStream(mPreviewWindow,
                 params.previewWidth, params.previewHeight,
                 CAMERA2_HAL_PIXEL_FORMAT_OPAQUE, HAL_DATASPACE_UNKNOWN,
-                CAMERA3_STREAM_ROTATION_0, &mPreviewStreamId, String8());
+                CAMERA_STREAM_ROTATION_0, &mPreviewStreamId, std::string(),
+                std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
         if (res != OK) {
             ALOGE("%s: Camera %d: Unable to create preview stream: %s (%d)",
                     __FUNCTION__, mId, strerror(-res), res);
@@ -263,7 +269,7 @@ status_t StreamingProcessor::updateRecordingRequest(const Parameters &params) {
     }
 
     if (mRecordingRequest.entryCount() == 0) {
-        res = device->createDefaultRequest(CAMERA2_TEMPLATE_VIDEO_RECORD,
+        res = device->createDefaultRequest(camera_request_template_t::CAMERA_TEMPLATE_VIDEO_RECORD,
                 &mRecordingRequest);
         if (res != OK) {
             ALOGE("%s: Camera %d: Unable to create default recording request:"
@@ -379,8 +385,8 @@ status_t StreamingProcessor::updateRecordingStream(const Parameters &params) {
         res = device->createStream(mRecordingWindow,
                 params.videoWidth, params.videoHeight,
                 params.videoFormat, params.videoDataSpace,
-                CAMERA3_STREAM_ROTATION_0, &mRecordingStreamId,
-                String8());
+                CAMERA_STREAM_ROTATION_0, &mRecordingStreamId,
+                std::string(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create output stream for recording: "
                     "%s (%d)", __FUNCTION__, mId,
@@ -580,21 +586,21 @@ status_t StreamingProcessor::incrementStreamingIds() {
 }
 
 status_t StreamingProcessor::dump(int fd, const Vector<String16>& /*args*/) {
-    String8 result;
+    std::string result;
 
-    result.append("  Current requests:\n");
+    result += "  Current requests:\n";
     if (mPreviewRequest.entryCount() != 0) {
-        result.append("    Preview request:\n");
-        write(fd, result.string(), result.size());
+        result += "    Preview request:\n";
+        write(fd, result.c_str(), result.size());
         mPreviewRequest.dump(fd, 2, 6);
         result.clear();
     } else {
-        result.append("    Preview request: undefined\n");
+        result += "    Preview request: undefined\n";
     }
 
     if (mRecordingRequest.entryCount() != 0) {
         result = "    Recording request:\n";
-        write(fd, result.string(), result.size());
+        write(fd, result.c_str(), result.size());
         mRecordingRequest.dump(fd, 2, 6);
         result.clear();
     } else {
@@ -604,11 +610,11 @@ status_t StreamingProcessor::dump(int fd, const Vector<String16>& /*args*/) {
     const char* streamTypeString[] = {
         "none", "preview", "record"
     };
-    result.append(String8::format("   Active request: %s (paused: %s)\n",
-                                  streamTypeString[mActiveRequest],
-                                  mPaused ? "yes" : "no"));
+    result += fmt::sprintf("   Active request: %s (paused: %s\n",
+            streamTypeString[mActiveRequest],
+            mPaused ? "yes" : "no");
 
-    write(fd, result.string(), result.size());
+    write(fd, result.c_str(), result.size());
 
     return OK;
 }

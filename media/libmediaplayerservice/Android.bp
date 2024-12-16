@@ -17,7 +17,8 @@ license {
     ],
 }
 
-cc_library {
+filegroup {
+    name: "libmediaplayerservice_sources",
 
     srcs: [
         "ActivityManager.cpp",
@@ -30,11 +31,24 @@ cc_library {
         "StagefrightRecorder.cpp",
         "TestPlayerStub.cpp",
     ],
+}
+
+cc_defaults {
+    name: "libmediaplayerservice_defaults",
+
+    srcs: [
+        ":libmediaplayerservice_sources",
+    ],
 
     shared_libs: [
         "android.hardware.media.c2@1.0",
         "android.hardware.media.omx@1.0",
+        "av-types-aidl-cpp",
+        "framework-permission-aidl-cpp",
+        "libaconfig_storage_read_api_cc",
+        "libaudioclient_aidl_conversion",
         "libbase",
+        "libbinder_ndk",
         "libactivitymanager_aidl",
         "libandroid_net",
         "libaudioclient",
@@ -62,27 +76,25 @@ cc_library {
         "libstagefright_foundation",
         "libstagefright_httplive",
         "libutils",
+        "packagemanager_aidl-cpp",
+        "server_configurable_flags",
     ],
 
     header_libs: [
         "media_plugin_headers",
+        "libmediautils_headers",
+        "libstagefright_rtsp_headers",
+        "libstagefright_webm_headers",
     ],
 
     static_libs: [
+        "com.android.media.flags.editing-aconfig-cc",
         "libplayerservice_datasource",
         "libstagefright_nuplayer",
         "libstagefright_rtsp",
         "libstagefright_timedtext",
+        "framework-permission-aidl-cpp",
     ],
-
-    export_shared_lib_headers: ["libmedia"],
-
-    include_dirs: [
-        "frameworks/av/media/libstagefright/rtsp",
-        "frameworks/av/media/libstagefright/webm",
-    ],
-
-    local_include_dirs: ["include"],
 
     cflags: [
         "-Werror",
@@ -90,10 +102,30 @@ cc_library {
         "-Wall",
     ],
 
-    name: "libmediaplayerservice",
-
     sanitize: {
         cfi: true,
     },
+}
 
+cc_library {
+    name: "libmediaplayerservice",
+
+    defaults: [
+        "libmediaplayerservice_defaults",
+    ],
+
+    export_shared_lib_headers: [
+        "libmedia",
+        "framework-permission-aidl-cpp",
+    ],
+
+    export_header_lib_headers: [
+        "libmediautils_headers",
+    ],
+
+    export_include_dirs: [
+        ".",
+    ],
+
+    local_include_dirs: ["include"],
 }

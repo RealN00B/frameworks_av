@@ -21,8 +21,7 @@
 #include <sys/mman.h>
 
 #include <android-base/unique_fd.h>
-#include <binder/Parcel.h>
-#include <binder/Parcelable.h>
+#include <android/media/SharedFileRegion.h>
 
 namespace aaudio {
 
@@ -36,10 +35,14 @@ namespace aaudio {
  * It may be divided into several regions.
  * The memory can be shared using Binder or simply shared between threads.
  */
-class SharedMemoryParcelable : public android::Parcelable {
+class SharedMemoryParcelable {
 public:
-    SharedMemoryParcelable();
-    virtual ~SharedMemoryParcelable();
+    SharedMemoryParcelable() = default;
+
+    // Ctor from a parcelable representation.
+    // Since the parcelable object owns a unique FD, move semantics are provided to avoid the need
+    // to dupe.
+    explicit SharedMemoryParcelable(android::media::SharedFileRegion&& parcelable);
 
     /**
      * Make a dup() of the fd and store it for later use.
@@ -49,9 +52,7 @@ public:
      */
     void setup(const android::base::unique_fd& fd, int32_t sizeInBytes);
 
-    virtual android::status_t writeToParcel(android::Parcel* parcel) const override;
-
-    virtual android::status_t readFromParcel(const android::Parcel* parcel) override;
+    void setup(const SharedMemoryParcelable& sharedMemoryParcelable);
 
     // mmap() shared memory
     aaudio_result_t resolve(int32_t offsetInBytes, int32_t sizeInBytes, void **regionAddressPtr);
@@ -59,24 +60,31 @@ public:
     // munmap() any mapped memory
     aaudio_result_t close();
 
+    aaudio_result_t closeAndReleaseFd();
+
     int32_t getSizeInBytes();
 
-    void dump();
+    bool isInUse() const { return mFd.get() != -1; }
 
-protected:
+    void dump() const;
 
-#define MMAP_UNRESOLVED_ADDRESS    reinterpret_cast<uint8_t*>(MAP_FAILED)
+    // Extract a parcelable representation of this object.
+    // Since we own a unique FD, move semantics are provided to avoid the need to dupe.
+    android::media::SharedFileRegion parcelable() &&;
 
-    aaudio_result_t resolveSharedMemory(const android::base::unique_fd& fd);
-
-    android::base::unique_fd   mFd;
-    int32_t                    mSizeInBytes = 0;
-    uint8_t                   *mResolvedAddress = MMAP_UNRESOLVED_ADDRESS;
+    // Copy this instance. Duplicates the underlying FD.
+    SharedMemoryParcelable dup() const;
 
 private:
+#define MMAP_UNRESOLVED_ADDRESS    reinterpret_cast<uint8_t*>(MAP_FAILED)
 
+    android::base::unique_fd   mFd;
+    int64_t                    mSizeInBytes = 0;
+    int64_t                    mOffsetInBytes = 0;
+    uint8_t                   *mResolvedAddress = MMAP_UNRESOLVED_ADDRESS;
+
+    aaudio_result_t resolveSharedMemory(const android::base::unique_fd& fd);
     aaudio_result_t validate() const;
-
 };
 
 } /* namespace aaudio */

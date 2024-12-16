@@ -18,10 +18,15 @@
 #define LOG_TAG "CCodecBuffers"
 #include <utils/Log.h>
 
+#include <numeric>
+
+#include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
 
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/MediaCodec.h>
+#include <media/stagefright/foundation/AUtils.h>
+#include <media/stagefright/foundation/MediaDefs.h>
+#include <media/stagefright/CodecBase.h>
 #include <media/stagefright/MediaCodecConstants.h>
 #include <media/stagefright/SkipCutBuffer.h>
 #include <mediadrm/ICrypto.h>
@@ -33,7 +38,9 @@ namespace android {
 
 namespace {
 
-sp<GraphicBlockBuffer> AllocateGraphicBuffer(
+constexpr uint32_t PIXEL_FORMAT_UNKNOWN = 0;
+
+sp<GraphicBlockBuffer> AllocateInputGraphicBuffer(
         const std::shared_ptr<C2BlockPool> &pool,
         const sp<AMessage> &format,
         uint32_t pixelFormat,
@@ -45,9 +52,13 @@ sp<GraphicBlockBuffer> AllocateGraphicBuffer(
         return nullptr;
     }
 
+    int64_t usageValue = 0;
+    (void)format->findInt64("android._C2MemoryUsage", &usageValue);
+    C2MemoryUsage fullUsage{usageValue | usage.expected};
+
     std::shared_ptr<C2GraphicBlock> block;
     c2_status_t err = pool->fetchGraphicBlock(
-            width, height, pixelFormat, usage, &block);
+            align(width, 2), align(height, 2), pixelFormat, fullUsage, &block);
     if (err != C2_OK) {
         ALOGD("fetch graphic block failed: %d", err);
         return nullptr;
@@ -96,7 +107,10 @@ void CCodecBuffers::handleImageData(const sp<Codec2Buffer> &buffer) {
         if (img->mNumPlanes > 0 && img->mType != img->MEDIA_IMAGE_TYPE_UNKNOWN) {
             int32_t stride = img->mPlane[0].mRowInc;
             mFormatWithImageData->setInt32(KEY_STRIDE, stride);
-            ALOGD("[%s] updating stride = %d", mName, stride);
+            mFormatWithImageData->setInt32(KEY_WIDTH, img->mWidth);
+            mFormatWithImageData->setInt32(KEY_HEIGHT, img->mHeight);
+            ALOGD("[%s] updating stride = %d, width: %d, height: %d",
+                  mName, stride, img->mWidth, img->mHeight);
             if (img->mNumPlanes > 1 && stride > 0) {
                 int64_t offsetDelta =
                     (int64_t)img->mPlane[1].mOffset - (int64_t)img->mPlane[0].mOffset;
@@ -111,6 +125,10 @@ void CCodecBuffers::handleImageData(const sp<Codec2Buffer> &buffer) {
     }
     buffer->setFormat(mFormatWithImageData);
 }
+
+uint32_t CCodecBuffers::getPixelFormatIfApplicable() { return PIXEL_FORMAT_UNKNOWN; }
+
+bool CCodecBuffers::resetPixelFormatIfApplicable() { return false; }
 
 // InputBuffers
 
@@ -129,8 +147,174 @@ sp<Codec2Buffer> InputBuffers::cloneAndReleaseBuffer(const sp<MediaCodecBuffer> 
     if (!copy->copy(c2buffer)) {
         return nullptr;
     }
+    copy->meta()->extend(buffer->meta());
     return copy;
 }
+
+// MultiAccessUnitSkipCutBuffer for buffer and bufferInfos
+
+class MultiAccessUnitSkipCutBuffer : public SkipCutBuffer {
+
+public:
+    explicit MultiAccessUnitSkipCutBuffer(
+            int32_t skip, int32_t cut, size_t num16BitChannels):
+        SkipCutBuffer(skip, cut, num16BitChannels),
+        mFrontPaddingDelay(0), mSize(0) {
+    }
+    void clearAll() {
+        mInfos.clear();
+        mFrontPaddingDelay = 0;
+        mSize = 0;
+        SkipCutBuffer::clear();
+    }
+
+    virtual ~MultiAccessUnitSkipCutBuffer() {
+
+    }
+
+    void submitMultiAccessUnits(
+            const sp<MediaCodecBuffer>& buffer,
+            int32_t sampleRate, size_t num16BitChannels,
+            std::shared_ptr<const C2AccessUnitInfos::output> &infos) {
+        if (infos == nullptr) {
+            // there is nothing to do more.
+            SkipCutBuffer::submit(buffer);
+            return;
+        }
+        typedef WrapperObject<std::vector<AccessUnitInfo>> BufferInfosWrapper;
+        CHECK_EQ(mSize, SkipCutBuffer::size());
+        sp<BufferInfosWrapper> bufferInfos{new BufferInfosWrapper(decltype(bufferInfos->value)())};
+        uint32_t availableSize = buffer->size() + SkipCutBuffer::size();
+        uint32_t frontPadding = mFrontPadding;
+        int32_t lastEmptyAccessUnitIndex = -1;
+        int64_t byteInUs = 0;
+        if (sampleRate > 0 && num16BitChannels > 0) {
+            byteInUs = (1000000u / (sampleRate * num16BitChannels * 2));
+        }
+        if (frontPadding > 0) {
+            mInfos.clear();
+            mSize = 0;
+        }
+        for (int i = 0 ; i < infos->flexCount() && frontPadding > 0; i++) {
+            uint32_t flagsInPadding = 0;
+            int64_t timeInPadding = 0;
+            if (infos->m.values[i].size <= frontPadding) {
+                // we have more front padding so this buffer is not going to be used.
+                int32_t consumed = infos->m.values[i].size;
+                frontPadding -= consumed;
+                mFrontPaddingDelay += byteInUs * (consumed);
+                availableSize -= consumed;
+                flagsInPadding |= toMediaCodecFlags(infos->m.values[i].flags);
+                timeInPadding = infos->m.values[i].timestamp;
+            } else {
+                C2AccessUnitInfosStruct info = infos->m.values[i];
+                mFrontPaddingDelay +=  byteInUs * (frontPadding);
+                info.size -= frontPadding;
+                info.timestamp -= mFrontPaddingDelay;
+                availableSize -= frontPadding;
+                flagsInPadding |= toMediaCodecFlags(infos->m.values[i].flags);
+                timeInPadding = infos->m.values[i].timestamp;
+                frontPadding = 0;
+                mInfos.push_back(info);
+                mSize += info.size;
+            }
+            if (flagsInPadding != 0) {
+                bufferInfos->value.emplace_back(
+                        flagsInPadding, 0, timeInPadding);
+            }
+            lastEmptyAccessUnitIndex = i;
+        }
+        if (frontPadding <= 0) {
+            // process what's already in the buffer first
+            auto it = mInfos.begin();
+            while (it != mInfos.end() && availableSize > mBackPadding) {
+                // we have samples to send out.
+                if ((availableSize - it->size) >= mBackPadding) {
+                    // this is totally used here.
+                    int32_t consumed = it->size;
+                    bufferInfos->value.emplace_back(
+                            toMediaCodecFlags(it->flags), consumed, it->timestamp);
+                    availableSize -= consumed;
+                    mSize -= consumed;
+                    it = mInfos.erase(it);
+                } else {
+                    int32_t consumed = availableSize - mBackPadding;
+                    bufferInfos->value.emplace_back(
+                            toMediaCodecFlags(it->flags),
+                            consumed,
+                            it->timestamp);
+                    it->size -= consumed;
+                    it->timestamp += consumed * byteInUs;
+                    availableSize -= consumed;
+                    mSize -= consumed;
+                    it++;
+                }
+            }
+            // if buffer has more process all of it and keep the remaining info.
+            for (int i = (lastEmptyAccessUnitIndex + 1) ; i < infos->flexCount() ; i++) {
+                // upddate updatedInfo and mInfos
+                if (availableSize > mBackPadding) {
+                    // we have to take data from the new buffer.
+                    if (availableSize - infos->m.values[i].size >= mBackPadding) {
+                        // we are using this info
+                        int32_t consumed = infos->m.values[i].size;
+                        bufferInfos->value.emplace_back(
+                                toMediaCodecFlags(infos->m.values[i].flags),
+                                consumed,
+                                infos->m.values[i].timestamp - mFrontPaddingDelay);
+                        availableSize -= consumed;
+                    } else {
+                        // if we need to update the size
+                        C2AccessUnitInfosStruct info = infos->m.values[i];
+                        int32_t consumed = availableSize - mBackPadding;
+                        bufferInfos->value.emplace_back(
+                                toMediaCodecFlags(infos->m.values[i].flags),
+                                consumed,
+                                infos->m.values[i].timestamp - mFrontPaddingDelay);
+                        info.size -= consumed;
+                        info.timestamp = info.timestamp - mFrontPaddingDelay +
+                                consumed * byteInUs;
+                        mInfos.push_back(info);
+                        availableSize -= consumed;
+                        mSize += info.size;
+                    }
+                } else {
+                    // we have to maintain infos
+                    C2AccessUnitInfosStruct info = infos->m.values[i];
+                    info.timestamp -= mFrontPaddingDelay;
+                    mInfos.push_back(info);
+                    mSize += info.size;
+                }
+            }
+        }
+        SkipCutBuffer::submit(buffer);
+        infos = nullptr;
+        if (!bufferInfos->value.empty()) {
+            buffer->meta()->setObject("accessUnitInfo", bufferInfos);
+        }
+    }
+protected:
+    // Flags can come with individual BufferInfos
+    // when used with large frame audio
+    constexpr static std::initializer_list<std::pair<uint32_t, uint32_t>> flagList = {
+            {BUFFER_FLAG_CODEC_CONFIG, C2FrameData::FLAG_CODEC_CONFIG},
+            {BUFFER_FLAG_END_OF_STREAM, C2FrameData::FLAG_END_OF_STREAM},
+            {BUFFER_FLAG_DECODE_ONLY, C2FrameData::FLAG_DROP_FRAME}
+    };
+
+    static uint32_t toMediaCodecFlags(uint32_t flags) {
+        return std::transform_reduce(
+                flagList.begin(), flagList.end(),
+                0u,
+                std::bit_or{},
+                [flags](const std::pair<uint32_t, uint32_t> &entry) {
+                    return (flags & entry.second) ? entry.first : 0;
+                });
+    }
+    std::list<C2AccessUnitInfosStruct> mInfos;
+    int64_t mFrontPaddingDelay;
+    size_t mSize;
+};
 
 // OutputBuffers
 
@@ -186,6 +370,15 @@ void OutputBuffers::submit(const sp<MediaCodecBuffer> &buffer) {
     }
 }
 
+bool OutputBuffers::submit(const sp<MediaCodecBuffer> &buffer, int32_t sampleRate,
+            int32_t channelCount, std::shared_ptr<const C2AccessUnitInfos::output> &infos) {
+    if (mSkipCutBuffer == nullptr) {
+        return false;
+    }
+    mSkipCutBuffer->submitMultiAccessUnits(buffer, sampleRate, channelCount, infos);
+    return true;
+}
+
 void OutputBuffers::setSkipCutBuffer(int32_t skip, int32_t cut) {
     if (mSkipCutBuffer != nullptr) {
         size_t prevSize = mSkipCutBuffer->size();
@@ -193,7 +386,62 @@ void OutputBuffers::setSkipCutBuffer(int32_t skip, int32_t cut) {
             ALOGD("[%s] Replacing SkipCutBuffer holding %zu bytes", mName, prevSize);
         }
     }
-    mSkipCutBuffer = new SkipCutBuffer(skip, cut, mChannelCount);
+    mSkipCutBuffer = new MultiAccessUnitSkipCutBuffer(skip, cut, mChannelCount);
+}
+
+bool OutputBuffers::convert(
+        const std::shared_ptr<C2Buffer> &src, sp<Codec2Buffer> *dst) {
+    if (src && src->data().type() != C2BufferData::LINEAR) {
+        return false;
+    }
+    int32_t configEncoding = kAudioEncodingPcm16bit;
+    int32_t codecEncoding = kAudioEncodingPcm16bit;
+    if (mFormat->findInt32("android._codec-pcm-encoding", &codecEncoding)
+            && mFormat->findInt32("android._config-pcm-encoding", &configEncoding)) {
+        if (mSrcEncoding != codecEncoding || mDstEncoding != configEncoding) {
+            if (codecEncoding != configEncoding) {
+                mDataConverter = AudioConverter::Create(
+                        (AudioEncoding)codecEncoding, (AudioEncoding)configEncoding);
+                ALOGD_IF(mDataConverter, "[%s] Converter created from %d to %d",
+                         mName, codecEncoding, configEncoding);
+                mFormatWithConverter = mFormat->dup();
+                mFormatWithConverter->setInt32(KEY_PCM_ENCODING, configEncoding);
+            } else {
+                mDataConverter = nullptr;
+                mFormatWithConverter = nullptr;
+            }
+            mSrcEncoding = codecEncoding;
+            mDstEncoding = configEncoding;
+        }
+        if (int encoding; !mFormat->findInt32(KEY_PCM_ENCODING, &encoding)
+                || encoding != mDstEncoding) {
+        }
+    }
+    if (!mDataConverter) {
+        return false;
+    }
+    sp<MediaCodecBuffer> srcBuffer;
+    if (src) {
+        srcBuffer = ConstLinearBlockBuffer::Allocate(mFormat, src);
+    } else {
+        srcBuffer = new MediaCodecBuffer(mFormat, new ABuffer(0));
+    }
+    if (!srcBuffer) {
+        return false;
+    }
+    if (!*dst) {
+        *dst = new Codec2Buffer(
+                mFormat,
+                new ABuffer(mDataConverter->targetSize(srcBuffer->size())));
+    }
+    sp<MediaCodecBuffer> dstBuffer = *dst;
+    status_t err = mDataConverter->convert(srcBuffer, dstBuffer);
+    if (err != OK) {
+        ALOGD("[%s] buffer conversion failed: %d", mName, err);
+        return false;
+    }
+    dstBuffer->setFormat(mFormatWithConverter);
+    return true;
 }
 
 void OutputBuffers::clearStash() {
@@ -233,7 +481,7 @@ void OutputBuffers::pushToStash(
         int32_t flags,
         const sp<AMessage>& format,
         const C2WorkOrdinalStruct& ordinal) {
-    bool eos = flags & MediaCodec::BUFFER_FLAG_EOS;
+    bool eos = flags & BUFFER_FLAG_END_OF_STREAM;
     if (!buffer && eos) {
         // TRICKY: we may be violating ordering of the stash here. Because we
         // don't expect any more emplace() calls after this, the ordering should
@@ -241,7 +489,7 @@ void OutputBuffers::pushToStash(
         mReorderStash.emplace_back(
                 buffer, notify, timestamp, flags, format, ordinal);
     } else {
-        flags = flags & ~MediaCodec::BUFFER_FLAG_EOS;
+        flags = flags & ~BUFFER_FLAG_END_OF_STREAM;
         auto it = mReorderStash.begin();
         for (; it != mReorderStash.end(); ++it) {
             if (less(ordinal, it->ordinal)) {
@@ -252,7 +500,7 @@ void OutputBuffers::pushToStash(
                 buffer, notify, timestamp, flags, format, ordinal);
         if (eos) {
             mReorderStash.back().flags =
-                mReorderStash.back().flags | MediaCodec::BUFFER_FLAG_EOS;
+                mReorderStash.back().flags | BUFFER_FLAG_END_OF_STREAM;
         }
     }
     while (!mReorderStash.empty() && mReorderStash.size() > mDepth) {
@@ -289,7 +537,7 @@ OutputBuffers::BufferAction OutputBuffers::popFromStashAndRegister(
 
     // Flushing mReorderStash because no other buffers should come after output
     // EOS.
-    if (entry.flags & MediaCodec::BUFFER_FLAG_EOS) {
+    if (entry.flags & BUFFER_FLAG_END_OF_STREAM) {
         // Flush reorder stash
         setReorderDepth(0);
     }
@@ -791,8 +1039,9 @@ sp<Codec2Buffer> LinearInputBuffers::Alloc(
         capacity = kMaxLinearBufferSize;
     }
 
-    // TODO: read usage from intf
-    C2MemoryUsage usage = { C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE };
+    int64_t usageValue = 0;
+    (void)format->findInt64("android._C2MemoryUsage", &usageValue);
+    C2MemoryUsage usage{usageValue | C2MemoryUsage::CPU_READ | C2MemoryUsage::CPU_WRITE};
     std::shared_ptr<C2LinearBlock> block;
 
     c2_status_t err = pool->fetchLinearBlock(capacity, usage, &block);
@@ -882,6 +1131,10 @@ sp<Codec2Buffer> EncryptedLinearInputBuffers::Alloc(
     if (memory == nullptr) {
         return nullptr;
     }
+
+    int64_t usageValue = 0;
+    (void)format->findInt64("android._C2MemoryUsage", &usageValue);
+    usage = C2MemoryUsage(usage.expected | usageValue);
 
     std::shared_ptr<C2LinearBlock> block;
     c2_status_t err = pool->fetchLinearBlock(capacity, usage, &block);
@@ -973,7 +1226,8 @@ GraphicInputBuffers::GraphicInputBuffers(
         const char *componentName, const char *name)
     : InputBuffers(componentName, name),
       mImpl(mName),
-      mLocalBufferPool(LocalBufferPool::Create()) { }
+      mLocalBufferPool(LocalBufferPool::Create()),
+      mPixelFormat(PIXEL_FORMAT_UNKNOWN) { }
 
 bool GraphicInputBuffers::requestNewBuffer(size_t *index, sp<MediaCodecBuffer> *buffer) {
     sp<Codec2Buffer> newBuffer = createNewBuffer();
@@ -1027,7 +1281,7 @@ std::unique_ptr<InputBuffers> GraphicInputBuffers::toArrayMode(size_t size) {
             [pool = mPool, format = mFormat, lbp = mLocalBufferPool, pixelFormat]()
                     -> sp<Codec2Buffer> {
                 C2MemoryUsage usage = { C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE };
-                return AllocateGraphicBuffer(
+                return AllocateInputGraphicBuffer(
                         pool, format, pixelFormat, usage, lbp);
             });
     return std::move(array);
@@ -1038,10 +1292,17 @@ size_t GraphicInputBuffers::numActiveSlots() const {
 }
 
 sp<Codec2Buffer> GraphicInputBuffers::createNewBuffer() {
-    // TODO: read usage from intf
     C2MemoryUsage usage = { C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE };
-    return AllocateGraphicBuffer(
-            mPool, mFormat, extractPixelFormat(mFormat), usage, mLocalBufferPool);
+    mPixelFormat = extractPixelFormat(mFormat);
+    return AllocateInputGraphicBuffer(
+            mPool, mFormat, mPixelFormat, usage, mLocalBufferPool);
+}
+
+uint32_t GraphicInputBuffers::getPixelFormatIfApplicable() { return mPixelFormat; }
+
+bool GraphicInputBuffers::resetPixelFormatIfApplicable() {
+    mPixelFormat = PIXEL_FORMAT_UNKNOWN;
+    return true;
 }
 
 // OutputBuffersArray
@@ -1073,11 +1334,20 @@ status_t OutputBuffersArray::registerBuffer(
         return err;
     }
     c2Buffer->setFormat(mFormat);
-    if (!c2Buffer->copy(buffer)) {
+    if (!convert(buffer, &c2Buffer) && !c2Buffer->copy(buffer)) {
         ALOGD("[%s] copy buffer failed", mName);
         return WOULD_BLOCK;
     }
-    submit(c2Buffer);
+    if (buffer && buffer->hasInfo(C2AccessUnitInfos::output::PARAM_TYPE)) {
+        std::shared_ptr<const C2AccessUnitInfos::output> bufferMetadata =
+                        std::static_pointer_cast<const C2AccessUnitInfos::output>(
+                        buffer->getInfo(C2AccessUnitInfos::output::PARAM_TYPE));
+        if (submit(c2Buffer, mSampleRate, mChannelCount, bufferMetadata)) {
+            buffer->removeInfo(C2AccessUnitInfos::output::PARAM_TYPE);
+        }
+    } else {
+        submit(c2Buffer);
+    }
     handleImageData(c2Buffer);
     *clientBuffer = c2Buffer;
     ALOGV("[%s] grabbed buffer %zu", mName, *index);
@@ -1115,7 +1385,7 @@ void OutputBuffersArray::flush(const std::list<std::unique_ptr<C2Work>> &flushed
     (void)flushedWork;
     mImpl.flush();
     if (mSkipCutBuffer != nullptr) {
-        mSkipCutBuffer->clear();
+        mSkipCutBuffer->clearAll();
     }
 }
 
@@ -1189,14 +1459,19 @@ status_t FlexOutputBuffers::registerBuffer(
         const std::shared_ptr<C2Buffer> &buffer,
         size_t *index,
         sp<MediaCodecBuffer> *clientBuffer) {
-    sp<Codec2Buffer> newBuffer = wrap(buffer);
-    if (newBuffer == nullptr) {
-        return NO_MEMORY;
+    sp<Codec2Buffer> newBuffer;
+    if (!convert(buffer, &newBuffer)) {
+        newBuffer = wrap(buffer);
+        if (newBuffer == nullptr) {
+            return NO_MEMORY;
+        }
+        newBuffer->setFormat(mFormat);
     }
-    newBuffer->setFormat(mFormat);
     *index = mImpl.assignSlot(newBuffer);
     handleImageData(newBuffer);
     *clientBuffer = newBuffer;
+
+    extractPixelFormatFromC2Buffer(buffer);
     ALOGV("[%s] registered buffer %zu", mName, *index);
     return OK;
 }
@@ -1237,30 +1512,60 @@ size_t FlexOutputBuffers::numActiveSlots() const {
     return mImpl.numActiveSlots();
 }
 
+bool FlexOutputBuffers::extractPixelFormatFromC2Buffer(const std::shared_ptr<C2Buffer> &buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+    const C2BufferData &data = buffer->data();
+    // only extract the first pixel format in a metric session.
+    if (mPixelFormat != PIXEL_FORMAT_UNKNOWN || data.type() != C2BufferData::GRAPHIC
+            || data.graphicBlocks().empty()) {
+        return false;
+    }
+    const C2Handle *const handle = data.graphicBlocks().front().handle();
+    uint32_t pf = ExtractFormatFromCodec2GrallocHandle(handle);
+    if (pf == PIXEL_FORMAT_UNKNOWN) {
+        return false;
+    }
+    mPixelFormat = pf;
+    return true;
+}
+
+bool FlexOutputBuffers::resetPixelFormatIfApplicable() {
+    mPixelFormat = PIXEL_FORMAT_UNKNOWN;
+    return true;
+}
+
+uint32_t FlexOutputBuffers::getPixelFormatIfApplicable() { return mPixelFormat; }
+
 // LinearOutputBuffers
 
 void LinearOutputBuffers::flush(
         const std::list<std::unique_ptr<C2Work>> &flushedWork) {
     if (mSkipCutBuffer != nullptr) {
-        mSkipCutBuffer->clear();
+        mSkipCutBuffer->clearAll();
     }
     FlexOutputBuffers::flush(flushedWork);
 }
 
 sp<Codec2Buffer> LinearOutputBuffers::wrap(const std::shared_ptr<C2Buffer> &buffer) {
     if (buffer == nullptr) {
-        ALOGV("[%s] using a dummy buffer", mName);
+        ALOGD("[%s] received null buffer", mName);
         return new LocalLinearBuffer(mFormat, new ABuffer(0));
     }
     if (buffer->data().type() != C2BufferData::LINEAR) {
-        ALOGV("[%s] non-linear buffer %d", mName, buffer->data().type());
+        ALOGW("[%s] non-linear buffer %d", mName, buffer->data().type());
         // We expect linear output buffers from the component.
         return nullptr;
     }
     if (buffer->data().linearBlocks().size() != 1u) {
-        ALOGV("[%s] no linear buffers", mName);
+        ALOGW("[%s] no linear buffers", mName);
         // We expect one and only one linear block from the component.
         return nullptr;
+    }
+    if (buffer->data().linearBlocks().front().size() == 0) {
+        ALOGD("[%s] received 0-sized buffer", mName);
+        return new LocalLinearBuffer(mFormat, new ABuffer(0));
     }
     sp<Codec2Buffer> clientBuffer = ConstLinearBlockBuffer::Allocate(mFormat, buffer);
     if (clientBuffer == nullptr) {
@@ -1299,17 +1604,7 @@ RawGraphicOutputBuffers::RawGraphicOutputBuffers(
 
 sp<Codec2Buffer> RawGraphicOutputBuffers::wrap(const std::shared_ptr<C2Buffer> &buffer) {
     if (buffer == nullptr) {
-        sp<Codec2Buffer> c2buffer = ConstGraphicBlockBuffer::AllocateEmpty(
-                mFormat,
-                [lbp = mLocalBufferPool](size_t capacity) {
-                    return lbp->newBuffer(capacity);
-                });
-        if (c2buffer == nullptr) {
-            ALOGD("[%s] ConstGraphicBlockBuffer::AllocateEmpty failed", mName);
-            return nullptr;
-        }
-        c2buffer->setRange(0, 0);
-        return c2buffer;
+        return new Codec2Buffer(mFormat, new ABuffer(nullptr, 0));
     } else {
         return ConstGraphicBlockBuffer::Allocate(
                 mFormat,

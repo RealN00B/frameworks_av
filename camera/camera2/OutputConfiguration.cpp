@@ -21,12 +21,15 @@
 #include <utils/Log.h>
 
 #include <camera/camera2/OutputConfiguration.h>
+#include <camera/StringUtils.h>
 #include <binder/Parcel.h>
 #include <gui/view/Surface.h>
+#include <system/camera_metadata.h>
+#include <system/graphics.h>
 #include <utils/String8.h>
 
-namespace android {
 
+namespace android {
 
 const int OutputConfiguration::INVALID_ROTATION = -1;
 const int OutputConfiguration::INVALID_SET_ID = -1;
@@ -64,8 +67,59 @@ bool OutputConfiguration::isShared() const {
     return mIsShared;
 }
 
-String16 OutputConfiguration::getPhysicalCameraId() const {
+std::string OutputConfiguration::getPhysicalCameraId() const {
     return mPhysicalCameraId;
+}
+
+bool OutputConfiguration::isMultiResolution() const {
+    return mIsMultiResolution;
+}
+
+const std::vector<int32_t> &OutputConfiguration::getSensorPixelModesUsed() const {
+    return mSensorPixelModesUsed;
+}
+
+int64_t OutputConfiguration::getDynamicRangeProfile() const {
+    return mDynamicRangeProfile;
+}
+
+int32_t OutputConfiguration::getColorSpace() const {
+    return mColorSpace;
+}
+
+int64_t OutputConfiguration::getStreamUseCase() const {
+    return mStreamUseCase;
+}
+
+int OutputConfiguration::getTimestampBase() const {
+    return mTimestampBase;
+}
+
+int OutputConfiguration::getMirrorMode() const {
+    return mMirrorMode;
+}
+
+bool OutputConfiguration::useReadoutTimestamp() const {
+    return mUseReadoutTimestamp;
+}
+
+int OutputConfiguration::getFormat() const {
+    return mFormat;
+}
+
+int OutputConfiguration::getDataspace() const {
+    return mDataspace;
+}
+
+int64_t OutputConfiguration::getUsage() const {
+    return mUsage;
+}
+
+bool OutputConfiguration::isComplete() const {
+    return !((mSurfaceType == SURFACE_TYPE_MEDIA_RECORDER ||
+             mSurfaceType == SURFACE_TYPE_MEDIA_CODEC ||
+             mSurfaceType == SURFACE_TYPE_IMAGE_READER) &&
+             mGbps.empty());
 }
 
 OutputConfiguration::OutputConfiguration() :
@@ -75,7 +129,17 @@ OutputConfiguration::OutputConfiguration() :
         mWidth(0),
         mHeight(0),
         mIsDeferred(false),
-        mIsShared(false) {
+        mIsShared(false),
+        mIsMultiResolution(false),
+        mDynamicRangeProfile(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD),
+        mColorSpace(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED),
+        mStreamUseCase(ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT),
+        mTimestampBase(TIMESTAMP_BASE_DEFAULT),
+        mMirrorMode(MIRROR_MODE_AUTO),
+        mUseReadoutTimestamp(false),
+        mFormat(HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED),
+        mDataspace(0),
+        mUsage(0) {
 }
 
 OutputConfiguration::OutputConfiguration(const android::Parcel& parcel) :
@@ -143,7 +207,73 @@ status_t OutputConfiguration::readFromParcel(const android::Parcel* parcel) {
         return err;
     }
 
-    parcel->readString16(&mPhysicalCameraId);
+    String16 physicalCameraId;
+    parcel->readString16(&physicalCameraId);
+    mPhysicalCameraId = toStdString(physicalCameraId);
+
+    int isMultiResolution = 0;
+    if ((err = parcel->readInt32(&isMultiResolution)) != OK) {
+        ALOGE("%s: Failed to read surface isMultiResolution flag from parcel", __FUNCTION__);
+        return err;
+    }
+
+    std::vector<int32_t> sensorPixelModesUsed;
+    if ((err = parcel->readInt32Vector(&sensorPixelModesUsed)) != OK) {
+        ALOGE("%s: Failed to read sensor pixel mode(s) from parcel", __FUNCTION__);
+        return err;
+    }
+    int64_t dynamicProfile;
+    if ((err = parcel->readInt64(&dynamicProfile)) != OK) {
+        ALOGE("%s: Failed to read surface dynamic range profile flag from parcel", __FUNCTION__);
+        return err;
+    }
+    int32_t colorSpace;
+    if ((err = parcel->readInt32(&colorSpace)) != OK) {
+        ALOGE("%s: Failed to read surface color space flag from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT;
+    if ((err = parcel->readInt64(&streamUseCase)) != OK) {
+        ALOGE("%s: Failed to read stream use case from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int timestampBase = TIMESTAMP_BASE_DEFAULT;
+    if ((err = parcel->readInt32(&timestampBase)) != OK) {
+        ALOGE("%s: Failed to read timestamp base from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int mirrorMode = MIRROR_MODE_AUTO;
+    if ((err = parcel->readInt32(&mirrorMode)) != OK) {
+        ALOGE("%s: Failed to read mirroring mode from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int useReadoutTimestamp = 0;
+    if ((err = parcel->readInt32(&useReadoutTimestamp)) != OK) {
+        ALOGE("%s: Failed to read useReadoutTimestamp flag from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int format = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    if ((err = parcel->readInt32(&format)) != OK) {
+        ALOGE("%s: Failed to read format from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int dataspace = 0;
+    if ((err = parcel->readInt32(&dataspace)) != OK) {
+        ALOGE("%s: Failed to read dataspace from parcel", __FUNCTION__);
+        return err;
+    }
+
+    int64_t usage = 0;
+    if ((err = parcel->readInt64(&usage)) != OK) {
+        ALOGE("%s: Failed to read usage flag from parcel", __FUNCTION__);
+        return err;
+    }
 
     mRotation = rotation;
     mSurfaceSetID = setID;
@@ -152,22 +282,38 @@ status_t OutputConfiguration::readFromParcel(const android::Parcel* parcel) {
     mHeight = height;
     mIsDeferred = isDeferred != 0;
     mIsShared = isShared != 0;
+    mIsMultiResolution = isMultiResolution != 0;
+    mStreamUseCase = streamUseCase;
+    mTimestampBase = timestampBase;
+    mMirrorMode = mirrorMode;
+    mUseReadoutTimestamp = useReadoutTimestamp != 0;
     for (auto& surface : surfaceShims) {
         ALOGV("%s: OutputConfiguration: %p, name %s", __FUNCTION__,
                 surface.graphicBufferProducer.get(),
-                String8(surface.name).string());
+                toString8(surface.name).c_str());
         mGbps.push_back(surface.graphicBufferProducer);
     }
 
+    mSensorPixelModesUsed = std::move(sensorPixelModesUsed);
+    mDynamicRangeProfile = dynamicProfile;
+    mColorSpace = colorSpace;
+    mFormat = format;
+    mDataspace = dataspace;
+    mUsage = usage;
+
     ALOGV("%s: OutputConfiguration: rotation = %d, setId = %d, surfaceType = %d,"
-          " physicalCameraId = %s", __FUNCTION__, mRotation, mSurfaceSetID,
-          mSurfaceType, String8(mPhysicalCameraId).string());
+          " physicalCameraId = %s, isMultiResolution = %d, streamUseCase = %" PRId64
+          ", timestampBase = %d, mirrorMode = %d, useReadoutTimestamp = %d, format = %d, "
+          "dataspace = %d, usage = %" PRId64,
+          __FUNCTION__, mRotation, mSurfaceSetID, mSurfaceType,
+          mPhysicalCameraId.c_str(), mIsMultiResolution, mStreamUseCase, timestampBase,
+          mMirrorMode, mUseReadoutTimestamp, mFormat, mDataspace, mUsage);
 
     return err;
 }
 
 OutputConfiguration::OutputConfiguration(sp<IGraphicBufferProducer>& gbp, int rotation,
-        const String16& physicalId,
+        const std::string& physicalId,
         int surfaceSetID, bool isShared) {
     mGbps.push_back(gbp);
     mRotation = rotation;
@@ -175,15 +321,32 @@ OutputConfiguration::OutputConfiguration(sp<IGraphicBufferProducer>& gbp, int ro
     mIsDeferred = false;
     mIsShared = isShared;
     mPhysicalCameraId = physicalId;
+    mIsMultiResolution = false;
+    mDynamicRangeProfile = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD;
+    mColorSpace = ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED;
+    mStreamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT;
+    mTimestampBase = TIMESTAMP_BASE_DEFAULT;
+    mMirrorMode = MIRROR_MODE_AUTO;
+    mUseReadoutTimestamp = false;
+    mFormat = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    mDataspace = 0;
+    mUsage = 0;
 }
 
 OutputConfiguration::OutputConfiguration(
         const std::vector<sp<IGraphicBufferProducer>>& gbps,
-    int rotation, const String16& physicalCameraId, int surfaceSetID,  int surfaceType,
+    int rotation, const std::string& physicalCameraId, int surfaceSetID,  int surfaceType,
     int width, int height, bool isShared)
   : mGbps(gbps), mRotation(rotation), mSurfaceSetID(surfaceSetID), mSurfaceType(surfaceType),
     mWidth(width), mHeight(height), mIsDeferred(false), mIsShared(isShared),
-    mPhysicalCameraId(physicalCameraId) { }
+    mPhysicalCameraId(physicalCameraId), mIsMultiResolution(false),
+    mDynamicRangeProfile(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD),
+    mColorSpace(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED),
+    mStreamUseCase(ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT),
+    mTimestampBase(TIMESTAMP_BASE_DEFAULT),
+    mMirrorMode(MIRROR_MODE_AUTO), mUseReadoutTimestamp(false),
+    mFormat(HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED), mDataspace(0),
+    mUsage(0) { }
 
 status_t OutputConfiguration::writeToParcel(android::Parcel* parcel) const {
 
@@ -221,27 +384,85 @@ status_t OutputConfiguration::writeToParcel(android::Parcel* parcel) const {
     err = parcel->writeParcelableVector(surfaceShims);
     if (err != OK) return err;
 
-    err = parcel->writeString16(mPhysicalCameraId);
+    String16 physicalCameraId = toString16(mPhysicalCameraId);
+    err = parcel->writeString16(physicalCameraId);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mIsMultiResolution ? 1 : 0);
+    if (err != OK) return err;
+
+    err = parcel->writeParcelableVector(mSensorPixelModesUsed);
+    if (err != OK) return err;
+
+    err = parcel->writeInt64(mDynamicRangeProfile);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mColorSpace);
+    if (err != OK) return err;
+
+    err = parcel->writeInt64(mStreamUseCase);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mTimestampBase);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mMirrorMode);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mUseReadoutTimestamp ? 1 : 0);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mFormat);
+    if (err != OK) return err;
+
+    err = parcel->writeInt32(mDataspace);
+    if (err != OK) return err;
+
+    err = parcel->writeInt64(mUsage);
     if (err != OK) return err;
 
     return OK;
 }
 
-bool OutputConfiguration::gbpsEqual(const OutputConfiguration& other) const {
-    const std::vector<sp<IGraphicBufferProducer> >& otherGbps =
-            other.getGraphicBufferProducers();
-
-    if (mGbps.size() != otherGbps.size()) {
+template <typename T>
+static bool simpleVectorsEqual(T first, T second) {
+    if (first.size() != second.size()) {
         return false;
     }
 
-    for (size_t i = 0; i < mGbps.size(); i++) {
-        if (mGbps[i] != otherGbps[i]) {
+    for (size_t i = 0; i < first.size(); i++) {
+        if (first[i] != second[i]) {
             return false;
         }
     }
-
     return true;
+}
+
+bool OutputConfiguration::gbpsEqual(const OutputConfiguration& other) const {
+    const std::vector<sp<IGraphicBufferProducer> >& otherGbps =
+            other.getGraphicBufferProducers();
+    return simpleVectorsEqual(otherGbps, mGbps);
+}
+
+bool OutputConfiguration::sensorPixelModesUsedEqual(const OutputConfiguration& other) const {
+    const std::vector<int32_t>& othersensorPixelModesUsed = other.getSensorPixelModesUsed();
+    return simpleVectorsEqual(othersensorPixelModesUsed, mSensorPixelModesUsed);
+}
+
+bool OutputConfiguration::sensorPixelModesUsedLessThan(const OutputConfiguration& other) const {
+    const std::vector<int32_t>& spms = other.getSensorPixelModesUsed();
+
+    if (mSensorPixelModesUsed.size() !=  spms.size()) {
+        return mSensorPixelModesUsed.size() < spms.size();
+    }
+
+    for (size_t i = 0; i < spms.size(); i++) {
+        if (mSensorPixelModesUsed[i] != spms[i]) {
+            return mSensorPixelModesUsed[i] < spms[i];
+        }
+    }
+
+    return false;
 }
 
 bool OutputConfiguration::gbpsLessThan(const OutputConfiguration& other) const {

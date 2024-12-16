@@ -56,7 +56,7 @@ struct Parameters {
     int previewTransform; // set by CAMERA_CMD_SET_DISPLAY_ORIENTATION
 
     int pictureWidth, pictureHeight;
-    // Store the picture size before they are overriden by video snapshot
+    // Store the picture size before they are overridden by video snapshot
     int pictureWidthLastSet, pictureHeightLastSet;
     bool pictureSizeOverriden;
 
@@ -147,6 +147,7 @@ struct Parameters {
 
     bool recordingHint;
     bool videoStabilization;
+    bool videoStabilizationOnSupported = false;
 
     CameraParameters2 params;
     String8 paramsFlattened;
@@ -182,6 +183,8 @@ struct Parameters {
     bool isDeviceZslSupported;
     // Whether the device supports geometric distortion correction
     bool isDistortionCorrectionSupported;
+    // Whether slowJpegMode is forced regardless of jpeg stream FPS
+    bool isSlowJpegModeForced;
 
     // Overall camera state
     enum State {
@@ -205,7 +208,7 @@ struct Parameters {
     static const int MAX_INITIAL_PREVIEW_WIDTH = 1920;
     static const int MAX_INITIAL_PREVIEW_HEIGHT = 1080;
     // Aspect ratio tolerance
-    static const CONSTEXPR float ASPECT_RATIO_TOLERANCE = 0.001;
+    static const CONSTEXPR float ASPECT_RATIO_TOLERANCE = 0.01;
     // Threshold for slow jpeg mode
     static const int64_t kSlowJpegModeThreshold = 33400000LL; // 33.4 ms
     // Margin for checking FPS
@@ -248,6 +251,7 @@ struct Parameters {
         bool useFlexibleYuv;
         Size maxJpegSize;
         Size maxZslSize;
+        Size usedZslSize;
         bool supportsPreferredConfigs;
     } fastInfo;
 
@@ -268,7 +272,7 @@ struct Parameters {
     ~Parameters();
 
     // Sets up default parameters
-    status_t initialize(CameraDeviceBase *device, int deviceVersion);
+    status_t initialize(CameraDeviceBase *device);
 
     // Build fast-access device static info from static info
     status_t buildFastInfo(CameraDeviceBase *device);
@@ -395,9 +399,10 @@ private:
 
     Vector<Size> availablePreviewSizes;
     Vector<Size> availableVideoSizes;
-    // Get size list (that are no larger than limit) from static metadata.
+    // Get size list (that fall within lower/upper bounds) from static metadata.
     // This method filtered size with minFrameDuration < MAX_PREVIEW_RECORD_DURATION_NS
-    status_t getFilteredSizes(Size limit, Vector<Size> *sizes);
+    status_t getFilteredSizes(const Size &lower, const Size &upper,
+            Vector<Size> *sizes);
     // Get max size (from the size array) that matches the given aspect ratio.
     Size getMaxSizeForRatio(float ratio, const int32_t* sizeArray, size_t count);
 
@@ -426,6 +431,11 @@ private:
     // return -1 if input jpeg size cannot be found in supported size list
     int64_t getJpegStreamMinFrameDurationNs(Parameters::Size size);
 
+    // Helper function to get minimum frame duration for a
+    // IMPLEMENTATION_DEFINED stream of size 'size'
+    // return -1 if input size cannot be found in supported size list
+    int64_t getZslStreamMinFrameDurationNs(Parameters::Size size);
+
     // Helper function to get minimum frame duration for a size/format combination
     // return -1 if input size/format combination cannot be found.
     int64_t getMinFrameDurationNs(Parameters::Size size, int format);
@@ -452,7 +462,6 @@ private:
     // Helper function to get the suggested video sizes
     Vector<Size> getPreferredVideoSizes() const;
 
-    int mDeviceVersion;
     uint8_t mDefaultSceneMode;
 };
 

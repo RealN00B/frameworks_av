@@ -23,17 +23,6 @@
 
 using namespace aaudio;
 
-// TODO These defines should be moved to a central place in audio.
-#define SAMPLES_PER_FRAME_MIN        1
-// TODO Remove 8 channel limitation.
-#define SAMPLES_PER_FRAME_MAX        FCC_8
-#define SAMPLE_RATE_HZ_MIN           8000
-// HDMI supports up to 32 channels at 1536000 Hz.
-#define SAMPLE_RATE_HZ_MAX           1600000
-
-AAudioStreamParameters::AAudioStreamParameters() {}
-AAudioStreamParameters::~AAudioStreamParameters() {}
-
 void AAudioStreamParameters::copyFrom(const AAudioStreamParameters &other) {
     mSamplesPerFrame      = other.mSamplesPerFrame;
     mSampleRate           = other.mSampleRate;
@@ -45,16 +34,28 @@ void AAudioStreamParameters::copyFrom(const AAudioStreamParameters &other) {
     mBufferCapacity       = other.mBufferCapacity;
     mUsage                = other.mUsage;
     mContentType          = other.mContentType;
+    mSpatializationBehavior = other.mSpatializationBehavior;
+    mIsContentSpatialized = other.mIsContentSpatialized;
     mInputPreset          = other.mInputPreset;
     mAllowedCapturePolicy = other.mAllowedCapturePolicy;
     mIsPrivacySensitive   = other.mIsPrivacySensitive;
+    mOpPackageName        = other.mOpPackageName;
+    mAttributionTag       = other.mAttributionTag;
+    mChannelMask          = other.mChannelMask;
+    mHardwareSamplesPerFrame = other.mHardwareSamplesPerFrame;
+    mHardwareSampleRate   = other.mHardwareSampleRate;
+    mHardwareAudioFormat  = other.mHardwareAudioFormat;
 }
 
 static aaudio_result_t isFormatValid(audio_format_t format) {
     switch (format) {
         case AUDIO_FORMAT_DEFAULT:
         case AUDIO_FORMAT_PCM_16_BIT:
+        case AUDIO_FORMAT_PCM_32_BIT:
         case AUDIO_FORMAT_PCM_FLOAT:
+        case AUDIO_FORMAT_PCM_24_BIT_PACKED:
+        case AUDIO_FORMAT_PCM_8_24_BIT:
+        case AUDIO_FORMAT_IEC61937:
             break; // valid
         default:
             ALOGD("audioFormat not valid, audio_format_t = 0x%08x", format);
@@ -65,8 +66,8 @@ static aaudio_result_t isFormatValid(audio_format_t format) {
 }
 
 aaudio_result_t AAudioStreamParameters::validate() const {
-    if (mSamplesPerFrame != AAUDIO_UNSPECIFIED
-        && (mSamplesPerFrame < SAMPLES_PER_FRAME_MIN || mSamplesPerFrame > SAMPLES_PER_FRAME_MAX)) {
+    if (mSamplesPerFrame != AAUDIO_UNSPECIFIED && (mSamplesPerFrame < CHANNEL_COUNT_MIN_AAUDIO ||
+                                                   mSamplesPerFrame > CHANNEL_COUNT_MAX_AAUDIO)) {
         ALOGD("channelCount out of range = %d", mSamplesPerFrame);
         return AAUDIO_ERROR_OUT_OF_RANGE;
     }
@@ -80,7 +81,6 @@ aaudio_result_t AAudioStreamParameters::validate() const {
     switch (mSessionId) {
         case AAUDIO_SESSION_ID_NONE:
         case AAUDIO_SESSION_ID_ALLOCATE:
-            break;
         default:
             break;
     }
@@ -98,8 +98,8 @@ aaudio_result_t AAudioStreamParameters::validate() const {
     aaudio_result_t result = isFormatValid (mAudioFormat);
     if (result != AAUDIO_OK) return result;
 
-    if (mSampleRate != AAUDIO_UNSPECIFIED
-        && (mSampleRate < SAMPLE_RATE_HZ_MIN || mSampleRate > SAMPLE_RATE_HZ_MAX)) {
+    if (mSampleRate != AAUDIO_UNSPECIFIED &&
+        (mSampleRate < SAMPLE_RATE_HZ_MIN_AAUDIO || mSampleRate > SAMPLE_RATE_HZ_MAX_IEC610937)) {
         ALOGD("sampleRate out of range = %d", mSampleRate);
         return AAUDIO_ERROR_INVALID_RATE;
     }
@@ -157,6 +157,19 @@ aaudio_result_t AAudioStreamParameters::validate() const {
             // break;
     }
 
+    switch (mSpatializationBehavior) {
+        case AAUDIO_UNSPECIFIED:
+        case AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO:
+        case AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER:
+            break; // valid
+        default:
+            ALOGD("spatialization behavior not valid = %d", mSpatializationBehavior);
+            return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
+            // break;
+    }
+
+    // no validation required for mIsContentSpatialized
+
     switch (mInputPreset) {
         case AAUDIO_UNSPECIFIED:
         case AAUDIO_INPUT_PRESET_GENERIC:
@@ -165,6 +178,8 @@ aaudio_result_t AAudioStreamParameters::validate() const {
         case AAUDIO_INPUT_PRESET_VOICE_RECOGNITION:
         case AAUDIO_INPUT_PRESET_UNPROCESSED:
         case AAUDIO_INPUT_PRESET_VOICE_PERFORMANCE:
+        case AAUDIO_INPUT_PRESET_SYSTEM_ECHO_REFERENCE:
+        case AAUDIO_INPUT_PRESET_SYSTEM_HOTWORD:
             break; // valid
         default:
             ALOGD("input preset not valid = %d", mInputPreset);
@@ -184,7 +199,94 @@ aaudio_result_t AAudioStreamParameters::validate() const {
             // break;
     }
 
-    return AAUDIO_OK;
+    return validateChannelMask();
+}
+
+aaudio_result_t AAudioStreamParameters::validateChannelMask() const {
+    if (mChannelMask == AAUDIO_UNSPECIFIED) {
+        return AAUDIO_OK;
+    }
+
+    if (mChannelMask & AAUDIO_CHANNEL_BIT_INDEX) {
+        switch (mChannelMask) {
+            case AAUDIO_CHANNEL_INDEX_MASK_1:
+            case AAUDIO_CHANNEL_INDEX_MASK_2:
+            case AAUDIO_CHANNEL_INDEX_MASK_3:
+            case AAUDIO_CHANNEL_INDEX_MASK_4:
+            case AAUDIO_CHANNEL_INDEX_MASK_5:
+            case AAUDIO_CHANNEL_INDEX_MASK_6:
+            case AAUDIO_CHANNEL_INDEX_MASK_7:
+            case AAUDIO_CHANNEL_INDEX_MASK_8:
+            case AAUDIO_CHANNEL_INDEX_MASK_9:
+            case AAUDIO_CHANNEL_INDEX_MASK_10:
+            case AAUDIO_CHANNEL_INDEX_MASK_11:
+            case AAUDIO_CHANNEL_INDEX_MASK_12:
+            case AAUDIO_CHANNEL_INDEX_MASK_13:
+            case AAUDIO_CHANNEL_INDEX_MASK_14:
+            case AAUDIO_CHANNEL_INDEX_MASK_15:
+            case AAUDIO_CHANNEL_INDEX_MASK_16:
+            case AAUDIO_CHANNEL_INDEX_MASK_17:
+            case AAUDIO_CHANNEL_INDEX_MASK_18:
+            case AAUDIO_CHANNEL_INDEX_MASK_19:
+            case AAUDIO_CHANNEL_INDEX_MASK_20:
+            case AAUDIO_CHANNEL_INDEX_MASK_21:
+            case AAUDIO_CHANNEL_INDEX_MASK_22:
+            case AAUDIO_CHANNEL_INDEX_MASK_23:
+            case AAUDIO_CHANNEL_INDEX_MASK_24:
+                return AAUDIO_OK;
+            default:
+                ALOGD("Invalid channel index mask %#x", mChannelMask);
+                return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
+        }
+    }
+
+    if (getDirection() == AAUDIO_DIRECTION_INPUT) {
+        switch (mChannelMask) {
+            case AAUDIO_CHANNEL_MONO:
+            case AAUDIO_CHANNEL_STEREO:
+            case AAUDIO_CHANNEL_FRONT_BACK:
+            case AAUDIO_CHANNEL_2POINT0POINT2:
+            case AAUDIO_CHANNEL_2POINT1POINT2:
+            case AAUDIO_CHANNEL_3POINT0POINT2:
+            case AAUDIO_CHANNEL_3POINT1POINT2:
+            case AAUDIO_CHANNEL_5POINT1:
+                return AAUDIO_OK;
+            default:
+                ALOGD("Invalid channel mask %#x, IN", mChannelMask);
+                return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
+        }
+    } else {
+        switch (mChannelMask) {
+            case AAUDIO_CHANNEL_MONO:
+            case AAUDIO_CHANNEL_STEREO:
+            case AAUDIO_CHANNEL_2POINT1:
+            case AAUDIO_CHANNEL_TRI:
+            case AAUDIO_CHANNEL_TRI_BACK:
+            case AAUDIO_CHANNEL_3POINT1:
+            case AAUDIO_CHANNEL_2POINT0POINT2:
+            case AAUDIO_CHANNEL_2POINT1POINT2:
+            case AAUDIO_CHANNEL_3POINT0POINT2:
+            case AAUDIO_CHANNEL_3POINT1POINT2:
+            case AAUDIO_CHANNEL_QUAD:
+            case AAUDIO_CHANNEL_QUAD_SIDE:
+            case AAUDIO_CHANNEL_SURROUND:
+            case AAUDIO_CHANNEL_PENTA:
+            case AAUDIO_CHANNEL_5POINT1:
+            case AAUDIO_CHANNEL_5POINT1_SIDE:
+            case AAUDIO_CHANNEL_5POINT1POINT2:
+            case AAUDIO_CHANNEL_5POINT1POINT4:
+            case AAUDIO_CHANNEL_6POINT1:
+            case AAUDIO_CHANNEL_7POINT1:
+            case AAUDIO_CHANNEL_7POINT1POINT2:
+            case AAUDIO_CHANNEL_7POINT1POINT4:
+            case AAUDIO_CHANNEL_9POINT1POINT4:
+            case AAUDIO_CHANNEL_9POINT1POINT6:
+                return AAUDIO_OK;
+            default:
+                ALOGD("Invalid channel mask %#x. OUT", mChannelMask);
+                return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
+        }
+    }
 }
 
 void AAudioStreamParameters::dump() const {
@@ -192,13 +294,23 @@ void AAudioStreamParameters::dump() const {
     ALOGD("mSessionId            = %6d", mSessionId);
     ALOGD("mSampleRate           = %6d", mSampleRate);
     ALOGD("mSamplesPerFrame      = %6d", mSamplesPerFrame);
+    ALOGD("mChannelMask          = %#x", mChannelMask);
     ALOGD("mSharingMode          = %6d", (int)mSharingMode);
     ALOGD("mAudioFormat          = %6d", (int)mAudioFormat);
     ALOGD("mDirection            = %6d", mDirection);
     ALOGD("mBufferCapacity       = %6d", mBufferCapacity);
     ALOGD("mUsage                = %6d", mUsage);
     ALOGD("mContentType          = %6d", mContentType);
+    ALOGD("mSpatializationBehavior = %6d", mSpatializationBehavior);
+    ALOGD("mIsContentSpatialized = %s", mIsContentSpatialized ? "true" : "false");
     ALOGD("mInputPreset          = %6d", mInputPreset);
     ALOGD("mAllowedCapturePolicy = %6d", mAllowedCapturePolicy);
     ALOGD("mIsPrivacySensitive   = %s", mIsPrivacySensitive ? "true" : "false");
+    ALOGD("mOpPackageName        = %s", !mOpPackageName.has_value() ?
+        "(null)" : mOpPackageName.value().c_str());
+    ALOGD("mAttributionTag       = %s", !mAttributionTag.has_value() ?
+        "(null)" : mAttributionTag.value().c_str());
+    ALOGD("mHardwareSamplesPerFrame = %6d", mHardwareSamplesPerFrame);
+    ALOGD("mHardwareSampleRate   = %6d", mHardwareSampleRate);
+    ALOGD("mHardwareAudioFormat  = %6d", (int)mHardwareAudioFormat);
 }

@@ -21,6 +21,8 @@
 #define LOG_TAG "AudioSource"
 #include <utils/Log.h>
 
+#include <binder/IPCThreadState.h>
+#include <media/AidlConversion.h>
 #include <media/AudioRecord.h>
 #include <media/stagefright/AudioSource.h>
 #include <media/stagefright/MediaBuffer.h>
@@ -32,21 +34,22 @@
 
 namespace android {
 
-static void AudioRecordCallbackFunction(int event, void *user, void *info) {
-    AudioSource *source = (AudioSource *) user;
-    switch (event) {
-        case AudioRecord::EVENT_MORE_DATA: {
-            source->dataCallback(*((AudioRecord::Buffer *) info));
-            break;
-        }
-        case AudioRecord::EVENT_OVERRUN: {
-            ALOGW("AudioRecord reported overrun!");
-            break;
-        }
-        default:
-            // does nothing
-            break;
-    }
+using content::AttributionSourceState;
+
+
+void AudioSource::onOverrun() {
+    ALOGW("AudioRecord reported overrun!");
+}
+
+AudioSource::AudioSource(
+    const audio_attributes_t *attr, const AttributionSourceState& attributionSource,
+    uint32_t sampleRate, uint32_t channelCount, uint32_t outSampleRate,
+    audio_port_handle_t selectedDeviceId,
+    audio_microphone_direction_t selectedMicDirection,
+    float selectedMicFieldDimension)
+{
+  set(attr, attributionSource, sampleRate, channelCount, outSampleRate, selectedDeviceId,
+      selectedMicDirection, selectedMicFieldDimension);
 }
 
 AudioSource::AudioSource(
@@ -55,69 +58,84 @@ AudioSource::AudioSource(
         uid_t uid, pid_t pid, audio_port_handle_t selectedDeviceId,
         audio_microphone_direction_t selectedMicDirection,
         float selectedMicFieldDimension)
-    : mStarted(false),
-      mSampleRate(sampleRate),
-      mOutSampleRate(outSampleRate > 0 ? outSampleRate : sampleRate),
-      mTrackMaxAmplitude(false),
-      mStartTimeUs(0),
-      mStopSystemTimeUs(-1),
-      mLastFrameTimestampUs(0),
-      mMaxAmplitude(0),
-      mPrevSampleTimeUs(0),
-      mInitialReadTimeUs(0),
-      mNumFramesReceived(0),
-      mNumFramesSkipped(0),
-      mNumFramesLost(0),
-      mNumClientOwnedBuffers(0),
-      mNoMoreFramesToRead(false) {
-    ALOGV("sampleRate: %u, outSampleRate: %u, channelCount: %u",
-            sampleRate, outSampleRate, channelCount);
-    CHECK(channelCount == 1 || channelCount == 2);
-    CHECK(sampleRate > 0);
+{
+    // TODO b/182392769: use attribution source util
+    AttributionSourceState attributionSource;
+    attributionSource.packageName = VALUE_OR_FATAL(legacy2aidl_String16_string(opPackageName));
+    attributionSource.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(uid));
+    attributionSource.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(pid));
+    attributionSource.token = sp<BBinder>::make();
+    set(attr, attributionSource, sampleRate, channelCount, outSampleRate, selectedDeviceId,
+      selectedMicDirection, selectedMicFieldDimension);
+}
 
-    size_t minFrameCount;
-    status_t status = AudioRecord::getMinFrameCount(&minFrameCount,
-                                           sampleRate,
-                                           AUDIO_FORMAT_PCM_16_BIT,
-                                           audio_channel_in_mask_from_count(channelCount));
-    if (status == OK) {
-        // make sure that the AudioRecord callback never returns more than the maximum
-        // buffer size
-        uint32_t frameCount = kMaxBufferSize / sizeof(int16_t) / channelCount;
+void AudioSource::set(
+   const audio_attributes_t *attr, const AttributionSourceState& attributionSource,
+        uint32_t sampleRate, uint32_t channelCount, uint32_t outSampleRate,
+        audio_port_handle_t selectedDeviceId,
+        audio_microphone_direction_t selectedMicDirection,
+        float selectedMicFieldDimension)
+{
+   mStarted = false;
+   mSampleRate = sampleRate;
+   mOutSampleRate = outSampleRate > 0 ? outSampleRate : sampleRate;
+   mTrackMaxAmplitude = false;
+   mStartTimeUs = 0;
+   mStopSystemTimeUs = -1;
+   mLastFrameTimestampUs = 0;
+   mMaxAmplitude = 0;
+   mPrevSampleTimeUs = 0;
+   mInitialReadTimeUs = 0;
+   mNumFramesReceived = 0;
+   mNumFramesSkipped = 0;
+   mNumFramesLost = 0;
+   mNumClientOwnedBuffers = 0;
+   mNoMoreFramesToRead = false;
+  ALOGV("sampleRate: %u, outSampleRate: %u, channelCount: %u",
+        sampleRate, outSampleRate, channelCount);
+  CHECK(channelCount == 1 || channelCount == 2);
+  CHECK(sampleRate > 0);
 
-        // make sure that the AudioRecord total buffer size is large enough
-        size_t bufCount = 2;
-        while ((bufCount * frameCount) < minFrameCount) {
-            bufCount++;
-        }
+  size_t minFrameCount;
+  status_t status = AudioRecord::getMinFrameCount(&minFrameCount,
+                                                  sampleRate,
+                                                  AUDIO_FORMAT_PCM_16_BIT,
+                                                  audio_channel_in_mask_from_count(channelCount));
+  if (status == OK) {
+    // make sure that the AudioRecord callback never returns more than the maximum
+    // buffer size
+    uint32_t frameCount = kMaxBufferSize / sizeof(int16_t) / channelCount;
 
-        mRecord = new AudioRecord(
-                    AUDIO_SOURCE_DEFAULT, sampleRate, AUDIO_FORMAT_PCM_16_BIT,
-                    audio_channel_in_mask_from_count(channelCount),
-                    opPackageName,
-                    (size_t) (bufCount * frameCount),
-                    AudioRecordCallbackFunction,
-                    this,
-                    frameCount /*notificationFrames*/,
-                    AUDIO_SESSION_ALLOCATE,
-                    AudioRecord::TRANSFER_DEFAULT,
-                    AUDIO_INPUT_FLAG_NONE,
-                    uid,
-                    pid,
-                    attr,
-                    selectedDeviceId,
-                    selectedMicDirection,
-                    selectedMicFieldDimension);
-        // Set caller name so it can be logged in destructor.
-        // MediaMetricsConstants.h: AMEDIAMETRICS_PROP_CALLERNAME_VALUE_MEDIA
-        mRecord->setCallerName("media");
-        mInitCheck = mRecord->initCheck();
-        if (mInitCheck != OK) {
-            mRecord.clear();
-        }
-    } else {
-        mInitCheck = status;
+    // make sure that the AudioRecord total buffer size is large enough
+    size_t bufCount = 2;
+    while ((bufCount * frameCount) < minFrameCount) {
+      bufCount++;
     }
+
+    mRecord = new AudioRecord(
+        AUDIO_SOURCE_DEFAULT, sampleRate, AUDIO_FORMAT_PCM_16_BIT,
+        audio_channel_in_mask_from_count(channelCount),
+        attributionSource,
+        (size_t) (bufCount * frameCount),
+        wp<AudioRecord::IAudioRecordCallback>{this},
+        frameCount /*notificationFrames*/,
+        AUDIO_SESSION_ALLOCATE,
+        AudioRecord::TRANSFER_DEFAULT,
+        AUDIO_INPUT_FLAG_NONE,
+        attr,
+        selectedDeviceId,
+        selectedMicDirection,
+        selectedMicFieldDimension);
+    // Set caller name so it can be logged in destructor.
+    // MediaMetricsConstants.h: AMEDIAMETRICS_PROP_CALLERNAME_VALUE_MEDIA
+    mRecord->setCallerName("media");
+    mInitCheck = mRecord->initCheck();
+    if (mInitCheck != OK) {
+      mRecord.clear();
+    }
+  } else {
+    mInitCheck = status;
+  }
 }
 
 AudioSource::~AudioSource() {
@@ -328,7 +346,7 @@ void AudioSource::signalBufferReturned(MediaBufferBase *buffer) {
     return;
 }
 
-status_t AudioSource::dataCallback(const AudioRecord::Buffer& audioBuffer) {
+size_t AudioSource::onMoreData(const AudioRecord::Buffer& audioBuffer) {
     int64_t timeUs, position, timeNs;
     ExtendedTimestamp ts;
     ExtendedTimestamp::Location location;
@@ -353,21 +371,21 @@ status_t AudioSource::dataCallback(const AudioRecord::Buffer& audioBuffer) {
 
     ALOGV("dataCallbackTimestamp: %" PRId64 " us", timeUs);
     Mutex::Autolock autoLock(mLock);
+
     if (!mStarted) {
         ALOGW("Spurious callback from AudioRecord. Drop the audio data.");
-        return OK;
+        return audioBuffer.size();
     }
 
-    const size_t bufferSize = audioBuffer.size;
 
     // Drop retrieved and previously lost audio data.
     if (mNumFramesReceived == 0 && timeUs < mStartTimeUs) {
         (void) mRecord->getInputFramesLost();
-        int64_t receievedFrames = bufferSize / mRecord->frameSize();
+        int64_t receievedFrames = audioBuffer.size() / mRecord->frameSize();
         ALOGV("Drop audio data(%" PRId64 " frames) at %" PRId64 "/%" PRId64 " us",
                 receievedFrames, timeUs, mStartTimeUs);
         mNumFramesSkipped += receievedFrames;
-        return OK;
+        return audioBuffer.size();
     }
 
     if (mStopSystemTimeUs != -1 && timeUs >= mStopSystemTimeUs) {
@@ -375,7 +393,7 @@ status_t AudioSource::dataCallback(const AudioRecord::Buffer& audioBuffer) {
                 (long long)timeUs, (long long)mStopSystemTimeUs);
         mNoMoreFramesToRead = true;
         mFrameAvailableCondition.signal();
-        return OK;
+        return audioBuffer.size();
     }
 
     if (mNumFramesReceived == 0 && mPrevSampleTimeUs == 0) {
@@ -396,7 +414,7 @@ status_t AudioSource::dataCallback(const AudioRecord::Buffer& audioBuffer) {
     }
 
     CHECK_EQ(numLostBytes & 1, 0u);
-    CHECK_EQ(audioBuffer.size & 1, 0u);
+    CHECK_EQ(audioBuffer.size() & 1, 0u);
     if (numLostBytes > 0) {
         // Loss of audio frames should happen rarely; thus the LOGW should
         // not cause a logging spam
@@ -418,17 +436,17 @@ status_t AudioSource::dataCallback(const AudioRecord::Buffer& audioBuffer) {
         queueInputBuffer_l(lostAudioBuffer, timeUs);
     }
 
-    if (audioBuffer.size == 0) {
+    if (audioBuffer.size() == 0) {
         ALOGW("Nothing is available from AudioRecord callback buffer");
-        return OK;
+        return audioBuffer.size();
     }
 
-    MediaBuffer *buffer = new MediaBuffer(bufferSize);
+    MediaBuffer *buffer = new MediaBuffer(audioBuffer.size());
     memcpy((uint8_t *) buffer->data(),
-            audioBuffer.i16, audioBuffer.size);
-    buffer->set_range(0, bufferSize);
+            audioBuffer.data(), audioBuffer.size());
+    buffer->set_range(0, audioBuffer.size());
     queueInputBuffer_l(buffer, timeUs);
-    return OK;
+    return audioBuffer.size();
 }
 
 void AudioSource::queueInputBuffer_l(MediaBuffer *buffer, int64_t timeUs) {
@@ -504,7 +522,7 @@ status_t AudioSource::removeAudioDeviceCallback(
 }
 
 status_t AudioSource::getActiveMicrophones(
-        std::vector<media::MicrophoneInfo>* activeMicrophones) {
+        std::vector<media::MicrophoneInfoFw>* activeMicrophones) {
     if (mRecord != 0) {
         return mRecord->getActiveMicrophones(activeMicrophones);
     }

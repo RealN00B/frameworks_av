@@ -34,12 +34,12 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
      * Set the transform on the output stream; one of the
      * HAL_TRANSFORM_* / NATIVE_WINDOW_TRANSFORM_* constants.
      */
-    virtual status_t setTransform(int transform) = 0;
+    virtual status_t setTransform(int transform, bool mayChangeMirror) = 0;
 
     /**
      * Return if this output stream is for video encoding.
      */
-    virtual bool isVideoStream() const = 0;
+    virtual bool isVideoStream() = 0;
 
     /**
      * Return if the consumer configuration of this stream is deferred.
@@ -94,7 +94,34 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
     /**
      * Query the physical camera id for the output stream.
      */
-    virtual const String8& getPhysicalCameraId() const = 0;
+    virtual const std::string& getPhysicalCameraId() const = 0;
+
+    /**
+     * Set the batch size for buffer operations. The output stream will request
+     * buffers from buffer queue on a batch basis. Currently only video streams
+     * are allowed to set the batch size. Also if the stream is managed by
+     * buffer manager (Surface group in Java API) then batching is also not
+     * supported. Changing batch size on the fly while there is already batched
+     * buffers in the stream is also not supported.
+     * If the batch size is larger than the max dequeue count set
+     * by the camera HAL, the batch size will be set to the max dequeue count
+     * instead.
+     */
+    virtual status_t setBatchSize(size_t batchSize = 1) = 0;
+
+    /**
+     * Notify the output stream that the minimum frame duration has changed, or
+     * frame rate has switched between variable and fixed.
+     *
+     * The minimum frame duration is calculated based on the upper bound of
+     * AE_TARGET_FPS_RANGE in the capture request.
+     */
+    virtual void onMinDurationChanged(nsecs_t duration, bool fixedFps) = 0;
+
+    /**
+     * Modify the stream use case for this output.
+     */
+    virtual void setStreamUseCase(int64_t streamUseCase) = 0;
 };
 
 // Helper class to organize a synchronized mapping of stream IDs to stream instances

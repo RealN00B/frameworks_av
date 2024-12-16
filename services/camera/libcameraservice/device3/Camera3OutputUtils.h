@@ -33,11 +33,10 @@
 #include "device3/InFlightRequest.h"
 #include "device3/Camera3Stream.h"
 #include "device3/Camera3OutputStreamInterface.h"
+#include "utils/SessionStatsBuilder.h"
 #include "utils/TagMonitor.h"
 
 namespace android {
-
-using ResultMetadataQueue = hardware::MessageQueue<uint8_t, hardware::kSynchronizedReadWrite>;
 
 namespace camera3 {
 
@@ -45,35 +44,84 @@ namespace camera3 {
      * Helper methods shared between Camera3Device/Camera3OfflineSession for HAL callbacks
      */
 
-    // helper function to return the output buffers to output streams. The
-    // function also optionally calls notify(ERROR_BUFFER).
-    void returnOutputBuffers(
+    struct BufferToReturn {
+        Camera3StreamInterface *stream;
+        camera_stream_buffer_t buffer;
+        nsecs_t timestamp;
+        nsecs_t readoutTimestamp;
+        bool timestampIncreasing;
+        std::vector<size_t> surfaceIds;
+        const CaptureResultExtras resultExtras;
+        int32_t transform;
+        nsecs_t requestTimeNs;
+
+        BufferToReturn(Camera3StreamInterface *stream,
+                camera_stream_buffer_t buffer,
+                nsecs_t timestamp, nsecs_t readoutTimestamp,
+                bool timestampIncreasing, std::vector<size_t> surfaceIds,
+                const CaptureResultExtras &resultExtras,
+                int32_t transform, nsecs_t requestTimeNs):
+            stream(stream),
+            buffer(buffer),
+            timestamp(timestamp),
+            readoutTimestamp(readoutTimestamp),
+            timestampIncreasing(timestampIncreasing),
+            surfaceIds(surfaceIds),
+            resultExtras(resultExtras),
+            transform(transform),
+            requestTimeNs(requestTimeNs) {}
+    };
+
+    // helper function to return the output buffers to output
+    // streams. The function also optionally calls
+    // notify(ERROR_BUFFER).  Returns the list of buffers to hand back
+    // to streams in returnableBuffers.  Does not make any two-way
+    // binder calls, so suitable for use when critical locks are being
+    // held
+    void collectReturnableOutputBuffers(
             bool useHalBufManager,
+            const std::set<int32_t> &halBufferManagedStreams,
             sp<NotificationListener> listener, // Only needed when outputSurfaces is not empty
-            const camera3_stream_buffer_t *outputBuffers,
-            size_t numBuffers, nsecs_t timestamp, bool timestampIncreasing = true,
+            const camera_stream_buffer_t *outputBuffers,
+            size_t numBuffers, nsecs_t timestamp,
+            nsecs_t readoutTimestamp, bool requested, nsecs_t requestTimeNs,
+            SessionStatsBuilder& sessionStatsBuilder,
+            /*out*/ std::vector<BufferToReturn> *returnableBuffers,
+            bool timestampIncreasing = true,
             // The following arguments are only meant for surface sharing use case
             const SurfaceMap& outputSurfaces = SurfaceMap{},
             // Used to send buffer error callback when failing to return buffer
             const CaptureResultExtras &resultExtras = CaptureResultExtras{},
-            ERROR_BUF_STRATEGY errorBufStrategy = ERROR_BUF_RETURN);
+            ERROR_BUF_STRATEGY errorBufStrategy = ERROR_BUF_RETURN,
+            int32_t transform = -1);
 
-    // helper function to return the output buffers to output streams, and
-    // remove the returned buffers from the inflight request's pending buffers
-    // vector.
-    void returnAndRemovePendingOutputBuffers(
+    // helper function to collect the output buffers ready to be
+    // returned to output streams, and to remove these buffers from
+    // the inflight request's pending buffers vector.  Does not make
+    // any two-way binder calls, so suitable for use when critical
+    // locks are being held
+    void collectAndRemovePendingOutputBuffers(
             bool useHalBufManager,
+            const std::set<int32_t> &halBufferManagedStreams,
             sp<NotificationListener> listener, // Only needed when outputSurfaces is not empty
-            InFlightRequest& request);
+            InFlightRequest& request, SessionStatsBuilder& sessionStatsBuilder,
+            /*out*/ std::vector<BufferToReturn> *returnableBuffers);
+
+    // Actually return filled output buffers to the consumer to use, using the list
+    // provided by collectReturnableOutputBuffers / collectAndRemovePendingOutputBuffers
+    // Makes two-way binder calls to applications, so do not hold any critical locks when
+    // calling.
+    void finishReturningOutputBuffers(const std::vector<BufferToReturn> &returnableBuffers,
+            sp<NotificationListener> listener, SessionStatsBuilder& sessionStatsBuilder);
 
     // Camera3Device/Camera3OfflineSession internal states used in notify/processCaptureResult
     // callbacks
     struct CaptureOutputStates {
-        const String8& cameraId;
+        const std::string& cameraId;
         std::mutex& inflightLock;
         int64_t& lastCompletedRegularFrameNumber;
-        int64_t& lastCompletedZslFrameNumber;
         int64_t& lastCompletedReprocessFrameNumber;
+        int64_t& lastCompletedZslFrameNumber;
         InFlightRequestMap& inflightMap; // end of inflightLock scope
         std::mutex& outputLock;
         std::list<CaptureResult>& resultQueue;
@@ -85,70 +133,66 @@ namespace camera3 {
         uint32_t& nextReprocResultFrameNum;
         uint32_t& nextZslResultFrameNum; // end of outputLock scope
         const bool useHalBufManager;
+        const std::set<int32_t > &halBufManagedStreamIds;
         const bool usePartialResult;
         const bool needFixupMonoChrome;
         const uint32_t numPartialResults;
         const metadata_vendor_id_t vendorTagId;
         const CameraMetadata& deviceInfo;
         const std::unordered_map<std::string, CameraMetadata>& physicalDeviceInfoMap;
-        std::unique_ptr<ResultMetadataQueue>& fmq;
         std::unordered_map<std::string, camera3::DistortionMapper>& distortionMappers;
         std::unordered_map<std::string, camera3::ZoomRatioMapper>& zoomRatioMappers;
         std::unordered_map<std::string, camera3::RotateAndCropMapper>& rotateAndCropMappers;
         TagMonitor& tagMonitor;
         sp<Camera3Stream> inputStream;
         StreamSet& outputStreams;
+        SessionStatsBuilder& sessionStatsBuilder;
         sp<NotificationListener> listener;
         SetErrorInterface& setErrIntf;
         InflightRequestUpdateInterface& inflightIntf;
         BufferRecordsInterface& bufferRecordsIntf;
+        bool legacyClient;
+        nsecs_t& minFrameDuration;
+        bool& isFixedFps;
+        int rotationOverride;
+        std::string &activePhysicalId;
     };
 
-    // Handle one capture result. Assume callers hold the lock to serialize all
-    // processCaptureResult calls
-    void processOneCaptureResultLocked(
-            CaptureOutputStates& states,
-            const hardware::camera::device::V3_2::CaptureResult& result,
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_4::PhysicalCameraMetadata> physicalCameraMetadata);
-
-    // Handle one notify message
-    void notify(CaptureOutputStates& states,
-            const hardware::camera::device::V3_2::NotifyMsg& msg);
+    void processCaptureResult(CaptureOutputStates& states, const camera_capture_result *result);
+    void notify(CaptureOutputStates& states, const camera_notify_msg *msg);
 
     struct RequestBufferStates {
-        const String8& cameraId;
+        const std::string& cameraId;
         std::mutex& reqBufferLock; // lock to serialize request buffer calls
         const bool useHalBufManager;
+        const std::set<int32_t > &halBufManagedStreamIds;
         StreamSet& outputStreams;
+        SessionStatsBuilder& sessionStatsBuilder;
         SetErrorInterface& setErrIntf;
         BufferRecordsInterface& bufferRecordsIntf;
         RequestBufferInterface& reqBufferIntf;
     };
 
-    void requestStreamBuffers(RequestBufferStates& states,
-            const hardware::hidl_vec<hardware::camera::device::V3_5::BufferRequest>& bufReqs,
-            hardware::camera::device::V3_5::ICameraDeviceCallback::requestStreamBuffers_cb _hidl_cb);
-
     struct ReturnBufferStates {
-        const String8& cameraId;
+        const std::string& cameraId;
         const bool useHalBufManager;
+        const std::set<int32_t > &halBufManagedStreamIds;
         StreamSet& outputStreams;
+        SessionStatsBuilder& sessionStatsBuilder;
         BufferRecordsInterface& bufferRecordsIntf;
     };
 
-    void returnStreamBuffers(ReturnBufferStates& states,
-            const hardware::hidl_vec<hardware::camera::device::V3_2::StreamBuffer>& buffers);
-
     struct FlushInflightReqStates {
-        const String8& cameraId;
+        const std::string& cameraId;
         std::mutex& inflightLock;
         InFlightRequestMap& inflightMap; // end of inflightLock scope
         const bool useHalBufManager;
+        const std::set<int32_t > &halBufManagedStreamIds;
         sp<NotificationListener> listener;
         InflightRequestUpdateInterface& inflightIntf;
         BufferRecordsInterface& bufferRecordsIntf;
         FlushBufferInterface& flushBufferIntf;
+        SessionStatsBuilder& sessionStatsBuilder;
     };
 
     void flushInflightRequests(FlushInflightReqStates& states);

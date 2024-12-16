@@ -44,31 +44,25 @@ class AAudioServiceStreamShared : public AAudioServiceStreamBase {
 
 public:
     explicit AAudioServiceStreamShared(android::AAudioService &aAudioService);
-    virtual ~AAudioServiceStreamShared() = default;
+    ~AAudioServiceStreamShared() override = default;
 
     static std::string dumpHeader();
 
     std::string dump() const override;
 
-    aaudio_result_t open(const aaudio::AAudioStreamRequest &request) override;
+    aaudio_result_t open(const aaudio::AAudioStreamRequest &request) override
+            EXCLUDES(mUpMessageQueueLock);
 
-    aaudio_result_t close_l() override;
-
-    /**
-     * This must be locked when calling getAudioDataFifoBuffer_l() and while
-     * using the FifoBuffer it returns.
-     */
-    std::mutex &getAudioDataQueueLock() {
-        return mAudioDataQueueLock;
-    }
+    void writeDataIfRoom(int64_t mmapFramesRead, const void *buffer, int32_t numFrames);
 
     /**
-     * This must only be call under getAudioDataQueueLock().
+     * This must only be called under getAudioDataQueueLock().
      * @return
      */
-    android::FifoBuffer *getAudioDataFifoBuffer_l() { return (mAudioDataQueue == nullptr)
-                                                      ? nullptr
-                                                      : mAudioDataQueue->getFifoBuffer(); }
+    std::shared_ptr<SharedRingBuffer> getAudioDataQueue_l()
+            REQUIRES(audioDataQueueLock) {
+        return mAudioDataQueue;
+    }
 
     /* Keep a record of when a buffer transfer completed.
      * This allows for a more accurate timing model.
@@ -89,13 +83,20 @@ public:
 
     const char *getTypeText() const override { return "Shared"; }
 
+    // This is public so that the thread safety annotation, GUARDED_BY(),
+    // Can work when another object takes the lock.
+    mutable std::mutex   audioDataQueueLock;
+
 protected:
 
-    aaudio_result_t getAudioDataDescription(AudioEndpointParcelable &parcelable) override;
+    aaudio_result_t getAudioDataDescription_l(
+            AudioEndpointParcelable* parcelable) REQUIRES(mLock) override;
 
-    aaudio_result_t getFreeRunningPosition(int64_t *positionFrames, int64_t *timeNanos) override;
+    aaudio_result_t getFreeRunningPosition_l(
+            int64_t *positionFrames, int64_t *timeNanos) REQUIRES(mLock) override;
 
-    aaudio_result_t getHardwareTimestamp(int64_t *positionFrames, int64_t *timeNanos) override;
+    aaudio_result_t getHardwareTimestamp_l(
+            int64_t *positionFrames, int64_t *timeNanos) REQUIRES(mLock) override;
 
     /**
      * @param requestedCapacityFrames
@@ -106,8 +107,8 @@ protected:
                                             int32_t framesPerBurst);
 
 private:
-    SharedRingBuffer        *mAudioDataQueue = nullptr; // protected by mAudioDataQueueLock
-    std::mutex               mAudioDataQueueLock;
+
+    std::shared_ptr<SharedRingBuffer> mAudioDataQueue PT_GUARDED_BY(audioDataQueueLock);
 
     std::atomic<int64_t>     mTimestampPositionOffset;
     std::atomic<int32_t>     mXRunCount;

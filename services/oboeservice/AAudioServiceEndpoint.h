@@ -22,6 +22,8 @@
 #include <mutex>
 #include <vector>
 
+#include <android-base/thread_annotations.h>
+
 #include "client/AudioStreamInternal.h"
 #include "client/AudioStreamInternalPlay.h"
 #include "core/AAudioStreamParameters.h"
@@ -41,7 +43,7 @@ class AAudioServiceEndpoint
         , public AAudioStreamParameters {
 public:
 
-    virtual ~AAudioServiceEndpoint() = default;
+    ~AAudioServiceEndpoint() override;
 
     virtual std::string dump() const;
 
@@ -53,9 +55,11 @@ public:
      */
     virtual void close() = 0;
 
-    aaudio_result_t registerStream(android::sp<AAudioServiceStreamBase> stream);
+    aaudio_result_t registerStream(const android::sp<AAudioServiceStreamBase>& stream)
+            EXCLUDES(mLockStreams);
 
-    aaudio_result_t unregisterStream(android::sp<AAudioServiceStreamBase> stream);
+    aaudio_result_t unregisterStream(const android::sp<AAudioServiceStreamBase>& stream)
+            EXCLUDES(mLockStreams);
 
     virtual aaudio_result_t startStream(android::sp<AAudioServiceStreamBase> stream,
                                         audio_port_handle_t *clientHandle) = 0;
@@ -63,15 +67,25 @@ public:
     virtual aaudio_result_t stopStream(android::sp<AAudioServiceStreamBase> stream,
                                        audio_port_handle_t clientHandle) = 0;
 
-    virtual aaudio_result_t startClient(const android::AudioClient& client,
-                                        const audio_attributes_t *attr,
-                                        audio_port_handle_t *clientHandle) {
+    virtual aaudio_result_t startClient(const android::AudioClient& /*client*/,
+                                        const audio_attributes_t* /*attr*/,
+                                        audio_port_handle_t* /*clientHandle*/) {
         ALOGD("AAudioServiceEndpoint::startClient(...) AAUDIO_ERROR_UNAVAILABLE");
         return AAUDIO_ERROR_UNAVAILABLE;
     }
 
-    virtual aaudio_result_t stopClient(audio_port_handle_t clientHandle) {
+    virtual aaudio_result_t stopClient(audio_port_handle_t /*clientHandle*/) {
         ALOGD("AAudioServiceEndpoint::stopClient(...) AAUDIO_ERROR_UNAVAILABLE");
+        return AAUDIO_ERROR_UNAVAILABLE;
+    }
+
+    virtual aaudio_result_t standby() {
+        ALOGD("AAudioServiceEndpoint::standby() AAUDIO_ERROR_UNAVAILABLE");
+        return AAUDIO_ERROR_UNAVAILABLE;
+    }
+
+    virtual aaudio_result_t exitStandby(AudioEndpointParcelable* /*parcelable*/) {
+        ALOGD("AAudioServiceEndpoint::exitStandby() AAUDIO_ERROR_UNAVAILABLE");
         return AAUDIO_ERROR_UNAVAILABLE;
     }
 
@@ -136,12 +150,15 @@ protected:
      * @param portHandle
      * @return return true if a stream with the given portHandle is registered
      */
-    bool                     isStreamRegistered(audio_port_handle_t portHandle);
+    bool                     isStreamRegistered(audio_port_handle_t portHandle)
+                                    EXCLUDES(mLockStreams);
 
-    std::vector<android::sp<AAudioServiceStreamBase>> disconnectRegisteredStreams();
+    std::vector<android::sp<AAudioServiceStreamBase>> disconnectRegisteredStreams()
+            EXCLUDES(mLockStreams);
 
     mutable std::mutex       mLockStreams;
-    std::vector<android::sp<AAudioServiceStreamBase>> mRegisteredStreams;
+    std::vector<android::sp<AAudioServiceStreamBase>> mRegisteredStreams
+            GUARDED_BY(mLockStreams);
 
     SimpleDoubleBuffer<Timestamp>  mAtomicEndpointTimestamp;
 

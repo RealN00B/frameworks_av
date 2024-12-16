@@ -19,19 +19,27 @@
 #include <utils/Log.h>
 
 #include "MediaMetricsService.h"
+#include "ValidateId.h"
+#include "iface_statsd.h"
 
 #include <pwd.h> //getpwuid
 
+#include <android-base/stringprintf.h>
 #include <android/content/pm/IPackageManagerNative.h>  // package info
 #include <audio_utils/clock.h>                 // clock conversions
 #include <binder/IPCThreadState.h>             // get calling uid
+#include <binder/IServiceManager.h>            // checkCallingPermission
 #include <cutils/properties.h>                 // for property_get
 #include <mediautils/MemoryLeakTrackUtil.h>
 #include <memunreachable/memunreachable.h>
 #include <private/android_filesystem_config.h> // UID
+#include <stats_media_metrics.h>
+
+#include <set>
 
 namespace android {
 
+using base::StringPrintf;
 using mediametrics::Item;
 using mediametrics::startsWith;
 
@@ -41,12 +49,9 @@ using mediametrics::startsWith;
 // (0 for either of these disables that threshold)
 //
 static constexpr nsecs_t kMaxRecordAgeNs = 28 * 3600 * NANOS_PER_SECOND;
-// 2019/6: average daily per device is currently 375-ish;
-// setting this to 2000 is large enough to catch most devices
-// we'll lose some data on very very media-active devices, but only for
-// the gms collection; statsd will have already covered those for us.
-// This also retains enough information to help with bugreports
-static constexpr size_t kMaxRecords = 2000;
+
+// Max records to keep in queue which dump out for bugreports.
+static constexpr size_t kMaxRecords = 2500;
 
 // max we expire in a single call, to constrain how long we hold the
 // mutex, which also constrains how long a client might wait.
@@ -64,6 +69,7 @@ nsecs_t MediaMetricsService::roundTime(nsecs_t timeNs)
 bool MediaMetricsService::useUidForPackage(
         const std::string& package, const std::string& installer)
 {
+    // NOLINTBEGIN(bugprone-branch-clone)
     if (strchr(package.c_str(), '.') == nullptr) {
         return false;  // not of form 'com.whatever...'; assume internal and ok
     } else if (strncmp(package.c_str(), "android.", 8) == 0) {
@@ -77,21 +83,18 @@ bool MediaMetricsService::useUidForPackage(
     } else {
         return true;  // we're not sure where it came from, use uid only.
     }
+    // NOLINTEND(bugprone-branch-clone)
 }
 
 /* static */
 std::pair<std::string, int64_t>
 MediaMetricsService::getSanitizedPackageNameAndVersionCode(uid_t uid) {
-    // Meyer's singleton, initialized on first access.
-    // mUidInfo is locked internally.
-    static mediautils::UidInfo uidInfo;
-
-    // get info.
-    mediautils::UidInfo::Info info = uidInfo.getInfo(uid);
-    if (useUidForPackage(info.package, info.installer)) {
+    const std::shared_ptr<const mediautils::UidInfo::Info> info =
+            mediautils::UidInfo::getInfo(uid);
+    if (useUidForPackage(info->package, info->installer)) {
         return { std::to_string(uid), /* versionCode */ 0 };
     } else {
-        return { info.package, info.versionCode };
+        return { info->package, info->versionCode };
     }
 }
 
@@ -197,24 +200,30 @@ status_t MediaMetricsService::submitInternal(mediametrics::Item *item, bool rele
     // now attach either the item or its dup to a const shared pointer
     std::shared_ptr<const mediametrics::Item> sitem(release ? item : item->dup());
 
+    // register log session ids with singleton.
+    if (startsWith(item->getKey(), "metrics.manager")) {
+        std::string logSessionId;
+        if (item->get("logSessionId", &logSessionId)
+                && mediametrics::stringutils::isLogSessionId(logSessionId.c_str())) {
+            mediametrics::ValidateId::get()->registerId(logSessionId);
+        }
+    }
+
     (void)mAudioAnalytics.submit(sitem, isTrusted);
 
-    extern bool dump2Statsd(const std::shared_ptr<const mediametrics::Item>& item);
-    (void)dump2Statsd(sitem);  // failure should be logged in function.
+    (void)dump2Statsd(sitem, mStatsdLog);  // failure should be logged in function.
     saveItem(sitem);
     return NO_ERROR;
 }
 
 status_t MediaMetricsService::dump(int fd, const Vector<String16>& args)
 {
-    String8 result;
-
     if (checkCallingPermission(String16("android.permission.DUMP")) == false) {
-        result.appendFormat("Permission Denial: "
+        const std::string result = StringPrintf("Permission Denial: "
                 "can't dump MediaMetricsService from pid=%d, uid=%d\n",
                 IPCThreadState::self()->getCallingPid(),
                 IPCThreadState::self()->getCallingUid());
-        write(fd, result.string(), result.size());
+        write(fd, result.c_str(), result.size());
         return NO_ERROR;
     }
 
@@ -246,29 +255,30 @@ status_t MediaMetricsService::dump(int fd, const Vector<String16>& args)
             // dumpsys media.metrics audiotrack,codec
             // or dumpsys media.metrics audiotrack codec
 
-            result.append("Recognized parameters:\n");
-            result.append("--all         show all records\n");
-            result.append("--clear       clear out saved records\n");
-            result.append("--heap        show heap usage (top 100)\n");
-            result.append("--help        display help\n");
-            result.append("--prefix X    process records for component X\n");
-            result.append("--since X     X < 0: records from -X seconds in the past\n");
-            result.append("              X = 0: ignore\n");
-            result.append("              X > 0: records from X seconds since Unix epoch\n");
-            result.append("--unreachable show unreachable memory (leaks)\n");
-            write(fd, result.string(), result.size());
+            static constexpr char result[] =
+                    "Recognized parameters:\n"
+                    "--all         show all records\n"
+                    "--clear       clear out saved records\n"
+                    "--heap        show heap usage (top 100)\n"
+                    "--help        display help\n"
+                    "--prefix X    process records for component X\n"
+                    "--since X     X < 0: records from -X seconds in the past\n"
+                    "              X = 0: ignore\n"
+                    "              X > 0: records from X seconds since Unix epoch\n"
+                    "--unreachable show unreachable memory (leaks)\n";
+            write(fd, result, std::size(result));
             return NO_ERROR;
         } else if (args[i] == prefixOption) {
             ++i;
             if (i < n) {
-                prefix = String8(args[i]).string();
+                prefix = String8(args[i]).c_str();
             }
         } else if (args[i] == sinceOption) {
             ++i;
             if (i < n) {
                 String8 value(args[i]);
                 char *endp;
-                const char *p = value.string();
+                const char *p = value.c_str();
                 const auto sec = (int64_t)strtoll(p, &endp, 10);
                 if (endp == p || *endp != '\0' || sec == 0) {
                     sinceNs = 0;
@@ -282,7 +292,7 @@ status_t MediaMetricsService::dump(int fd, const Vector<String16>& args)
             unreachable = true;
         }
     }
-
+    std::stringstream result;
     {
         std::lock_guard _l(mLock);
 
@@ -291,21 +301,57 @@ status_t MediaMetricsService::dump(int fd, const Vector<String16>& args)
             mItems.clear();
             mAudioAnalytics.clear();
         } else {
-            result.appendFormat("Dump of the %s process:\n", kServiceName);
+            result << StringPrintf("Dump of the %s process:\n", kServiceName);
             const char *prefixptr = prefix.size() > 0 ? prefix.c_str() : nullptr;
-            dumpHeaders(result, sinceNs, prefixptr);
-            dumpQueue(result, sinceNs, prefixptr);
+            result << dumpHeaders(sinceNs, prefixptr);
+            result << dumpQueue(sinceNs, prefixptr);
 
             // TODO: maybe consider a better way of dumping audio analytics info.
             const int32_t linesToDump = all ? INT32_MAX : 1000;
-            auto [ dumpString, lines ] = mAudioAnalytics.dump(linesToDump, sinceNs, prefixptr);
-            result.append(dumpString.c_str());
+            auto [ dumpString, lines ] = mAudioAnalytics.dump(
+                    all, linesToDump, sinceNs, prefixptr);
+            result << dumpString;
             if (lines == linesToDump) {
-                result.append("-- some lines may be truncated --\n");
+                result << "-- some lines may be truncated --\n";
             }
+
+            const int32_t heatLinesToDump = all ? INT32_MAX : 20;
+            const auto [ heatDumpString, heatLines] =
+                    mAudioAnalytics.dumpHeatMap(heatLinesToDump);
+            result << "\n" << heatDumpString;
+            if (heatLines == heatLinesToDump) {
+                result << "-- some lines may be truncated --\n";
+            }
+
+            const int32_t healthLinesToDump = all ? INT32_MAX : 15;
+            result << "\nHealth Message Log:";
+            const auto [ healthDumpString, healthLines ] =
+                    mAudioAnalytics.dumpHealth(healthLinesToDump);
+            result << "\n" << healthDumpString;
+            if (healthLines == healthLinesToDump) {
+                result << "-- some lines may be truncated --\n";
+            }
+
+            const int32_t spatializerLinesToDump = all ? INT32_MAX : 15;
+            result << "\nSpatializer Message Log:";
+            const auto [ spatializerDumpString, spatializerLines ] =
+                    mAudioAnalytics.dumpSpatializer(spatializerLinesToDump);
+            result << "\n" << spatializerDumpString;
+            if (spatializerLines == spatializerLinesToDump) {
+                result << "-- some lines may be truncated --\n";
+            }
+
+            result << "\nLogSessionId:\n"
+                   << mediametrics::ValidateId::get()->dump();
+
+            // Dump the statsd atoms we sent out.
+            result << "\nStatsd atoms:\n"
+                   << mStatsdLog->dumpToString("  " /* prefix */,
+                           all ? STATSD_LOG_LINES_MAX : STATSD_LOG_LINES_DUMP);
         }
     }
-    write(fd, result.string(), result.size());
+    const std::string str = result.str();
+    write(fd, str.c_str(), str.size());
 
     // Check heap and unreachable memory outside of lock.
     if (heap) {
@@ -323,38 +369,37 @@ status_t MediaMetricsService::dump(int fd, const Vector<String16>& args)
 }
 
 // dump headers
-void MediaMetricsService::dumpHeaders(String8 &result, int64_t sinceNs, const char* prefix)
+std::string MediaMetricsService::dumpHeaders(int64_t sinceNs, const char* prefix)
 {
+    std::stringstream result;
     if (mediametrics::Item::isEnabled()) {
-        result.append("Metrics gathering: enabled\n");
+        result << "Metrics gathering: enabled\n";
     } else {
-        result.append("Metrics gathering: DISABLED via property\n");
+        result << "Metrics gathering: DISABLED via property\n";
     }
-    result.appendFormat(
+    result << StringPrintf(
             "Since Boot: Submissions: %lld Accepted: %lld\n",
             (long long)mItemsSubmitted.load(), (long long)mItemsFinalized);
-    result.appendFormat(
+    result << StringPrintf(
             "Records Discarded: %lld (by Count: %lld by Expiration: %lld)\n",
             (long long)mItemsDiscarded, (long long)mItemsDiscardedCount,
             (long long)mItemsDiscardedExpire);
     if (prefix != nullptr) {
-        result.appendFormat("Restricting to prefix %s", prefix);
+        result << "Restricting to prefix " << prefix << "\n";
     }
     if (sinceNs != 0) {
-        result.appendFormat(
-            "Emitting Queue entries more recent than: %lld\n",
-            (long long)sinceNs);
+        result << "Emitting Queue entries more recent than: " << sinceNs << "\n";
     }
+    return result.str();
 }
 
 // TODO: should prefix be a set<string>?
-void MediaMetricsService::dumpQueue(String8 &result, int64_t sinceNs, const char* prefix)
+std::string MediaMetricsService::dumpQueue(int64_t sinceNs, const char* prefix)
 {
     if (mItems.empty()) {
-        result.append("empty\n");
-        return;
+        return "empty\n";
     }
-
+    std::stringstream result;
     int slot = 0;
     for (const auto &item : mItems) {         // TODO: consider std::lower_bound() on mItems
         if (item->getTimestamp() < sinceNs) { // sinceNs == 0 means all items shown
@@ -365,9 +410,10 @@ void MediaMetricsService::dumpQueue(String8 &result, int64_t sinceNs, const char
                     __func__, item->getKey().c_str(), prefix);
             continue;
         }
-        result.appendFormat("%5d: %s\n", slot, item->toString().c_str());
+        result << StringPrintf("%5d: %s\n", slot, item->toString().c_str());
         slot++;
     }
+    return result.str();
 }
 
 //
@@ -439,6 +485,10 @@ void MediaMetricsService::saveItem(const std::shared_ptr<const mediametrics::Ite
     std::lock_guard _l(mLock);
     // we assume the items are roughly in time order.
     mItems.emplace_back(item);
+    if (isPullable(item->getKey())) {
+        registerStatsdCallbacksIfNeeded();
+        mPullableItems[item->getKey()].emplace_back(item);
+    }
     ++mItemsFinalized;
     if (expirations(item)
             && (!mExpireFuture.valid()
@@ -455,6 +505,8 @@ bool MediaMetricsService::isContentValid(const mediametrics::Item *item, bool is
     const std::string &key = item->getKey();
     if (startsWith(key, "audio.")) return true;
     if (startsWith(key, "drm.vendor.")) return true;
+    if (startsWith(key, "mediadrm.")) return true;
+
     // the list of allowedKey uses statsd_handlers
     // in iface_statsd.cpp as reference
     // drmmanager is from a trusted uid, therefore not needed here
@@ -466,6 +518,8 @@ bool MediaMetricsService::isContentValid(const mediametrics::Item *item, bool is
                                      "audiotrack",
                                      // other media
                                      "codec",
+                                     "videofreeze",
+                                     "videojudder",
                                      "extractor",
                                      "mediadrm",
                                      "mediaparser",
@@ -485,4 +539,58 @@ bool MediaMetricsService::isRateLimited(mediametrics::Item *) const
     return false;
 }
 
+void MediaMetricsService::registerStatsdCallbacksIfNeeded()
+{
+    if (mStatsdRegistered.test_and_set()) {
+        return;
+    }
+    auto tag = stats::media_metrics::MEDIA_DRM_ACTIVITY_INFO;
+    auto cb = MediaMetricsService::pullAtomCallback;
+    AStatsManager_setPullAtomCallback(tag, /* metadata */ nullptr, cb, this);
+}
+
+/* static */
+bool MediaMetricsService::isPullable(const std::string &key)
+{
+    static const std::set<std::string> pullableKeys{
+        "mediadrm",
+    };
+    return pullableKeys.count(key);
+}
+
+/* static */
+std::string MediaMetricsService::atomTagToKey(int32_t atomTag)
+{
+    switch (atomTag) {
+    case stats::media_metrics::MEDIA_DRM_ACTIVITY_INFO:
+        return "mediadrm";
+    }
+    return {};
+}
+
+/* static */
+AStatsManager_PullAtomCallbackReturn MediaMetricsService::pullAtomCallback(
+        int32_t atomTag, AStatsEventList* data, void* cookie)
+{
+    MediaMetricsService* svc = reinterpret_cast<MediaMetricsService*>(cookie);
+    return svc->pullItems(atomTag, data);
+}
+
+AStatsManager_PullAtomCallbackReturn MediaMetricsService::pullItems(
+        int32_t atomTag, AStatsEventList* data)
+{
+    const std::string key(atomTagToKey(atomTag));
+    if (key.empty()) {
+        return AStatsManager_PULL_SKIP;
+    }
+    std::lock_guard _l(mLock);
+    bool dumped = false;
+    for (auto &item : mPullableItems[key]) {
+        if (const auto sitem = item.lock()) {
+            dumped |= dump2Statsd(sitem, data, mStatsdLog);
+        }
+    }
+    mPullableItems[key].clear();
+    return dumped ? AStatsManager_PULL_SUCCESS : AStatsManager_PULL_SKIP;
+}
 } // namespace android

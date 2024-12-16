@@ -21,7 +21,7 @@
 #include <thread>
 
 #include <android/frameworks/cameraservice/common/2.0/types.h>
-#include <android/frameworks/cameraservice/service/2.1/ICameraService.h>
+#include <android/frameworks/cameraservice/service/2.2/ICameraService.h>
 #include <android/frameworks/cameraservice/service/2.0/types.h>
 #include <android/frameworks/cameraservice/device/2.0/types.h>
 
@@ -42,7 +42,7 @@ using hardware::Return;
 
 using HCameraDeviceCallback = frameworks::cameraservice::device::V2_0::ICameraDeviceCallback;
 using HCameraMetadata = frameworks::cameraservice::service::V2_0::CameraMetadata;
-using HCameraService = frameworks::cameraservice::service::V2_1::ICameraService;
+using HCameraService = frameworks::cameraservice::service::V2_2::ICameraService;
 using HCameraServiceListener = frameworks::cameraservice::service::V2_0::ICameraServiceListener;
 using HCameraServiceListener2_1 = frameworks::cameraservice::service::V2_1::ICameraServiceListener;
 using HStatus = frameworks::cameraservice::common::V2_0::Status;
@@ -75,7 +75,7 @@ struct HidlCameraService final : public HCameraService {
     static sp<HidlCameraService> getInstance(android::CameraService *cs);
 
 private:
-    HidlCameraService(android::CameraService *cs) : mAidlICameraService(cs) { };
+    HidlCameraService(android::CameraService *cs);
 
     sp<hardware::ICameraServiceListener> searchListenerCacheLocked(
         sp<HCameraServiceListener> listener, /*removeIfFound*/ bool shouldRemove = false);
@@ -95,6 +95,7 @@ private:
     using HIListeners =
         std::pair<sp<HCameraServiceListener>, sp<ICameraServiceListener>>;
     std::list<HIListeners> mListeners;
+    int mVndkVersion = -1;
 };
 
 }  // namespace implementation

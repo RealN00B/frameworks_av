@@ -17,13 +17,13 @@
 #ifndef AAUDIO_AAUDIO_STREAM_TRACKER_H
 #define AAUDIO_AAUDIO_STREAM_TRACKER_H
 
+#include <mutex>
 #include <time.h>
-#include <pthread.h>
 
+#include <android-base/thread_annotations.h>
 #include <aaudio/AAudio.h>
 
 #include "binding/AAudioCommon.h"
-
 #include "AAudioServiceStreamBase.h"
 
 namespace aaudio {
@@ -37,7 +37,7 @@ public:
      * @param streamHandle
      * @return number of streams removed
      */
-    int32_t removeStreamByHandle(aaudio_handle_t streamHandle);
+    int32_t removeStreamByHandle(aaudio_handle_t streamHandle) EXCLUDES(mHandleLock);
 
     /**
      * Look up a stream based on the handle.
@@ -46,7 +46,7 @@ public:
      * @return strong pointer to the stream if found, or nullptr
      */
     android::sp<aaudio::AAudioServiceStreamBase> getStreamByHandle(
-            aaudio_handle_t streamHandle);
+            aaudio_handle_t streamHandle) EXCLUDES(mHandleLock);
 
     /**
      * Look up a stream based on the AudioPolicy portHandle.
@@ -56,7 +56,7 @@ public:
      * @return strong pointer to the stream if found, or nullptr
      */
     android::sp<aaudio::AAudioServiceStreamBase> findStreamByPortHandle(
-            audio_port_handle_t portHandle);
+            audio_port_handle_t portHandle) EXCLUDES(mHandleLock);
 
     /**
      * Store a strong pointer to the stream and return a unique handle for future reference.
@@ -64,7 +64,8 @@ public:
      * @param serviceStream
      * @return handle for identifying the stream
      */
-    aaudio_handle_t addStreamForHandle(android::sp<AAudioServiceStreamBase> serviceStream);
+    aaudio_handle_t addStreamForHandle(const android::sp<AAudioServiceStreamBase>& serviceStream)
+            EXCLUDES(mHandleLock);
 
     /**
      * @return string that can be added to dumpsys
@@ -75,11 +76,10 @@ private:
     static aaudio_handle_t bumpHandle(aaudio_handle_t handle);
 
     // Track stream using a unique handle that wraps. Only use positive half.
-    mutable std::mutex                mHandleLock;
-    // protected by mHandleLock
-    aaudio_handle_t                   mPreviousHandle = 0;
-    // protected by mHandleLock
-    std::map<aaudio_handle_t, android::sp<aaudio::AAudioServiceStreamBase>> mStreamsByHandle;
+    mutable std::mutex            mHandleLock;
+    aaudio_handle_t               mPreviousHandle GUARDED_BY(mHandleLock) = 0;
+    std::map<aaudio_handle_t, android::sp<aaudio::AAudioServiceStreamBase>>
+            mStreamsByHandle GUARDED_BY(mHandleLock);
 };
 
 

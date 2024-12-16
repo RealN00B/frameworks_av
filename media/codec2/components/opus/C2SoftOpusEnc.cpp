@@ -29,7 +29,6 @@ extern "C" {
     #include <opus_multistream.h>
 }
 
-#define DEFAULT_FRAME_DURATION_MS 20
 namespace android {
 
 namespace {
@@ -38,7 +37,6 @@ constexpr char COMPONENT_NAME[] = "c2.android.opus.encoder";
 
 }  // namespace
 
-static const int kMaxNumChannelsSupported = 2;
 
 class C2SoftOpusEnc::IntfImpl : public SimpleInterface<void>::BaseParams {
 public:
@@ -245,13 +243,14 @@ c2_status_t C2SoftOpusEnc::initEncoder() {
     mIsFirstFrame = true;
     mEncoderFlushed = false;
     mBufferAvailable = false;
-    mAnchorTimeStamp = 0ull;
+    mAnchorTimeStamp = 0;
     mProcessedSamples = 0;
     mFilledLen = 0;
-    mFrameDurationMs = DEFAULT_FRAME_DURATION_MS;
+    mFrameDurationMs = kDefaultFrameDurationMs;
     if (!mInputBufferPcm16) {
+        size_t frameSize = (mFrameDurationMs * kMaxSampleRateSupported) / 1000;
         mInputBufferPcm16 =
-            (int16_t*)malloc(kFrameSize * kMaxNumChannels * sizeof(int16_t));
+            (int16_t*)malloc(frameSize * kMaxNumChannelsSupported * sizeof(int16_t));
     }
     if (!mInputBufferPcm16) return C2_NO_MEMORY;
 
@@ -266,7 +265,7 @@ c2_status_t C2SoftOpusEnc::onStop() {
     mIsFirstFrame = true;
     mEncoderFlushed = false;
     mBufferAvailable = false;
-    mAnchorTimeStamp = 0ull;
+    mAnchorTimeStamp = 0;
     mProcessedSamples = 0u;
     mFilledLen = 0;
     if (mEncoder) {
@@ -363,12 +362,14 @@ void C2SoftOpusEnc::process(const std::unique_ptr<C2Work>& work,
         }
     }
     if (mIsFirstFrame && inSize > 0) {
-        mAnchorTimeStamp = work->input.ordinal.timestamp.peekull();
+        mAnchorTimeStamp = work->input.ordinal.timestamp.peekll();
         mIsFirstFrame = false;
     }
 
     C2MemoryUsage usage = {C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE};
-    err = pool->fetchLinearBlock(kMaxPayload, usage, &mOutputBlock);
+    int outCapacity =
+        kMaxPayload * ((inSize + mNumPcmBytesPerInputFrame) / mNumPcmBytesPerInputFrame);
+    err = pool->fetchLinearBlock(outCapacity, usage, &mOutputBlock);
     if (err != C2_OK) {
         ALOGE("fetchLinearBlock for Output failed with status %d", err);
         work->result = C2_NO_MEMORY;
@@ -386,7 +387,7 @@ void C2SoftOpusEnc::process(const std::unique_ptr<C2Work>& work,
     size_t inPos = 0;
     size_t processSize = 0;
     mBytesEncoded = 0;
-    uint64_t outTimeStamp = 0u;
+    int64_t outTimeStamp = 0;
     std::shared_ptr<C2Buffer> buffer;
     uint64_t inputIndex = work->input.ordinal.frameIndex.peeku();
     const uint8_t* inPtr = rView.data() + inOffset;
@@ -497,11 +498,11 @@ void C2SoftOpusEnc::process(const std::unique_ptr<C2Work>& work,
         uint8_t* outPtr = wView.data() + mBytesEncoded;
         int encodedBytes =
             opus_multistream_encode(mEncoder, mInputBufferPcm16,
-                                    mNumSamplesPerFrame, outPtr, kMaxPayload - mBytesEncoded);
+                                    mNumSamplesPerFrame, outPtr, outCapacity - mBytesEncoded);
         ALOGV("encoded %i Opus bytes from %zu PCM bytes", encodedBytes,
               processSize);
 
-        if (encodedBytes < 0 || encodedBytes > (kMaxPayload - mBytesEncoded)) {
+        if (encodedBytes < 0 || encodedBytes > (outCapacity - mBytesEncoded)) {
             ALOGE("opus_encode failed, encodedBytes : %d", encodedBytes);
             mSignalledError = true;
             work->result = C2_CORRUPTED;
@@ -584,7 +585,7 @@ c2_status_t C2SoftOpusEnc::drainInternal(
         mOutputBlock.reset();
     }
     mProcessedSamples += (mNumPcmBytesPerInputFrame / sizeof(int16_t));
-    uint64_t outTimeStamp =
+    int64_t outTimeStamp =
         mProcessedSamples * 1000000ll / mChannelCount / mSampleRate;
     outOrdinal.frameIndex = mOutIndex++;
     outOrdinal.timestamp = mAnchorTimeStamp + outTimeStamp;
@@ -612,7 +613,7 @@ c2_status_t C2SoftOpusEnc::drain(uint32_t drainMode,
         return C2_OMITTED;
     }
     mIsFirstFrame = true;
-    mAnchorTimeStamp = 0ull;
+    mAnchorTimeStamp = 0;
     mProcessedSamples = 0u;
     return drainInternal(pool, nullptr);
 }

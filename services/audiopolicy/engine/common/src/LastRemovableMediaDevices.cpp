@@ -44,15 +44,29 @@ void LastRemovableMediaDevices::setRemovableMediaDevices(sp<DeviceDescriptor> de
 }
 
 std::vector<audio_devices_t> LastRemovableMediaDevices::getLastRemovableMediaDevices(
-        device_out_group_t group) const
+        device_out_group_t group, std::vector<audio_devices_t> excludedDevices) const
 {
     std::vector<audio_devices_t> ret;
     for (auto iter = mMediaDevices.begin(); iter != mMediaDevices.end(); ++iter) {
-        if ((group == GROUP_NONE) || (group == getDeviceOutGroup((iter->desc)->type()))) {
-            ret.push_back((iter->desc)->type());
+        audio_devices_t type = (iter->desc)->type();
+        if ((group == GROUP_NONE || group == getDeviceOutGroup(type))
+                && std::find(excludedDevices.begin(), excludedDevices.end(), type) ==
+                                       excludedDevices.end()) {
+            ret.push_back(type);
         }
     }
     return ret;
+}
+
+sp<DeviceDescriptor> LastRemovableMediaDevices::getLastRemovableMediaDevice(
+        const DeviceVector& excludedDevices, device_out_group_t group) const {
+    for (auto iter = mMediaDevices.begin(); iter != mMediaDevices.end(); ++iter) {
+        if ((group == GROUP_NONE || group == getDeviceOutGroup((iter->desc)->type())) &&
+                !excludedDevices.contains(iter->desc)) {
+            return iter->desc;
+        }
+    }
+    return nullptr;
 }
 
 device_out_group_t LastRemovableMediaDevices::getDeviceOutGroup(audio_devices_t device) const
@@ -65,6 +79,7 @@ device_out_group_t LastRemovableMediaDevices::getDeviceOutGroup(audio_devices_t 
     case AUDIO_DEVICE_OUT_USB_ACCESSORY:
     case AUDIO_DEVICE_OUT_USB_DEVICE:
     case AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET:
+    case AUDIO_DEVICE_OUT_AUX_DIGITAL:
         return GROUP_WIRED;
     case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
     case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
@@ -74,6 +89,7 @@ device_out_group_t LastRemovableMediaDevices::getDeviceOutGroup(audio_devices_t 
     case AUDIO_DEVICE_OUT_HEARING_AID:
     case AUDIO_DEVICE_OUT_BLE_HEADSET:
     case AUDIO_DEVICE_OUT_BLE_SPEAKER:
+    case AUDIO_DEVICE_OUT_BLE_BROADCAST:
         return GROUP_BT_A2DP;
     default:
         return GROUP_NONE;

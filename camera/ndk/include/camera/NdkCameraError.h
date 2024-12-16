@@ -40,7 +40,13 @@
 
 __BEGIN_DECLS
 
+/**
+ * Camera status enum types.
+ */
 typedef enum {
+    /**
+     * Camera operation has succeeded.
+     */
     ACAMERA_OK = 0,
 
     ACAMERA_ERROR_BASE                  = -10000,
@@ -91,7 +97,7 @@ typedef enum {
     ACAMERA_ERROR_CAMERA_SERVICE        = ACAMERA_ERROR_BASE - 6,
 
     /**
-     * The {@link ACameraCaptureSession} has been closed and cannnot perform any operation other
+     * The {@link ACameraCaptureSession} has been closed and cannot perform any operation other
      * than {@link ACameraCaptureSession_close}.
      */
     ACAMERA_ERROR_SESSION_CLOSED        = ACAMERA_ERROR_BASE - 7,

@@ -54,6 +54,38 @@ namespace android {
 
 static const int64_t kMinStreamableFileSizeInBytes = 5 * 1024 * 1024;
 
+bool WebmWriter::isFdOpenModeValid(int fd) {
+    // check for invalid file descriptor.
+    if (!MediaWriter::isFdOpenModeValid(fd)) {
+        return false;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if ((flags & O_RDWR) == 0) {
+        ALOGE("File must be in read-write mode for webm writer");
+        return false;
+    }
+    return true;
+}
+
+bool WebmWriter::isSampleMetadataValid(size_t trackIndex, int64_t timeUs) {
+    int64_t prevTimeUs = 0;
+    if (mLastTimestampUsByTrackIndex.find(trackIndex) != mLastTimestampUsByTrackIndex.end()) {
+        prevTimeUs = mLastTimestampUsByTrackIndex[trackIndex];
+    }
+    // WebM has monotonically increasing timestamps
+    if (timeUs < 0 || timeUs < prevTimeUs) {
+        return false;
+    }
+    int64_t lastDurationUs = timeUs - prevTimeUs;
+    // Ensure that the timeUs value does not overflow,
+    // when adding lastDurationUs in the WebmFrameMediaSourceThread.
+    if (timeUs > (INT64_MAX / 1000) - lastDurationUs) {
+        return false;
+    }
+    mLastTimestampUsByTrackIndex[trackIndex] = timeUs;
+    return true;
+}
+
 WebmWriter::WebmWriter(int fd)
     : mFd(dup(fd)),
       mInitCheck(mFd < 0 ? NO_INIT : OK),
@@ -258,7 +290,7 @@ uint64_t WebmWriter::estimateCuesSize(int32_t bitRate) {
     // Max file duration limit is set
     if (mMaxFileDurationLimitUs != 0) {
         if (bitRate > 0) {
-            int64_t size2 = ((mMaxFileDurationLimitUs * bitRate * 6) / 1000 / 8000000);
+            int64_t size2 = ((mMaxFileDurationLimitUs / 1000) * bitRate * 6) / 8000000;
             if (mMaxFileSizeLimitBytes != 0 && mIsFileSizeLimitExplicitlyRequested) {
                 // When both file size and duration limits are set,
                 // we use the smaller limit of the two.

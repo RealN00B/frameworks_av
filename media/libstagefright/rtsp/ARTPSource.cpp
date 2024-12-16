@@ -18,17 +18,17 @@
 #define LOG_TAG "ARTPSource"
 #include <utils/Log.h>
 
-#include "ARTPSource.h"
+#include <media/stagefright/rtsp/ARTPSource.h>
 
-#include "AAMRAssembler.h"
-#include "AAVCAssembler.h"
-#include "AHEVCAssembler.h"
-#include "AH263Assembler.h"
-#include "AMPEG2TSAssembler.h"
-#include "AMPEG4AudioAssembler.h"
-#include "AMPEG4ElementaryAssembler.h"
-#include "ARawAudioAssembler.h"
-#include "ASessionDescription.h"
+#include <media/stagefright/rtsp/AAMRAssembler.h>
+#include <media/stagefright/rtsp/AAVCAssembler.h>
+#include <media/stagefright/rtsp/AHEVCAssembler.h>
+#include <media/stagefright/rtsp/AH263Assembler.h>
+#include <media/stagefright/rtsp/AMPEG2TSAssembler.h>
+#include <media/stagefright/rtsp/AMPEG4AudioAssembler.h>
+#include <media/stagefright/rtsp/AMPEG4ElementaryAssembler.h>
+#include <media/stagefright/rtsp/ARawAudioAssembler.h>
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -132,10 +132,10 @@ void ARTPSource::processRTPPacket() {
     }
 }
 
-void ARTPSource::timeUpdate(uint32_t rtpTime, uint64_t ntpTime) {
+void ARTPSource::timeUpdate(int64_t recvTimeUs, uint32_t rtpTime, uint64_t ntpTime) {
     mLastSrRtpTime = rtpTime;
     mLastSrNtpTime = ntpTime;
-    mLastSrUpdateTimeUs = ALooper::GetNowUs();
+    mLastSrUpdateTimeUs = recvTimeUs;
 
     sp<AMessage> notify = mNotify->dup();
     notify->setInt32("time-update", true);
@@ -143,7 +143,30 @@ void ARTPSource::timeUpdate(uint32_t rtpTime, uint64_t ntpTime) {
     notify->setInt64("ntp-time", ntpTime);
     notify->setInt32("rtcp-event", 1);
     notify->setInt32("payload-type", RTCP_SR);
-    notify->setInt64("recv-time-us", mLastSrUpdateTimeUs);
+    notify->setInt64("recv-time-us", recvTimeUs);
+    notify->post();
+}
+
+void ARTPSource::processReceptionReportBlock(
+        int64_t recvTimeUs, uint32_t senderId, sp<ReceptionReportBlock> rrb) {
+    mLastRrUpdateTimeUs = recvTimeUs;
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("rtcp-event", 1);
+    // A Reception Report Block (RRB) can be included in both Sender Report and Receiver Report.
+    // But it means 'Packet Reception Report' actually.
+    // So that, we will report RRB as RR since there is no meaning difference
+    // between RRB(Reception Report Block) and RR(Receiver Report).
+    notify->setInt32("payload-type", RTCP_RR);
+    notify->setInt64("recv-time-us", recvTimeUs);
+    notify->setInt32("rtcp-rr-ssrc", senderId);
+    notify->setInt32("rtcp-rrb-ssrc", rrb->ssrc);
+    notify->setInt32("rtcp-rrb-fraction", rrb->fraction);
+    notify->setInt32("rtcp-rrb-lost", rrb->lost);
+    notify->setInt32("rtcp-rrb-lastSeq", rrb->lastSeq);
+    notify->setInt32("rtcp-rrb-jitter", rrb->jitter);
+    notify->setInt32("rtcp-rrb-lsr", rrb->lsr);
+    notify->setInt32("rtcp-rrb-dlsr", rrb->dlsr);
     notify->post();
 }
 
@@ -241,12 +264,12 @@ void ARTPSource::adjustAnchorTimeIfRequired(int64_t nowUs) {
 
 bool ARTPSource::queuePacket(const sp<ABuffer> &buffer) {
     int64_t nowUs = ALooper::GetNowUs();
+    int64_t rtpTime = 0;
     uint32_t seqNum = (uint32_t)buffer->int32Data();
-    int32_t ssrc = 0, rtpTime = 0;
+    int32_t ssrc = 0;
 
     buffer->meta()->findInt32("ssrc", &ssrc);
     CHECK(buffer->meta()->findInt32("rtp-time", (int32_t *)&rtpTime));
-    mLatestRtpTime = rtpTime;
 
     if (mNumBuffersReceived++ == 0 && mFirstSysTime == 0) {
         mFirstSysTime = nowUs;
@@ -254,7 +277,7 @@ bool ARTPSource::queuePacket(const sp<ABuffer> &buffer) {
         mLastSysAnchorTimeUpdatedUs = nowUs;
         mHighestSeqNumber = seqNum;
         mBaseSeqNumber = seqNum;
-        mFirstRtpTime = rtpTime;
+        mFirstRtpTime = (uint32_t)rtpTime;
         mFirstSsrc = ssrc;
         ALOGD("first-rtp arrived: first-rtp-time=%u, sys-time=%lld, seq-num=%u, ssrc=%d",
                 mFirstRtpTime, (long long)mFirstSysTime, mHighestSeqNumber, mFirstSsrc);
@@ -328,6 +351,18 @@ bool ARTPSource::queuePacket(const sp<ABuffer> &buffer) {
     }
 
     mQueue.insert(it, buffer);
+
+    /**
+     * RFC3550 calculates the interarrival jitter time for 'ALL packets'.
+     * We calculate anothor jitter only for all 'Head NAL units'
+     */
+    ALOGV("<======== Insert %d", seqNum);
+    rtpTime = mAssembler->findRTPTime(mFirstRtpTime, buffer);
+    if (rtpTime != mLatestRtpTime) {
+        mJitterCalc->putBaseData(rtpTime, nowUs);
+    }
+    mJitterCalc->putInterArrivalData(rtpTime, nowUs);
+    mLatestRtpTime = rtpTime;
 
     return true;
 }
@@ -453,7 +488,8 @@ void ARTPSource::addReceiverReport(const sp<ABuffer> &buffer) {
     data[18] = (mHighestSeqNumber >> 8) & 0xff;
     data[19] = mHighestSeqNumber & 0xff;
 
-    uint32_t jitterTime = 0;
+    uint32_t jitterTimeMs = (uint32_t)getInterArrivalJitterTimeMs();
+    uint32_t jitterTime = jitterTimeMs * mClockRate / 1000;
     data[20] = jitterTime >> 24;    // Interarrival jitter
     data[21] = (jitterTime >> 16) & 0xff;
     data[22] = (jitterTime >> 8) & 0xff;
@@ -654,14 +690,6 @@ int32_t ARTPSource::getInterArrivalJitterTimeMs() {
 
 void ARTPSource::setStaticJitterTimeMs(const uint32_t jbTimeMs) {
     mStaticJbTimeMs = jbTimeMs;
-}
-
-void ARTPSource::putBaseJitterData(uint32_t timeStamp, int64_t arrivalTime) {
-    mJitterCalc->putBaseData(timeStamp, arrivalTime);
-}
-
-void ARTPSource::putInterArrivalJitterData(uint32_t timeStamp, int64_t arrivalTime) {
-    mJitterCalc->putInterArrivalData(timeStamp, arrivalTime);
 }
 
 void ARTPSource::setJbTimer(const sp<AMessage> timer) {

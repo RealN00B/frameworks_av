@@ -20,18 +20,23 @@
 #include <assert.h>
 #include <mutex>
 
+#include <android-base/thread_annotations.h>
+#include <media/AidlConversion.h>
 #include <media/AudioClient.h>
 #include <utils/RefBase.h>
 
 #include "fifo/FifoBuffer.h"
-#include "binding/IAAudioService.h"
 #include "binding/AudioEndpointParcelable.h"
 #include "binding/AAudioServiceMessage.h"
+#include "binding/AAudioStreamRequest.h"
+#include "core/AAudioStreamParameters.h"
 #include "utility/AAudioUtilities.h"
 #include "utility/AudioClock.h"
 
-#include "SharedRingBuffer.h"
+#include "AAudioCommandQueue.h"
 #include "AAudioThread.h"
+#include "SharedRingBuffer.h"
+#include "TimestampScheduler.h"
 
 namespace android {
     class AAudioService;
@@ -57,7 +62,7 @@ class AAudioServiceStreamBase
 public:
     explicit AAudioServiceStreamBase(android::AAudioService &aAudioService);
 
-    virtual ~AAudioServiceStreamBase();
+    ~AAudioServiceStreamBase() override;
 
     enum {
         ILLEGAL_THREAD_ID = 0
@@ -71,13 +76,14 @@ public:
     /**
      * Open the device.
      */
-    virtual aaudio_result_t open(const aaudio::AAudioStreamRequest &request) = 0;
+    virtual aaudio_result_t open(const aaudio::AAudioStreamRequest &request)
+            EXCLUDES(mUpMessageQueueLock);
 
     // We log the CLOSE from the close() method. We needed this separate method to log the OPEN
     // because we had to wait until we generated the handle.
     void logOpen(aaudio_handle_t streamHandle);
 
-    aaudio_result_t close();
+    aaudio_result_t close() EXCLUDES(mLock);
 
     /**
      * Start the flow of audio data.
@@ -85,7 +91,7 @@ public:
      * This is not guaranteed to be synchronous but it currently is.
      * An AAUDIO_SERVICE_EVENT_STARTED will be sent to the client when complete.
      */
-    aaudio_result_t start();
+    aaudio_result_t start() EXCLUDES(mLock);
 
     /**
      * Stop the flow of data so that start() can resume without loss of data.
@@ -93,7 +99,7 @@ public:
      * This is not guaranteed to be synchronous but it currently is.
      * An AAUDIO_SERVICE_EVENT_PAUSED will be sent to the client when complete.
     */
-    aaudio_result_t pause();
+    aaudio_result_t pause() EXCLUDES(mLock);
 
     /**
      * Stop the flow of data after the currently queued data has finished playing.
@@ -102,14 +108,19 @@ public:
      * An AAUDIO_SERVICE_EVENT_STOPPED will be sent to the client when complete.
      *
      */
-    aaudio_result_t stop();
+    aaudio_result_t stop() EXCLUDES(mLock);
 
     /**
      * Discard any data held by the underlying HAL or Service.
      *
      * An AAUDIO_SERVICE_EVENT_FLUSHED will be sent to the client when complete.
      */
-    aaudio_result_t flush();
+    aaudio_result_t flush() EXCLUDES(mLock);
+
+    /**
+     * Exit standby mode. The MMAP buffer will be reallocated.
+     */
+    aaudio_result_t exitStandby(AudioEndpointParcelable *parcelable) EXCLUDES(mLock);
 
     virtual aaudio_result_t startClient(const android::AudioClient& client,
                                         const audio_attributes_t *attr __unused,
@@ -123,9 +134,9 @@ public:
         return AAUDIO_ERROR_UNAVAILABLE;
     }
 
-    aaudio_result_t registerAudioThread(pid_t clientThreadId, int priority);
+    aaudio_result_t registerAudioThread(pid_t clientThreadId, int priority) EXCLUDES(mLock);
 
-    aaudio_result_t unregisterAudioThread(pid_t clientThreadId);
+    aaudio_result_t unregisterAudioThread(pid_t clientThreadId) EXCLUDES(mLock);
 
     bool isRunning() const {
         return mState == AAUDIO_STREAM_STATE_STARTED;
@@ -134,7 +145,7 @@ public:
     /**
      * Fill in a parcelable description of stream.
      */
-    aaudio_result_t getDescription(AudioEndpointParcelable &parcelable);
+    aaudio_result_t getDescription(AudioEndpointParcelable &parcelable) EXCLUDES(mLock);
 
     void setRegisteredThread(pid_t pid) {
         mRegisteredClientThread = pid;
@@ -150,18 +161,20 @@ public:
 
     void run() override; // to implement Runnable
 
-    void disconnect();
+    void disconnect() EXCLUDES(mLock);
 
     const android::AudioClient &getAudioClient() {
         return mMmapClient;
     }
 
     uid_t getOwnerUserId() const {
-        return mMmapClient.clientUid;
+        return VALUE_OR_FATAL(android::aidl2legacy_int32_t_uid_t(
+                mMmapClient.attributionSource.uid));
     }
 
     pid_t getOwnerProcessId() const {
-        return mMmapClient.clientPid;
+        return VALUE_OR_FATAL(android::aidl2legacy_int32_t_pid_t(
+                mMmapClient.attributionSource.pid));
     }
 
     aaudio_handle_t getHandle() const {
@@ -208,37 +221,6 @@ public:
         return mSuspended;
     }
 
-    /**
-     * Atomically increment the number of active references to the stream by AAudioService.
-     *
-     * This is called under a global lock in AAudioStreamTracker.
-     *
-     * @return value after the increment
-     */
-    int32_t incrementServiceReferenceCount_l();
-
-    /**
-     * Atomically decrement the number of active references to the stream by AAudioService.
-     * This should only be called after incrementServiceReferenceCount_l().
-     *
-     * This is called under a global lock in AAudioStreamTracker.
-     *
-     * @return value after the decrement
-     */
-    int32_t decrementServiceReferenceCount_l();
-
-    bool isCloseNeeded() const {
-        return mCloseNeeded.load();
-    }
-
-    /**
-     * Mark this stream as needing to be closed.
-     * Once marked for closing, it cannot be unmarked.
-     */
-    void markCloseNeeded() {
-        mCloseNeeded.store(true);
-    }
-
     virtual const char *getTypeText() const { return "Base"; }
 
 protected:
@@ -249,11 +231,47 @@ protected:
     aaudio_result_t open(const aaudio::AAudioStreamRequest &request,
                          aaudio_sharing_mode_t sharingMode);
 
-    // These must be called under mLock
-    virtual aaudio_result_t close_l();
-    virtual aaudio_result_t pause_l();
-    virtual aaudio_result_t stop_l();
-    void disconnect_l();
+    aaudio_result_t start_l() REQUIRES(mLock);
+    virtual aaudio_result_t close_l() REQUIRES(mLock);
+    virtual aaudio_result_t pause_l() REQUIRES(mLock);
+    virtual aaudio_result_t stop_l() REQUIRES(mLock);
+    void disconnect_l() REQUIRES(mLock);
+    aaudio_result_t flush_l() REQUIRES(mLock);
+
+    class RegisterAudioThreadParam : public AAudioCommandParam {
+    public:
+        RegisterAudioThreadParam(pid_t ownerPid, pid_t clientThreadId, int priority)
+                : AAudioCommandParam(), mOwnerPid(ownerPid),
+                  mClientThreadId(clientThreadId), mPriority(priority) { }
+        ~RegisterAudioThreadParam() override = default;
+
+        pid_t mOwnerPid;
+        pid_t mClientThreadId;
+        int mPriority;
+    };
+    aaudio_result_t registerAudioThread_l(
+            pid_t ownerPid, pid_t clientThreadId, int priority) REQUIRES(mLock);
+
+    class UnregisterAudioThreadParam : public AAudioCommandParam {
+    public:
+        explicit UnregisterAudioThreadParam(pid_t clientThreadId)
+                : AAudioCommandParam(), mClientThreadId(clientThreadId) { }
+        ~UnregisterAudioThreadParam() override = default;
+
+        pid_t mClientThreadId;
+    };
+    aaudio_result_t unregisterAudioThread_l(pid_t clientThreadId) REQUIRES(mLock);
+
+    class GetDescriptionParam : public AAudioCommandParam {
+    public:
+        explicit GetDescriptionParam(AudioEndpointParcelable* parcelable)
+                : AAudioCommandParam(), mParcelable(parcelable) { }
+        ~GetDescriptionParam() override = default;
+
+        AudioEndpointParcelable* mParcelable;
+    };
+    aaudio_result_t getDescription_l(AudioEndpointParcelable* parcelable)
+            REQUIRES(mLock) EXCLUDES(mUpMessageQueueLock);
 
     void setState(aaudio_stream_state_t state);
 
@@ -261,35 +279,136 @@ protected:
      * Device specific startup.
      * @return AAUDIO_OK or negative error.
      */
-    virtual aaudio_result_t startDevice();
+    virtual aaudio_result_t startDevice_l() REQUIRES(mLock);
 
-    aaudio_result_t writeUpMessageQueue(AAudioServiceMessage *command);
+    aaudio_result_t writeUpMessageQueue(AAudioServiceMessage *command)
+            EXCLUDES(mUpMessageQueueLock);
 
-    aaudio_result_t sendCurrentTimestamp();
+    aaudio_result_t sendCurrentTimestamp_l() REQUIRES(mLock);
 
     aaudio_result_t sendXRunCount(int32_t xRunCount);
+
+    aaudio_result_t sendStartClientCommand(const android::AudioClient& client,
+                                           const audio_attributes_t *attr,
+                                           audio_port_handle_t *clientHandle) EXCLUDES(mLock);
+
+    aaudio_result_t sendStopClientCommand(audio_port_handle_t clientHandle) EXCLUDES(mLock);
 
     /**
      * @param positionFrames
      * @param timeNanos
      * @return AAUDIO_OK or AAUDIO_ERROR_UNAVAILABLE or other negative error
      */
-    virtual aaudio_result_t getFreeRunningPosition(int64_t *positionFrames, int64_t *timeNanos) = 0;
+    virtual aaudio_result_t getFreeRunningPosition_l(
+            int64_t *positionFrames, int64_t *timeNanos) = 0;
 
-    virtual aaudio_result_t getHardwareTimestamp(int64_t *positionFrames, int64_t *timeNanos) = 0;
+    virtual aaudio_result_t getHardwareTimestamp_l(int64_t *positionFrames, int64_t *timeNanos) = 0;
 
-    virtual aaudio_result_t getAudioDataDescription(AudioEndpointParcelable &parcelable) = 0;
+    virtual aaudio_result_t getAudioDataDescription_l(AudioEndpointParcelable* parcelable) = 0;
+
 
     aaudio_stream_state_t   mState = AAUDIO_STREAM_STATE_UNINITIALIZED;
 
+    bool isDisconnected_l() const REQUIRES(mLock) {
+        return mDisconnected;
+    }
+    void setDisconnected_l(bool flag) REQUIRES(mLock) {
+        mDisconnected = flag;
+    }
+
+    // If you implemented this method then please also override isStandbyImplemented().
+    virtual aaudio_result_t standby_l() REQUIRES(mLock) {
+        return AAUDIO_ERROR_UNIMPLEMENTED;
+    }
+    virtual bool isStandbyImplemented() {
+        return false;
+    }
+
+    class ExitStandbyParam : public AAudioCommandParam {
+    public:
+        explicit ExitStandbyParam(AudioEndpointParcelable* parcelable)
+                : AAudioCommandParam(), mParcelable(parcelable) { }
+        ~ExitStandbyParam() override = default;
+
+        AudioEndpointParcelable* mParcelable;
+    };
+    virtual aaudio_result_t exitStandby_l(
+            AudioEndpointParcelable* parcelable __unused) REQUIRES(mLock) {
+        return AAUDIO_ERROR_UNAVAILABLE;
+    }
+    bool isStandby_l() const REQUIRES(mLock) {
+        return mStandby;
+    }
+    void setStandby_l(bool standby) REQUIRES(mLock) {
+        mStandby = standby;
+    }
+
+    bool isIdle_l() const REQUIRES(mLock) {
+        return mState == AAUDIO_STREAM_STATE_OPEN || mState == AAUDIO_STREAM_STATE_PAUSED
+                || mState == AAUDIO_STREAM_STATE_STOPPED;
+    }
+
+    virtual int64_t nextDataReportTime_l() REQUIRES(mLock) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    virtual void reportData_l() REQUIRES(mLock) { return; }
+
+    class StartClientParam : public AAudioCommandParam {
+    public:
+        StartClientParam(const android::AudioClient& client, const audio_attributes_t* attr,
+                         audio_port_handle_t* clientHandle)
+                : AAudioCommandParam(), mClient(client), mAttr(attr), mClientHandle(clientHandle) {
+        }
+        ~StartClientParam() override = default;
+
+        android::AudioClient mClient;
+        const audio_attributes_t* mAttr;
+        audio_port_handle_t* mClientHandle;
+    };
+    virtual aaudio_result_t startClient_l(
+            const android::AudioClient& client,
+            const audio_attributes_t *attr __unused,
+            audio_port_handle_t *clientHandle __unused) REQUIRES(mLock) {
+        ALOGD("AAudioServiceStreamBase::startClient_l(%p, ...) AAUDIO_ERROR_UNAVAILABLE", &client);
+        return AAUDIO_ERROR_UNAVAILABLE;
+    }
+
+    class StopClientParam : public AAudioCommandParam {
+    public:
+        explicit StopClientParam(audio_port_handle_t clientHandle)
+                : AAudioCommandParam(), mClientHandle(clientHandle) {
+        }
+        ~StopClientParam() override = default;
+
+        audio_port_handle_t mClientHandle;
+    };
+    virtual aaudio_result_t stopClient_l(audio_port_handle_t clientHandle) REQUIRES(mLock) {
+        ALOGD("AAudioServiceStreamBase::stopClient(%d) AAUDIO_ERROR_UNAVAILABLE", clientHandle);
+        return AAUDIO_ERROR_UNAVAILABLE;
+    }
+
     pid_t                   mRegisteredClientThread = ILLEGAL_THREAD_ID;
 
-    SharedRingBuffer*       mUpMessageQueue;
     std::mutex              mUpMessageQueueLock;
+    std::shared_ptr<SharedRingBuffer> mUpMessageQueue PT_GUARDED_BY(mUpMessageQueueLock);
 
-    AAudioThread            mTimestampThread;
-    // This is used by one thread to tell another thread to exit. So it must be atomic.
-    std::atomic<bool>       mThreadEnabled{false};
+    enum : int32_t {
+        START,
+        PAUSE,
+        STOP,
+        FLUSH,
+        CLOSE,
+        DISCONNECT,
+        REGISTER_AUDIO_THREAD,
+        UNREGISTER_AUDIO_THREAD,
+        GET_DESCRIPTION,
+        EXIT_STANDBY,
+        START_CLIENT,
+        STOP_CLIENT,
+    };
+    AAudioThread            mCommandThread;
+    std::atomic_bool        mThreadEnabled{false};
+    AAudioCommandQueue      mCommandQueue;
 
     int32_t                 mFramesPerBurst = 0;
     android::AudioClient    mMmapClient; // set in open, used in MMAP start()
@@ -323,26 +442,36 @@ private:
     aaudio_result_t sendServiceEvent(aaudio_service_event_t event,
                                      double dataDouble);
 
+    aaudio_result_t sendCommand(aaudio_command_opcode opCode,
+                                std::shared_ptr<AAudioCommandParam> param = nullptr,
+                                bool waitForReply = false,
+                                int64_t timeoutNanos = 0);
+
+    void stopCommandThread();
+
+    aaudio_result_t closeAndClear();
+
     /**
      * @return true if the queue is getting full.
      */
-    bool isUpMessageQueueBusy();
+    bool isUpMessageQueueBusy() EXCLUDES(mUpMessageQueueLock);
 
     aaudio_handle_t         mHandle = -1;
     bool                    mFlowing = false;
 
-    // This is modified under a global lock in AAudioStreamTracker.
-    int32_t                 mCallingCount = 0;
-
-    // This indicates that a stream that is being referenced by a binder call needs to closed.
-    std::atomic<bool>       mCloseNeeded{false};
-
     // This indicate that a running stream should not be processed because of an error,
-    // for example a full message queue. Note that this atomic is unrelated to mCloseNeeded.
+    // for example a full message queue.
     std::atomic<bool>       mSuspended{false};
 
+    bool                    mDisconnected GUARDED_BY(mLock) {false};
+
+    bool                    mStandby GUARDED_BY(mLock) = false;
+
+protected:
     // Locking order is important.
-    // Always acquire mLock before acquiring AAudioServiceEndpoint::mLockStreams
+    // Acquire mLock before acquiring AAudioServiceEndpoint::mLockStreams
+    // The lock will be held by the command thread. All operations needing the lock must run from
+    // the command thread.
     std::mutex              mLock; // Prevent start/stop/close etcetera from colliding
 };
 

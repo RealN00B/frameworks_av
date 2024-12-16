@@ -44,3 +44,31 @@ cc_library_shared {
 
     header_libs: ["libaudioeffects"],
 }
+
+cc_library_shared {
+    name: "libloudnessenhanceraidl",
+    srcs: [
+        ":effectCommonFile",
+        "aidl/EffectLoudnessEnhancer.cpp",
+        "aidl/LoudnessEnhancerContext.cpp",
+        "dsp/core/dynamic_range_compression.cpp",
+    ],
+    defaults: [
+        "aidlaudioeffectservice_defaults",
+    ],
+    header_libs: [
+        "libaudioeffects",
+        "libhardware_headers",
+    ],
+    cflags: [
+        "-Wthread-safety",
+    ],
+    shared_libs: [
+        "libcutils",
+        "liblog",
+    ],
+    relative_install_path: "soundfx",
+    visibility: [
+        "//hardware/interfaces/audio/aidl/default:__subpackages__",
+    ],
+}

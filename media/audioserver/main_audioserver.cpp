@@ -17,11 +17,17 @@
 #define LOG_TAG "audioserver"
 //#define LOG_NDEBUG 0
 
+#include <algorithm>
+
 #include <fcntl.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <cutils/properties.h>
 
+#include <android/media/audio/common/AudioMMapPolicy.h>
+#include <android/media/audio/common/AudioMMapPolicyInfo.h>
+#include <android/media/audio/common/AudioMMapPolicyType.h>
+#include <android/media/IAudioFlingerService.h>
 #include <binder/IPCThreadState.h>
 #include <binder/ProcessState.h>
 #include <binder/IServiceManager.h>
@@ -29,8 +35,7 @@
 #include <mediautils/LimitProcessMemory.h>
 #include <utils/Log.h>
 
-// from LOCAL_C_INCLUDES
-#include "aaudio/AAudioTesting.h"
+// from include_dirs
 #include "AudioFlinger.h"
 #include "AudioPolicyService.h"
 #include "AAudioService.h"
@@ -39,8 +44,14 @@
 
 using namespace android;
 
+using android::media::audio::common::AudioMMapPolicy;
+using android::media::audio::common::AudioMMapPolicyInfo;
+using android::media::audio::common::AudioMMapPolicyType;
+
 int main(int argc __unused, char **argv)
 {
+    ALOGD("%s: starting", __func__);
+    const auto startTime = std::chrono::steady_clock::now();
     // TODO: update with refined parameters
     limitProcessMemory(
         "audio.maxmem", /* "ro.audio.maxmem", property that defines limit */
@@ -73,10 +84,8 @@ int main(int argc __unused, char **argv)
         IPCThreadState::self()->joinThreadPool();
         for (;;) {
             siginfo_t info;
-            int ret = waitid(P_PID, childPid, &info, WEXITED | WSTOPPED | WCONTINUED);
-            if (ret == EINTR) {
-                continue;
-            }
+            int ret = TEMP_FAILURE_RETRY(waitid(P_PID, childPid, &info,
+                                                WEXITED | WSTOPPED | WCONTINUED));
             if (ret < 0) {
                 break;
             }
@@ -137,22 +146,69 @@ int main(int argc __unused, char **argv)
             setpgid(0, 0);                      // but if I die first, don't kill my parent
         }
         android::hardware::configureRpcThreadpool(4, false /*callerWillJoin*/);
-        sp<ProcessState> proc(ProcessState::self());
+
+        // Ensure threads for possible callbacks.  Note that get_audio_flinger() does
+        // this automatically when called from AudioPolicy, but we do this anyways here.
+        ProcessState::self()->startThreadPool();
+
+        // Instantiating AudioFlinger (making it public, e.g. through ::initialize())
+        // and then instantiating AudioPolicy (and making it public)
+        // leads to situations where AudioFlinger is accessed remotely before
+        // AudioPolicy is initialized.  Not only might this
+        // cause inaccurate results, but if AudioPolicy has slow audio HAL
+        // initialization, it can cause a TimeCheck abort to occur on an AudioFlinger
+        // call which tries to access AudioPolicy.
+        //
+        // We create AudioFlinger and AudioPolicy locally then make it public to ServiceManager.
+        // This requires both AudioFlinger and AudioPolicy to be in-proc.
+        //
+        const auto af = sp<AudioFlinger>::make();
+        const auto afAdapter = sp<AudioFlingerServerAdapter>::make(af);
+        ALOGD("%s: AudioFlinger created", __func__);
+        ALOGW_IF(AudioSystem::setLocalAudioFlinger(af) != OK,
+                "%s: AudioSystem already has an AudioFlinger instance!", __func__);
+        const auto aps = sp<AudioPolicyService>::make();
+        af->initAudioPolicyLocal(aps);
+        ALOGD("%s: AudioPolicy created", __func__);
+        ALOGW_IF(AudioSystem::setLocalAudioPolicyService(aps) != OK,
+                 "%s: AudioSystem already has an AudioPolicyService instance!", __func__);
+
+        // Start initialization of internally managed audio objects such as Device Effects.
+        aps->onAudioSystemReady();
+
+        // Add AudioFlinger and AudioPolicy to ServiceManager.
         sp<IServiceManager> sm = defaultServiceManager();
-        ALOGI("ServiceManager: %p", sm.get());
-        AudioFlinger::instantiate();
-        AudioPolicyService::instantiate();
+        sm->addService(String16(IAudioFlinger::DEFAULT_SERVICE_NAME), afAdapter,
+                false /* allowIsolated */, IServiceManager::DUMP_FLAG_PRIORITY_DEFAULT);
+        sm->addService(String16(AudioPolicyService::getServiceName()), aps,
+                false /* allowIsolated */, IServiceManager::DUMP_FLAG_PRIORITY_DEFAULT);
 
         // AAudioService should only be used in OC-MR1 and later.
         // And only enable the AAudioService if the system MMAP policy explicitly allows it.
         // This prevents a client from misusing AAudioService when it is not supported.
-        aaudio_policy_t mmapPolicy = property_get_int32(AAUDIO_PROP_MMAP_POLICY,
-                                                        AAUDIO_POLICY_NEVER);
-        if (mmapPolicy == AAUDIO_POLICY_AUTO || mmapPolicy == AAUDIO_POLICY_ALWAYS) {
+        // If we cannot get audio flinger here, there must be some serious problems. In that case,
+        // attempting to call audio flinger on a null pointer could make the process crash
+        // and attract attentions.
+        std::vector<AudioMMapPolicyInfo> policyInfos;
+        status_t status = sp<IAudioFlinger>::cast(af)->getMmapPolicyInfos(
+                AudioMMapPolicyType::DEFAULT, &policyInfos);
+        // Initialize aaudio service when querying mmap policy succeeds and
+        // any of the policy supports MMAP.
+        if (status == NO_ERROR &&
+            std::any_of(policyInfos.begin(), policyInfos.end(), [](const auto& info) {
+                    return info.mmapPolicy == AudioMMapPolicy::AUTO ||
+                           info.mmapPolicy == AudioMMapPolicy::ALWAYS;
+            })) {
             AAudioService::instantiate();
+        } else {
+            ALOGD("%s: Do not init aaudio service, status %d, policy info size %zu",
+                  __func__, status, policyInfos.size());
         }
-
-        ProcessState::self()->startThreadPool();
+        const auto endTime = std::chrono::steady_clock::now();
+        using FloatMillis = std::chrono::duration<float, std::milli>;
+        const float timeTaken = std::chrono::duration_cast<FloatMillis>(
+                endTime - startTime).count();
+        ALOGI("%s: initialization done in %.3f ms, joining thread pool", __func__, timeTaken);
         IPCThreadState::self()->joinThreadPool();
     }
 }

@@ -20,6 +20,7 @@
 #include "PolicyAudioPort.h"
 #include "HwModule.h"
 #include <policy.h>
+#include <system/audio.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -63,21 +64,11 @@ const char *PolicyAudioPort::getModuleName() const
 
 status_t PolicyAudioPort::checkExactAudioProfile(const struct audio_port_config *config) const
 {
-    status_t status = NO_ERROR;
-    auto config_mask = config->config_mask;
-    if (config_mask & AUDIO_PORT_CONFIG_GAIN) {
-        config_mask &= ~AUDIO_PORT_CONFIG_GAIN;
-        status = asAudioPort()->checkGain(&config->gain, config->gain.index);
-        if (status != NO_ERROR) {
-            return status;
-        }
-    }
-    if (config_mask != 0) {
-        // TODO should we check sample_rate / channel_mask / format separately?
-        status = checkExactProfile(asAudioPort()->getAudioProfiles(), config->sample_rate,
-                config->channel_mask, config->format);
-    }
-    return status;
+    return checkAudioProfile(config, checkExactProfile);
+}
+
+status_t PolicyAudioPort::checkIdenticalAudioProfile(const struct audio_port_config *config) const {
+    return checkAudioProfile(config, checkIdenticalProfile);
 }
 
 void PolicyAudioPort::pickSamplingRate(uint32_t &pickedRate,
@@ -87,7 +78,7 @@ void PolicyAudioPort::pickSamplingRate(uint32_t &pickedRate,
     // For direct outputs, pick minimum sampling rate: this helps ensuring that the
     // channel count / sampling rate combination chosen will be supported by the connected
     // sink
-    if (isDirectOutput()) {
+    if (asAudioPort()->isDirectOutput()) {
         uint32_t samplingRate = UINT_MAX;
         for (const auto rate : samplingRates) {
             if ((rate < samplingRate) && (rate > 0)) {
@@ -122,7 +113,7 @@ void PolicyAudioPort::pickChannelMask(audio_channel_mask_t &pickedChannelMask,
     // For direct outputs, pick minimum channel count: this helps ensuring that the
     // channel count / sampling rate combination chosen will be supported by the connected
     // sink
-    if (isDirectOutput()) {
+    if (asAudioPort()->isDirectOutput()) {
         uint32_t channelCount = UINT_MAX;
         for (const auto channelMask : channelMasks) {
             uint32_t cnlCount;
@@ -236,7 +227,7 @@ void PolicyAudioPort::pickAudioProfile(uint32_t &samplingRate,
     audio_format_t bestFormat = sPcmFormatCompareTable[ARRAY_SIZE(sPcmFormatCompareTable) - 1];
     // For mixed output and inputs, use best mixer output format.
     // Do not limit format otherwise
-    if ((asAudioPort()->getType() != AUDIO_PORT_TYPE_MIX) || isDirectOutput()) {
+    if ((asAudioPort()->getType() != AUDIO_PORT_TYPE_MIX) || asAudioPort()->isDirectOutput()) {
         bestFormat = AUDIO_FORMAT_INVALID;
     }
 
@@ -266,29 +257,28 @@ void PolicyAudioPort::pickAudioProfile(uint32_t &samplingRate,
             asAudioPort()->getName().c_str(), samplingRate, channelMask, format);
 }
 
-// --- PolicyAudioPortConfig class implementation
-
-status_t PolicyAudioPortConfig::validationBeforeApplyConfig(
-        const struct audio_port_config *config) const
-{
-    sp<PolicyAudioPort> policyAudioPort = getPolicyAudioPort();
-    return policyAudioPort ? policyAudioPort->checkExactAudioProfile(config) : NO_INIT;
-}
-
-void PolicyAudioPortConfig::toPolicyAudioPortConfig(struct audio_port_config *dstConfig,
-                                                    const struct audio_port_config *srcConfig) const
-{
-    if (dstConfig->config_mask & AUDIO_PORT_CONFIG_FLAGS) {
-        if ((srcConfig != nullptr) && (srcConfig->config_mask & AUDIO_PORT_CONFIG_FLAGS)) {
-            dstConfig->flags = srcConfig->flags;
-        } else {
-            dstConfig->flags = mFlags;
+status_t PolicyAudioPort::checkAudioProfile(
+        const struct audio_port_config *config,
+        std::function<status_t(const AudioProfileVector &,
+                               const uint32_t,
+                               audio_channel_mask_t,
+                               audio_format_t)> checkProfile) const {
+    status_t status = NO_ERROR;
+    auto config_mask = config->config_mask;
+    if (config_mask & AUDIO_PORT_CONFIG_GAIN) {
+        config_mask &= ~AUDIO_PORT_CONFIG_GAIN;
+        status = asAudioPort()->checkGain(&config->gain, config->gain.index);
+        if (status != NO_ERROR) {
+            return status;
         }
-    } else {
-        dstConfig->flags = { AUDIO_INPUT_FLAG_NONE };
     }
+    if (config_mask != 0) {
+        // TODO should we check sample_rate / channel_mask / format separately?
+        status = checkProfile(asAudioPort()->getAudioProfiles(), config->sample_rate,
+                   config->channel_mask, config->format);
+    }
+    return status;
+
 }
-
-
 
 } // namespace android

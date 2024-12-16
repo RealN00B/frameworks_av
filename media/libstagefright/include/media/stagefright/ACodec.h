@@ -17,20 +17,24 @@
 #ifndef A_CODEC_H_
 #define A_CODEC_H_
 
+#include <set>
 #include <stdint.h>
+#include <deque>
+#include <vector>
 #include <android/native_window.h>
 #include <media/hardware/MetadataBufferType.h>
 #include <media/MediaCodecInfo.h>
 #include <media/IOMX.h>
 #include <media/stagefright/AHierarchicalStateMachine.h>
 #include <media/stagefright/CodecBase.h>
-#include <media/stagefright/FrameRenderTracker.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/SkipCutBuffer.h>
+#include <ui/GraphicBuffer.h>
 #include <utils/NativeHandle.h>
 #include <OMX_Audio.h>
 #include <hardware/gralloc.h>
 #include <nativebase/nativebase.h>
+#include <android/hardware/graphics/common/1.2/types.h>
 #include <android/hidl/allocator/1.0/IAllocator.h>
 #include <android/hidl/memory/1.0/IMemory.h>
 
@@ -54,6 +58,7 @@ class MemoryDealer;
 struct DescribeColorFormat2Params;
 struct DataConverter;
 
+using android::hardware::graphics::common::V1_2::BufferUsage;
 typedef hidl::allocator::V1_0::IAllocator TAllocator;
 typedef hidl::memory::V1_0::IMemory TMemory;
 
@@ -69,13 +74,16 @@ struct ACodec : public AHierarchicalStateMachine, public CodecBase {
     virtual void initiateSetInputSurface(const sp<PersistentSurface> &surface);
     virtual void initiateStart();
     virtual void initiateShutdown(bool keepComponentAllocated = false);
+    virtual status_t querySupportedParameters(std::vector<std::string> *names) override;
+    virtual status_t subscribeToParameters(const std::vector<std::string> &names) override;
+    virtual status_t unsubscribeFromParameters(const std::vector<std::string> &names) override;
 
     status_t queryCapabilities(
             const char* owner, const char* name,
             const char* mime, bool isEncoder,
             MediaCodecInfo::CapabilitiesWriter* caps);
 
-    virtual status_t setSurface(const sp<Surface> &surface);
+    virtual status_t setSurface(const sp<Surface> &surface, uint32_t /*generation*/);
 
     virtual void signalFlush();
     virtual void signalResume();
@@ -148,6 +156,7 @@ private:
         kWhatForceStateTransition    = 'fstt',
         kWhatCheckIfStuck            = 'Cstk',
         kWhatSubmitExtraOutputMetadataBuffer = 'sbxo',
+        kWhatPollForRenderedBuffers  = 'pfrb',
     };
 
     enum {
@@ -165,7 +174,15 @@ private:
     enum {
         kVideoGrallocUsage = (GRALLOC_USAGE_HW_TEXTURE
                             | GRALLOC_USAGE_HW_COMPOSER
-                            | GRALLOC_USAGE_EXTERNAL_DISP),
+                            | GRALLOC_USAGE_EXTERNAL_DISP)
+                            | static_cast<uint64_t>(BufferUsage::VIDEO_DECODER),
+    };
+
+    struct TrackedFrame {
+        int64_t id;
+        int64_t mediaTimeUs;
+        int64_t desiredRenderTimeNs;
+        nsecs_t renderTimeNs;
     };
 
     struct BufferInfo {
@@ -195,7 +212,6 @@ private:
         sp<GraphicBuffer> mGraphicBuffer;
         bool mNewGraphicBuffer;
         int mFenceFd;
-        FrameRenderTracker::Info *mRenderInfo;
 
         // The following field and 4 methods are used for debugging only
         bool mIsReadFence;
@@ -242,6 +258,11 @@ private:
     int32_t mNodeGeneration;
     sp<TAllocator> mAllocator[2];
 
+    std::deque<TrackedFrame> mTrackedFrames; // render information for buffers sent to a window
+    bool mAreRenderMetricsEnabled;
+    bool mIsWindowToDisplay;
+    bool mHasPresentFenceTimes;
+
     bool mUsingNativeWindow;
     sp<ANativeWindow> mNativeWindow;
     int mNativeWindowUsageBits;
@@ -258,12 +279,12 @@ private:
     // format updates. This will equal to mOutputFormat until the first actual frame is received.
     sp<AMessage> mBaseOutputFormat;
 
-    FrameRenderTracker mRenderTracker; // render information for buffers rendered by ACodec
-    Vector<BufferInfo> mBuffers[2];
+    std::vector<BufferInfo> mBuffers[2];
     bool mPortEOS[2];
     status_t mInputEOSResult;
+    std::set<int64_t> mDecodeOnlyTimesUs;
 
-    List<sp<AMessage> > mDeferredQueue;
+    std::list<sp<AMessage>> mDeferredQueue;
 
     sp<AMessage> mLastOutputFormat;
     bool mIsVideo;
@@ -338,6 +359,10 @@ private:
     status_t cancelBufferToNativeWindow(BufferInfo *info);
     status_t freeOutputBuffersNotOwnedByComponent();
     BufferInfo *dequeueBufferFromNativeWindow();
+
+    void initializeFrameTracking();
+    void trackReleasedFrame(int64_t frameId, int64_t mediaTimeUs, int64_t desiredRenderTimeNs);
+    void pollForRenderedFrames();
 
     inline bool storingMetadataInDecodedBuffers() {
         return (mPortMode[kPortIndexOutput] == IOMX::kPortModeDynamicANWBuffer) && !mIsEncoder;
@@ -515,6 +540,8 @@ private:
     status_t setLowLatency(int32_t lowLatency);
     status_t setLatency(uint32_t latency);
     status_t getLatency(uint32_t *latency);
+    status_t setTunnelPeek(int32_t tunnelPeek);
+    status_t setTunnelPeekLegacy(int32_t isLegacy);
     status_t setAudioPresentation(int32_t presentationId, int32_t programId);
     status_t setOperatingRate(float rateFloat, bool isVideo);
     status_t getIntraRefreshPeriod(uint32_t *intraRefreshPeriod);
@@ -559,21 +586,8 @@ private:
     void processDeferredMessages();
 
     void onFrameRendered(int64_t mediaTimeUs, nsecs_t systemNano);
-    // called when we have dequeued a buffer |buf| from the native window to track render info.
-    // |fenceFd| is the dequeue fence, and |info| points to the buffer info where this buffer is
-    // stored.
-    void updateRenderInfoForDequeuedBuffer(
-            ANativeWindowBuffer *buf, int fenceFd, BufferInfo *info);
 
-    // Checks to see if any frames have rendered up until |until|, and to notify client
-    // (MediaCodec) of rendered frames up-until the frame pointed to by |until| or the first
-    // unrendered frame. These frames are removed from the render queue.
-    // If |dropIncomplete| is true, unrendered frames up-until |until| will be dropped from the
-    // queue, allowing all rendered framed up till then to be notified of.
-    // (This will effectively clear the render queue up-until (and including) |until|.)
-    // If |until| is NULL, or is not in the rendered queue, this method will check all frames.
-    void notifyOfRenderedFrames(
-            bool dropIncomplete = false, FrameRenderTracker::Info *until = NULL);
+    void onFirstTunnelFrameReady();
 
     // Pass |expectedFormat| to print a warning if the format differs from it.
     // Using sp<> instead of const sp<>& because expectedFormat is likely the current mOutputFormat
@@ -589,6 +603,7 @@ private:
             status_t internalError = UNKNOWN_ERROR);
 
     status_t requestIDRFrame();
+    status_t setSurfaceParameters(const sp<AMessage> &params);
     status_t setParameters(const sp<AMessage> &params);
 
     // set vendor extension parameters specified in params that are supported by the codec

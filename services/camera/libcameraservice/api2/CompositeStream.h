@@ -23,7 +23,7 @@
 #include <android/hardware/camera2/ICameraDeviceCallbacks.h>
 #include <camera/CameraMetadata.h>
 #include <camera/camera2/OutputConfiguration.h>
-#include <gui/IProducerListener.h>
+#include <gui/Surface.h>
 #include "common/CameraDeviceBase.h"
 #include "device3/Camera3StreamInterface.h"
 
@@ -43,8 +43,11 @@ public:
 
     status_t createStream(const std::vector<sp<Surface>>& consumers,
             bool hasDeferredConsumer, uint32_t width, uint32_t height, int format,
-            camera3_stream_rotation_t rotation, int *id, const String8& physicalCameraId,
-            std::vector<int> *surfaceIds, int streamSetId, bool isShared);
+            camera_stream_rotation_t rotation, int *id, const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed,
+            std::vector<int> *surfaceIds,
+            int streamSetId, bool isShared, bool isMultiResolution, int32_t colorSpace,
+            int64_t dynamicProfile, int64_t streamUseCase, bool useReadoutTimestamp);
 
     status_t deleteStream();
 
@@ -54,8 +57,11 @@ public:
     // Create and register all internal camera streams.
     virtual status_t createInternalStreams(const std::vector<sp<Surface>>& consumers,
             bool hasDeferredConsumer, uint32_t width, uint32_t height, int format,
-            camera3_stream_rotation_t rotation, int *id, const String8& physicalCameraId,
-            std::vector<int> *surfaceIds, int streamSetId, bool isShared) = 0;
+            camera_stream_rotation_t rotation, int *id, const std::string& physicalCameraId,
+            const std::unordered_set<int32_t> &sensorPixelModesUsed,
+            std::vector<int> *surfaceIds,
+            int streamSetId, bool isShared, int32_t colorSpace,
+            int64_t dynamicProfile, int64_t streamUseCase, bool useReadoutTimestamp) = 0;
 
     // Release all internal streams and corresponding resources.
     virtual status_t deleteInternalStreams() = 0;
@@ -77,6 +83,9 @@ public:
     // Notify when shutter notify is triggered
     virtual void onShutter(const CaptureResultExtras& /*resultExtras*/, nsecs_t /*timestamp*/) {}
 
+    // Get composite stream stats
+    virtual void getStreamStats(hardware::CameraStreamStats* streamStats /*out*/) = 0;
+
     void onResultAvailable(const CaptureResult& result);
     bool onError(int32_t errorCode, const CaptureResultExtras& resultExtras);
 
@@ -87,9 +96,12 @@ public:
             const CameraMetadata& settings) override;
 
 protected:
-    struct ProducerListener : public BnProducerListener {
-        // ProducerListener impementation
+    struct StreamSurfaceListener : public SurfaceListener {
+        // StreamSurfaceListener implementation
         void onBufferReleased() override { /*No impl. for now*/ };
+        bool needsReleaseNotify() override { return true; };
+        void onBuffersDiscarded(const std::vector<sp<GraphicBuffer>>& /*buffers*/) override {};
+        void onBufferDetached(int /*slot*/) override {};
     };
 
     status_t registerCompositeStreamListener(int32_t streamId);
@@ -133,6 +145,9 @@ protected:
 
     // Keeps a set buffer/result frame numbers for any errors detected during processing.
     std::set<int64_t> mErrorFrameNumbers;
+
+    // Frame number to request time map
+    std::unordered_map<int64_t, nsecs_t> mRequestTimeMap;
 
 };
 

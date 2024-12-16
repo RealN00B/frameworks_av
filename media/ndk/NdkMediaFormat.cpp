@@ -142,43 +142,85 @@ const char* AMediaFormat_toString(AMediaFormat *mData) {
     }
     ret.append("}");
     mData->mDebug = ret;
-    return mData->mDebug.string();
+    return mData->mDebug.c_str();
 }
 
 EXPORT
 bool AMediaFormat_getInt32(AMediaFormat* format, const char *name, int32_t *out) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findInt32(name, out);
 }
 
 EXPORT
 bool AMediaFormat_getInt64(AMediaFormat* format, const char *name, int64_t *out) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findInt64(name, out);
 }
 
 EXPORT
 bool AMediaFormat_getFloat(AMediaFormat* format, const char *name, float *out) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findFloat(name, out);
 }
 
 EXPORT
 bool AMediaFormat_getDouble(AMediaFormat* format, const char *name, double *out) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findDouble(name, out);
 }
 
 EXPORT
 bool AMediaFormat_getSize(AMediaFormat* format, const char *name, size_t *out) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findSize(name, out);
 }
 
 EXPORT
 bool AMediaFormat_getRect(AMediaFormat* format, const char *name,
                           int32_t *left, int32_t *top, int32_t *right, int32_t *bottom) {
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     return format->mFormat->findRect(name, left, top, right, bottom);
 }
 
 EXPORT
 bool AMediaFormat_getBuffer(AMediaFormat* format, const char *name, void** data, size_t *outsize) {
     sp<ABuffer> buf;
+    if (format == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     if (format->mFormat->findBuffer(name, &buf)) {
         *data = buf->data() + buf->offset();
         *outsize = buf->size();
@@ -189,9 +231,14 @@ bool AMediaFormat_getBuffer(AMediaFormat* format, const char *name, void** data,
 
 EXPORT
 bool AMediaFormat_getString(AMediaFormat* mData, const char *name, const char **out) {
-
+    if (mData == nullptr) {
+        return false;
+    }
+    if (name == nullptr) {
+        return false;
+    }
     for (size_t i = 0; i < mData->mStringCache.size(); i++) {
-        if (strcmp(mData->mStringCache.keyAt(i).string(), name) == 0) {
+        if (strcmp(mData->mStringCache.keyAt(i).c_str(), name) == 0) {
             mData->mStringCache.removeItemsAt(i, 1);
             break;
         }
@@ -200,8 +247,11 @@ bool AMediaFormat_getString(AMediaFormat* mData, const char *name, const char **
     AString tmp;
     if (mData->mFormat->findString(name, &tmp)) {
         String8 ret(tmp.c_str());
-        mData->mStringCache.add(String8(name), ret);
-        *out = ret.string();
+        ssize_t i = mData->mStringCache.add(String8(name), ret);
+        if (i < 0) {
+            return false;
+        }
+        *out = mData->mStringCache.valueAt(i).c_str();
         return true;
     }
     return false;
@@ -209,43 +259,94 @@ bool AMediaFormat_getString(AMediaFormat* mData, const char *name, const char **
 
 EXPORT
 void AMediaFormat_setInt32(AMediaFormat* format, const char *name, int32_t value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setInt32(name, value);
 }
 
 EXPORT
 void AMediaFormat_setInt64(AMediaFormat* format, const char *name, int64_t value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setInt64(name, value);
 }
 
 EXPORT
 void AMediaFormat_setFloat(AMediaFormat* format, const char* name, float value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setFloat(name, value);
 }
 
 EXPORT
 void AMediaFormat_setDouble(AMediaFormat* format, const char* name, double value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setDouble(name, value);
 }
 
 EXPORT
 void AMediaFormat_setSize(AMediaFormat* format, const char* name, size_t value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setSize(name, value);
 }
 
 EXPORT
 void AMediaFormat_setRect(AMediaFormat* format, const char *name,
                           int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     format->mFormat->setRect(name, left, top, right, bottom);
 }
 
 EXPORT
 void AMediaFormat_setString(AMediaFormat* format, const char* name, const char* value) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
+    if (value == nullptr) {
+        return;
+    }
     // AMessage::setString() makes a copy of the string
     format->mFormat->setString(name, value, strlen(value));
 }
 
 EXPORT
 void AMediaFormat_setBuffer(AMediaFormat* format, const char* name, const void* data, size_t size) {
+    if (format == nullptr) {
+        return;
+    }
+    if (name == nullptr) {
+        return;
+    }
     // the ABuffer(void*, size_t) constructor doesn't take ownership of the data, so create
     // a new buffer and copy the data into it
     sp<ABuffer> buf = new ABuffer(size);
@@ -267,6 +368,7 @@ EXPORT const char* AMEDIAFORMAT_KEY_AAC_SBR_MODE = "aac-sbr-mode";
 EXPORT const char* AMEDIAFORMAT_KEY_ALBUM = "album";
 EXPORT const char* AMEDIAFORMAT_KEY_ALBUMART = "albumart";
 EXPORT const char* AMEDIAFORMAT_KEY_ALBUMARTIST = "albumartist";
+EXPORT const char* AMEDIAFORMAT_KEY_ALLOW_FRAME_DROP = "allow-frame-drop";
 EXPORT const char* AMEDIAFORMAT_KEY_ARTIST = "artist";
 EXPORT const char* AMEDIAFORMAT_KEY_AUDIO_PRESENTATION_INFO = "audio-presentation-info";
 EXPORT const char* AMEDIAFORMAT_KEY_AUDIO_PRESENTATION_PRESENTATION_ID =
@@ -326,6 +428,7 @@ EXPORT const char* AMEDIAFORMAT_KEY_HDR_STATIC_INFO = "hdr-static-info";
 EXPORT const char* AMEDIAFORMAT_KEY_HDR10_PLUS_INFO = "hdr10-plus-info";
 EXPORT const char* AMEDIAFORMAT_KEY_HEIGHT = "height";
 EXPORT const char* AMEDIAFORMAT_KEY_ICC_PROFILE = "icc-profile";
+EXPORT const char* AMEDIAFORMAT_KEY_IMPORTANCE = "importance";
 EXPORT const char* AMEDIAFORMAT_KEY_INTRA_REFRESH_PERIOD = "intra-refresh-period";
 EXPORT const char* AMEDIAFORMAT_KEY_IS_ADTS = "is-adts";
 EXPORT const char* AMEDIAFORMAT_KEY_IS_AUTOSELECT = "is-autoselect";
@@ -334,6 +437,7 @@ EXPORT const char* AMEDIAFORMAT_KEY_IS_FORCED_SUBTITLE = "is-forced-subtitle";
 EXPORT const char* AMEDIAFORMAT_KEY_IS_SYNC_FRAME = "is-sync-frame";
 EXPORT const char* AMEDIAFORMAT_KEY_I_FRAME_INTERVAL = "i-frame-interval";
 EXPORT const char* AMEDIAFORMAT_KEY_LANGUAGE = "language";
+EXPORT const char* AMEDIAFORMAT_KEY_LAST_SAMPLE_INDEX_IN_CHUNK = "last-sample-index-in-chunk";
 EXPORT const char* AMEDIAFORMAT_KEY_LATENCY = "latency";
 EXPORT const char* AMEDIAFORMAT_KEY_LEVEL = "level";
 EXPORT const char* AMEDIAFORMAT_KEY_LOCATION = "location";
@@ -342,16 +446,27 @@ EXPORT const char* AMEDIAFORMAT_KEY_LOW_LATENCY = "low-latency";
 EXPORT const char* AMEDIAFORMAT_KEY_LYRICIST = "lyricist";
 EXPORT const char* AMEDIAFORMAT_KEY_MANUFACTURER = "manufacturer";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_BIT_RATE = "max-bitrate";
+EXPORT const char* AMEDIAFORMAT_KEY_MAX_B_FRAMES = "max-bframes";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_FPS_TO_ENCODER = "max-fps-to-encoder";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_HEIGHT = "max-height";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_INPUT_SIZE = "max-input-size";
+EXPORT const char* AMEDIAFORMAT_KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE =
+        "buffer-batch-max-output-size";
+EXPORT const char* AMEDIAFORMAT_KEY_BUFFER_BATCH_THRESHOLD_OUTPUT_SIZE =
+        "buffer-batch-threshold-output-size";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_PTS_GAP_TO_ENCODER = "max-pts-gap-to-encoder";
 EXPORT const char* AMEDIAFORMAT_KEY_MAX_WIDTH = "max-width";
 EXPORT const char* AMEDIAFORMAT_KEY_MIME = "mime";
 EXPORT const char* AMEDIAFORMAT_KEY_MPEG_USER_DATA = "mpeg-user-data";
 EXPORT const char* AMEDIAFORMAT_KEY_MPEG2_STREAM_HEADER = "mpeg2-stream-header";
+EXPORT const char* AMEDIAFORMAT_KEY_MPEGH_COMPATIBLE_SETS = "mpegh-compatible-sets";
+EXPORT const char* AMEDIAFORMAT_KEY_MPEGH_PROFILE_LEVEL_INDICATION =
+        "mpegh-profile-level-indication";
+EXPORT const char* AMEDIAFORMAT_KEY_MPEGH_REFERENCE_CHANNEL_LAYOUT =
+        "mpegh-reference-channel-layout";
 EXPORT const char* AMEDIAFORMAT_KEY_OPERATING_RATE = "operating-rate";
 EXPORT const char* AMEDIAFORMAT_KEY_PCM_ENCODING = "pcm-encoding";
+EXPORT const char* AMEDIAFORMAT_KEY_PICTURE_TYPE = "picture-type";
 EXPORT const char* AMEDIAFORMAT_KEY_PRIORITY = "priority";
 EXPORT const char* AMEDIAFORMAT_KEY_PROFILE = "profile";
 EXPORT const char* AMEDIAFORMAT_KEY_PCM_BIG_ENDIAN = "pcm-big-endian";
@@ -359,17 +474,21 @@ EXPORT const char* AMEDIAFORMAT_KEY_PSSH = "pssh";
 EXPORT const char* AMEDIAFORMAT_KEY_PUSH_BLANK_BUFFERS_ON_STOP = "push-blank-buffers-on-shutdown";
 EXPORT const char* AMEDIAFORMAT_KEY_REPEAT_PREVIOUS_FRAME_AFTER = "repeat-previous-frame-after";
 EXPORT const char* AMEDIAFORMAT_KEY_ROTATION = "rotation-degrees";
+EXPORT const char* AMEDIAFORMAT_KEY_SAMPLE_FILE_OFFSET = "sample-file-offset";
 EXPORT const char* AMEDIAFORMAT_KEY_SAMPLE_RATE = "sample-rate";
+EXPORT const char* AMEDIAFORMAT_KEY_SAMPLE_TIME_BEFORE_APPEND = "sample-time-before-append";
 EXPORT const char* AMEDIAFORMAT_KEY_SAR_HEIGHT = "sar-height";
 EXPORT const char* AMEDIAFORMAT_KEY_SAR_WIDTH = "sar-width";
 EXPORT const char* AMEDIAFORMAT_KEY_SEI = "sei";
 EXPORT const char* AMEDIAFORMAT_KEY_SLICE_HEIGHT = "slice-height";
+EXPORT const char* AMEDIAFORMAT_KEY_SLOW_MOTION_MARKERS = "slow-motion-markers";
 EXPORT const char* AMEDIAFORMAT_KEY_STRIDE = "stride";
 EXPORT const char* AMEDIAFORMAT_KEY_TARGET_TIME = "target-time";
 EXPORT const char* AMEDIAFORMAT_KEY_TEMPORAL_LAYER_COUNT = "temporal-layer-count";
 EXPORT const char* AMEDIAFORMAT_KEY_TEMPORAL_LAYER_ID = "temporal-layer-id";
 EXPORT const char* AMEDIAFORMAT_KEY_TEMPORAL_LAYERING = "ts-schema";
 EXPORT const char* AMEDIAFORMAT_KEY_TEXT_FORMAT_DATA = "text-format-data";
+EXPORT const char* AMEDIAFORMAT_KEY_THUMBNAIL_CSD_AV1C = "thumbnail-csd-av1c";
 EXPORT const char* AMEDIAFORMAT_KEY_THUMBNAIL_CSD_HEVC = "thumbnail-csd-hevc";
 EXPORT const char* AMEDIAFORMAT_KEY_THUMBNAIL_HEIGHT = "thumbnail-height";
 EXPORT const char* AMEDIAFORMAT_KEY_THUMBNAIL_TIME = "thumbnail-time";
@@ -381,7 +500,20 @@ EXPORT const char* AMEDIAFORMAT_KEY_TITLE = "title";
 EXPORT const char* AMEDIAFORMAT_KEY_TRACK_ID = "track-id";
 EXPORT const char* AMEDIAFORMAT_KEY_TRACK_INDEX = "track-index";
 EXPORT const char* AMEDIAFORMAT_KEY_VALID_SAMPLES = "valid-samples";
+EXPORT const char* AMEDIAFORMAT_KEY_VIDEO_ENCODING_STATISTICS_LEVEL =
+        "video-encoding-statistics-level";
+EXPORT const char* AMEDIAFORMAT_KEY_VIDEO_QP_AVERAGE = "video-qp-average";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_B_MAX = "video-qp-b-max";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_B_MIN = "video-qp-b-min";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_I_MAX = "video-qp-i-max";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_I_MIN = "video-qp-i-min";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_MAX = "video-qp-max";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_MIN = "video-qp-min";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_P_MAX = "video-qp-p-max";
+EXPORT const char* AMEDIAFORMAT_VIDEO_QP_P_MIN = "video-qp-p-min";
 EXPORT const char* AMEDIAFORMAT_KEY_WIDTH = "width";
+EXPORT const char* AMEDIAFORMAT_KEY_XMP_OFFSET = "xmp-offset";
+EXPORT const char* AMEDIAFORMAT_KEY_XMP_SIZE = "xmp-size";
 EXPORT const char* AMEDIAFORMAT_KEY_YEAR = "year";
 
 } // extern "C"

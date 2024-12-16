@@ -108,17 +108,16 @@ bool AudioMixer::setChannelMasks(int name,
 
     if (track->mHapticChannelCount > 0) {
         track->mAdjustInChannelCount = track->channelCount + track->mHapticChannelCount;
-        track->mAdjustOutChannelCount = track->channelCount + track->mMixerHapticChannelCount;
-        track->mAdjustNonDestructiveInChannelCount = track->mAdjustOutChannelCount;
-        track->mAdjustNonDestructiveOutChannelCount = track->channelCount;
+        track->mAdjustOutChannelCount = track->channelCount;
         track->mKeepContractedChannels = track->mHapticPlaybackEnabled;
     } else {
         track->mAdjustInChannelCount = 0;
         track->mAdjustOutChannelCount = 0;
-        track->mAdjustNonDestructiveInChannelCount = 0;
-        track->mAdjustNonDestructiveOutChannelCount = 0;
         track->mKeepContractedChannels = false;
     }
+
+    track->mInputFrameSize = audio_bytes_per_frame(
+            track->channelCount + track->mHapticChannelCount, track->mFormat);
 
     // channel masks have changed, does this track need a downmixer?
     // update to try using our desired format (if we aren't already using it)
@@ -131,8 +130,7 @@ bool AudioMixer::setChannelMasks(int name,
     // do it after downmix since track format may change!
     track->prepareForReformat();
 
-    track->prepareForAdjustChannelsNonDestructive(mFrameCount);
-    track->prepareForAdjustChannels();
+    track->prepareForAdjustChannels(mFrameCount);
 
     // Resampler channels may have changed.
     track->recreateResampler(mSampleRate);
@@ -191,6 +189,24 @@ status_t AudioMixer::Track::prepareForDownmix()
             }
         }
         // mDownmixerBufferProvider reset below.
+    }
+
+    // See if we should use our built-in non-effect downmixer.
+    if (mMixerInFormat == AUDIO_FORMAT_PCM_FLOAT
+            && ChannelMixBufferProvider::isOutputChannelMaskSupported(mMixerChannelMask)
+            && audio_channel_mask_get_representation(channelMask)
+                    == AUDIO_CHANNEL_REPRESENTATION_POSITION) {
+        mDownmixerBufferProvider.reset(new ChannelMixBufferProvider(channelMask,
+                mMixerChannelMask, mMixerInFormat, kCopyBufferFrameCount));
+        if (static_cast<ChannelMixBufferProvider *>(mDownmixerBufferProvider.get())
+                ->isValid()) {
+            mDownmixRequiresFormat = mMixerInFormat;
+            reconfigureBufferProviders();
+            ALOGD("%s: Fallback using ChannelMix", __func__);
+            return NO_ERROR;
+        } else {
+            ALOGD("%s: ChannelMix not supported for channel mask %#x", __func__, channelMask);
+        }
     }
 
     // Effect downmixer does not accept the channel conversion.  Let's use our remixer.
@@ -265,48 +281,40 @@ void AudioMixer::Track::unprepareForAdjustChannels()
     }
 }
 
-status_t AudioMixer::Track::prepareForAdjustChannels()
+status_t AudioMixer::Track::prepareForAdjustChannels(size_t frames)
 {
     ALOGV("AudioMixer::prepareForAdjustChannels(%p) with inChannelCount: %u, outChannelCount: %u",
             this, mAdjustInChannelCount, mAdjustOutChannelCount);
     unprepareForAdjustChannels();
     if (mAdjustInChannelCount != mAdjustOutChannelCount) {
+        uint8_t* buffer = mKeepContractedChannels
+                ? (uint8_t*)mainBuffer + frames * audio_bytes_per_frame(
+                        mMixerChannelCount, mMixerFormat)
+                : nullptr;
         mAdjustChannelsBufferProvider.reset(new AdjustChannelsBufferProvider(
-                mFormat, mAdjustInChannelCount, mAdjustOutChannelCount, kCopyBufferFrameCount));
+                mFormat, mAdjustInChannelCount, mAdjustOutChannelCount, frames,
+                mKeepContractedChannels ? mMixerFormat : AUDIO_FORMAT_INVALID,
+                buffer, mMixerHapticChannelCount));
         reconfigureBufferProviders();
     }
     return NO_ERROR;
 }
 
-void AudioMixer::Track::unprepareForAdjustChannelsNonDestructive()
-{
-    ALOGV("AUDIOMIXER::unprepareForAdjustChannelsNonDestructive");
-    if (mContractChannelsNonDestructiveBufferProvider.get() != nullptr) {
-        mContractChannelsNonDestructiveBufferProvider.reset(nullptr);
+void AudioMixer::Track::unprepareForTee() {
+    ALOGV("AudioMixer::%s", __func__);
+    if (mTeeBufferProvider.get() != nullptr) {
+        mTeeBufferProvider.reset(nullptr);
         reconfigureBufferProviders();
     }
 }
 
-status_t AudioMixer::Track::prepareForAdjustChannelsNonDestructive(size_t frames)
-{
-    ALOGV("AudioMixer::prepareForAdjustChannelsNonDestructive(%p) with inChannelCount: %u, "
-          "outChannelCount: %u, keepContractedChannels: %d",
-            this, mAdjustNonDestructiveInChannelCount, mAdjustNonDestructiveOutChannelCount,
-            mKeepContractedChannels);
-    unprepareForAdjustChannelsNonDestructive();
-    if (mAdjustNonDestructiveInChannelCount != mAdjustNonDestructiveOutChannelCount) {
-        uint8_t* buffer = mKeepContractedChannels
-                ? (uint8_t*)mainBuffer + frames * audio_bytes_per_frame(
-                        mMixerChannelCount, mMixerFormat)
-                : NULL;
-        mContractChannelsNonDestructiveBufferProvider.reset(
-                new AdjustChannelsBufferProvider(
-                        mFormat,
-                        mAdjustNonDestructiveInChannelCount,
-                        mAdjustNonDestructiveOutChannelCount,
-                        frames,
-                        mKeepContractedChannels ? mMixerFormat : AUDIO_FORMAT_INVALID,
-                        buffer));
+status_t AudioMixer::Track::prepareForTee() {
+    ALOGV("AudioMixer::%s(%p) teeBuffer=%p", __func__, this, teeBuffer);
+    unprepareForTee();
+    if (teeBuffer != nullptr) {
+        mTeeBufferProvider.reset(new TeeBufferProvider(
+                mInputFrameSize, mInputFrameSize, kCopyBufferFrameCount,
+                (uint8_t*)teeBuffer, mTeeBufferFrameCount));
         reconfigureBufferProviders();
     }
     return NO_ERROR;
@@ -314,9 +322,15 @@ status_t AudioMixer::Track::prepareForAdjustChannelsNonDestructive(size_t frames
 
 void AudioMixer::Track::clearContractedBuffer()
 {
-    if (mContractChannelsNonDestructiveBufferProvider.get() != nullptr) {
+    if (mAdjustChannelsBufferProvider.get() != nullptr) {
         static_cast<AdjustChannelsBufferProvider*>(
-                mContractChannelsNonDestructiveBufferProvider.get())->clearContractedFrames();
+                mAdjustChannelsBufferProvider.get())->clearContractedFrames();
+    }
+}
+
+void AudioMixer::Track::clearTeeFrameCopied() {
+    if (mTeeBufferProvider.get() != nullptr) {
+        static_cast<TeeBufferProvider*>(mTeeBufferProvider.get())->clearFramesCopied();
     }
 }
 
@@ -324,13 +338,13 @@ void AudioMixer::Track::reconfigureBufferProviders()
 {
     // configure from upstream to downstream buffer providers.
     bufferProvider = mInputBufferProvider;
+    if (mTeeBufferProvider != nullptr) {
+        mTeeBufferProvider->setBufferProvider(bufferProvider);
+        bufferProvider = mTeeBufferProvider.get();
+    }
     if (mAdjustChannelsBufferProvider.get() != nullptr) {
         mAdjustChannelsBufferProvider->setBufferProvider(bufferProvider);
         bufferProvider = mAdjustChannelsBufferProvider.get();
-    }
-    if (mContractChannelsNonDestructiveBufferProvider.get() != nullptr) {
-        mContractChannelsNonDestructiveBufferProvider->setBufferProvider(bufferProvider);
-        bufferProvider = mContractChannelsNonDestructiveBufferProvider.get();
     }
     if (mReformatBufferProvider.get() != nullptr) {
         mReformatBufferProvider->setBufferProvider(bufferProvider);
@@ -377,7 +391,7 @@ void AudioMixer::setParameter(int name, int target, int param, void *value)
                 track->mainBuffer = valueBuf;
                 ALOGV("setParameter(TRACK, MAIN_BUFFER, %p)", valueBuf);
                 if (track->mKeepContractedChannels) {
-                    track->prepareForAdjustChannelsNonDestructive(mFrameCount);
+                    track->prepareForAdjustChannels(mFrameCount);
                 }
                 invalidate();
             }
@@ -405,7 +419,7 @@ void AudioMixer::setParameter(int name, int target, int param, void *value)
                 track->mMixerFormat = format;
                 ALOGV("setParameter(TRACK, MIXER_FORMAT, %#x)", format);
                 if (track->mKeepContractedChannels) {
-                    track->prepareForAdjustChannelsNonDestructive(mFrameCount);
+                    track->prepareForAdjustChannels(mFrameCount);
                 }
             }
             } break;
@@ -424,16 +438,35 @@ void AudioMixer::setParameter(int name, int target, int param, void *value)
             if (track->mHapticPlaybackEnabled != hapticPlaybackEnabled) {
                 track->mHapticPlaybackEnabled = hapticPlaybackEnabled;
                 track->mKeepContractedChannels = hapticPlaybackEnabled;
-                track->prepareForAdjustChannelsNonDestructive(mFrameCount);
-                track->prepareForAdjustChannels();
+                track->prepareForAdjustChannels(mFrameCount);
             }
             } break;
-        case HAPTIC_INTENSITY: {
-            const haptic_intensity_t hapticIntensity = static_cast<haptic_intensity_t>(valueInt);
-            if (track->mHapticIntensity != hapticIntensity) {
-                track->mHapticIntensity = hapticIntensity;
+        case HAPTIC_SCALE: {
+            const os::HapticScale hapticScale = *reinterpret_cast<os::HapticScale*>(value);
+            if (track->mHapticScale != hapticScale) {
+                track->mHapticScale = hapticScale;
             }
             } break;
+        case HAPTIC_MAX_AMPLITUDE: {
+            const float hapticMaxAmplitude = *reinterpret_cast<float*>(value);
+            if (track->mHapticMaxAmplitude != hapticMaxAmplitude) {
+                track->mHapticMaxAmplitude = hapticMaxAmplitude;
+            }
+            } break;
+        case TEE_BUFFER:
+            if (track->teeBuffer != valueBuf) {
+                track->teeBuffer = valueBuf;
+                ALOGV("setParameter(TRACK, TEE_BUFFER, %p)", valueBuf);
+                track->prepareForTee();
+            }
+            break;
+        case TEE_BUFFER_FRAME_COUNT:
+            if (track->mTeeBufferFrameCount != valueInt) {
+                track->mTeeBufferFrameCount = valueInt;
+                ALOGV("setParameter(TRACK, TEE_BUFFER_FRAME_COUNT, %i)", valueInt);
+                track->prepareForTee();
+            }
+            break;
         default:
             LOG_ALWAYS_FATAL("setParameter track: bad param %d", param);
         }
@@ -512,10 +545,10 @@ void AudioMixer::setBufferProvider(int name, AudioBufferProvider* bufferProvider
         track->mDownmixerBufferProvider->reset();
     } else if (track->mReformatBufferProvider.get() != nullptr) {
         track->mReformatBufferProvider->reset();
-    } else if (track->mContractChannelsNonDestructiveBufferProvider.get() != nullptr) {
-        track->mContractChannelsNonDestructiveBufferProvider->reset();
     } else if (track->mAdjustChannelsBufferProvider.get() != nullptr) {
         track->mAdjustChannelsBufferProvider->reset();
+    } else if (track->mTeeBufferProvider.get() != nullptr) {
+        track->mTeeBufferProvider->reset();
     }
 
     track->mInputBufferProvider = bufferProvider;
@@ -552,14 +585,15 @@ status_t AudioMixer::postCreateTrack(TrackBase *track)
     t->mPlaybackRate = AUDIO_PLAYBACK_RATE_DEFAULT;
     // haptic
     t->mHapticPlaybackEnabled = false;
-    t->mHapticIntensity = HAPTIC_SCALE_NONE;
+    t->mHapticScale = os::HapticScale::none();
+    t->mHapticMaxAmplitude = NAN;
     t->mMixerHapticChannelMask = AUDIO_CHANNEL_NONE;
     t->mMixerHapticChannelCount = 0;
     t->mAdjustInChannelCount = t->channelCount + t->mHapticChannelCount;
-    t->mAdjustOutChannelCount = t->channelCount + t->mMixerHapticChannelCount;
-    t->mAdjustNonDestructiveInChannelCount = t->mAdjustOutChannelCount;
-    t->mAdjustNonDestructiveOutChannelCount = t->channelCount;
+    t->mAdjustOutChannelCount = t->channelCount;
     t->mKeepContractedChannels = false;
+    t->mInputFrameSize = audio_bytes_per_frame(
+            t->channelCount + t->mHapticChannelCount, t->mFormat);
     // Check the downmixing (or upmixing) requirements.
     status_t status = t->prepareForDownmix();
     if (status != OK) {
@@ -569,8 +603,7 @@ status_t AudioMixer::postCreateTrack(TrackBase *track)
     // prepareForDownmix() may change mDownmixRequiresFormat
     ALOGVV("mMixerFormat:%#x  mMixerInFormat:%#x\n", t->mMixerFormat, t->mMixerInFormat);
     t->prepareForReformat();
-    t->prepareForAdjustChannelsNonDestructive(mFrameCount);
-    t->prepareForAdjustChannels();
+    t->prepareForAdjustChannels(mFrameCount);
     return OK;
 }
 
@@ -583,6 +616,7 @@ void AudioMixer::preProcess()
         if (t->mKeepContractedChannels) {
             t->clearContractedBuffer();
         }
+        t->clearTeeFrameCopied();
     }
 }
 
@@ -597,25 +631,23 @@ void AudioMixer::postProcess()
             const std::shared_ptr<Track> &t = getTrack(name);
             if (t->mHapticPlaybackEnabled) {
                 size_t sampleCount = mFrameCount * t->mMixerHapticChannelCount;
-                float gamma = t->getHapticScaleGamma();
-                float maxAmplitudeRatio = t->getHapticMaxAmplitudeRatio();
                 uint8_t* buffer = (uint8_t*)pair.first + mFrameCount * audio_bytes_per_frame(
                         t->mMixerChannelCount, t->mMixerFormat);
                 switch (t->mMixerFormat) {
                 // Mixer format should be AUDIO_FORMAT_PCM_FLOAT.
                 case AUDIO_FORMAT_PCM_FLOAT: {
-                    float* fout = (float*) buffer;
-                    for (size_t i = 0; i < sampleCount; i++) {
-                        float mul = fout[i] >= 0 ? 1.0 : -1.0;
-                        fout[i] = powf(fabsf(fout[i] / HAPTIC_MAX_AMPLITUDE_FLOAT), gamma)
-                                * maxAmplitudeRatio * HAPTIC_MAX_AMPLITUDE_FLOAT * mul;
-                    }
+                    os::scaleHapticData((float*) buffer, sampleCount, t->mHapticScale,
+                                        t->mHapticMaxAmplitude);
                 } break;
                 default:
                     LOG_ALWAYS_FATAL("bad mMixerFormat: %#x", t->mMixerFormat);
                     break;
                 }
                 break;
+            }
+            if (t->teeBuffer != nullptr && t->volumeRL == 0) {
+                // Need to mute tee
+                memset(t->teeBuffer, 0, t->mTeeBufferFrameCount * t->mInputFrameSize);
             }
         }
     }

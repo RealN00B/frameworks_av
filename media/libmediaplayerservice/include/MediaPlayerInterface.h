@@ -108,6 +108,7 @@ public:
         virtual audio_stream_type_t getAudioStreamType() const = 0;
         virtual uint32_t    getSampleRate() const = 0;
         virtual int64_t     getBufferDurationInUs() const = 0;
+        virtual audio_output_flags_t getFlags() const = 0;
 
         // If no callback is specified, use the "write" API below to submit
         // audio data.
@@ -121,6 +122,8 @@ public:
                 const audio_offload_info_t *offloadInfo = NULL,
                 bool doNotReconnect = false,
                 uint32_t suggestedFrameCount = 0) = 0;
+
+        virtual void        setPlayerIId(int32_t playerIId) = 0;
 
         virtual status_t    start() = 0;
 
@@ -146,7 +149,7 @@ public:
         virtual bool        needsTrailingPadding() { return true; }
 
         virtual status_t    setParameters(const String8& /* keyValuePairs */) { return NO_ERROR; }
-        virtual String8     getParameters(const String8& /* keys */) { return String8::empty(); }
+        virtual String8     getParameters(const String8& /* keys */) { return String8(); }
 
         virtual media::VolumeShaper::Status applyVolumeShaper(
                                     const sp<media::VolumeShaper::Configuration>& configuration,

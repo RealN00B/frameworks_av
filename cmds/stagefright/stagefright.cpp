@@ -60,6 +60,7 @@
 
 #include <private/media/VideoFrame.h>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/GLConsumer.h>
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
@@ -69,6 +70,10 @@
 #include "AudioPlayer.h"
 
 using namespace android;
+
+namespace {
+    constexpr static int PIXEL_FORMAT_RGBA_1010102_AS_8888 = -HAL_PIXEL_FORMAT_RGBA_1010102;
+}
 
 static long gNumRepetitions;
 static long gMaxNumFrames;  // 0 means decode all available.
@@ -102,6 +107,12 @@ static void displayDecodeHistogram(Vector<int64_t> *decodeTimesUs) {
     decodeTimesUs->sort(CompareIncreasing);
 
     size_t n = decodeTimesUs->size();
+
+    if (n == 0) {
+        printf("no decode histogram to display\n");
+        return;
+    }
+
     int64_t minUs = decodeTimesUs->itemAt(0);
     int64_t maxUs = decodeTimesUs->itemAt(n - 1);
 
@@ -145,7 +156,7 @@ static void displayAVCProfileLevelIfPossible(const sp<MetaData>& meta) {
 }
 
 static void dumpSource(const sp<MediaSource> &source, const String8 &filename) {
-    FILE *out = fopen(filename.string(), "wb");
+    FILE *out = fopen(filename.c_str(), "wb");
 
     CHECK_EQ((status_t)OK, source->start());
 
@@ -202,8 +213,8 @@ static void playSource(sp<MediaSource> &source) {
         }
         rawSource = SimpleDecodingSource::Create(
                 source, flags, gSurface,
-                gComponentNameOverride.isEmpty() ? nullptr : gComponentNameOverride.c_str(),
-                !gComponentNameOverride.isEmpty());
+                gComponentNameOverride.empty() ? nullptr : gComponentNameOverride.c_str(),
+                !gComponentNameOverride.empty());
         if (rawSource == NULL) {
             return;
         }
@@ -220,7 +231,7 @@ static void playSource(sp<MediaSource> &source) {
     }
 
     if (gPlaybackAudio) {
-        AudioPlayer *player = new AudioPlayer(NULL);
+        sp<AudioPlayer> player = sp<AudioPlayer>::make(nullptr);
         player->setSource(rawSource);
         rawSource.clear();
 
@@ -234,9 +245,6 @@ static void playSource(sp<MediaSource> &source) {
         } else {
             fprintf(stderr, "unable to start playback err=%d (0x%08x)\n", err, err);
         }
-
-        delete player;
-        player = NULL;
 
         return;
     } else if (gReproduceBug >= 3 && gReproduceBug <= 5) {
@@ -531,9 +539,9 @@ static void writeSourcesToMP4(
         Vector<sp<MediaSource> > &sources, bool syncInfoPresent) {
 #if 0
     sp<MPEG4Writer> writer =
-        new MPEG4Writer(gWriteMP4Filename.string());
+        new MPEG4Writer(gWriteMP4Filename.c_str());
 #else
-    int fd = open(gWriteMP4Filename.string(), O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
+    int fd = open(gWriteMP4Filename.c_str(), O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         fprintf(stderr, "couldn't open file");
         return;
@@ -629,7 +637,14 @@ static void usage(const char *me) {
     fprintf(stderr, "       -m max-number-of-frames-to-decode in each pass\n");
     fprintf(stderr, "       -b bug to reproduce\n");
     fprintf(stderr, "       -i(nfo) dump codec info (profiles and color formats supported, details)\n");
-    fprintf(stderr, "       -t(humbnail) extract video thumbnail or album art\n");
+    fprintf(stderr, "       -t(humbnail) extract video thumbnail or album art (/sdcard/out.jpg)\n");
+    fprintf(stderr, "       -P(ixelFormat) pixel format to use for raw thumbnail "
+                    "(/sdcard/out.raw)\n");
+    fprintf(stderr, "          %d: RGBA_565\n", HAL_PIXEL_FORMAT_RGB_565);
+    fprintf(stderr, "          %d: RGBA_8888\n", HAL_PIXEL_FORMAT_RGBA_8888);
+    fprintf(stderr, "          %d: BGRA_8888\n", HAL_PIXEL_FORMAT_BGRA_8888);
+    fprintf(stderr, "          %d: RGBA_1010102\n", HAL_PIXEL_FORMAT_RGBA_1010102);
+    fprintf(stderr, "          %d: RGBA_1010102 as RGBA_8888\n", PIXEL_FORMAT_RGBA_1010102_AS_8888);
     fprintf(stderr, "       -s(oftware) prefer software codec\n");
     fprintf(stderr, "       -r(hardware) force to use hardware codec\n");
     fprintf(stderr, "       -o playback audio\n");
@@ -741,7 +756,8 @@ static void dumpCodecDetails(bool queryDecoders) {
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP8)   ? asString_VP8Profile(pl.mProfile) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_HEVC)  ? asString_HEVCProfile(pl.mProfile) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)   ? asString_VP9Profile(pl.mProfile) :
-                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Profile(pl.mProfile) :"??";
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Profile(pl.mProfile) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_DOLBY_VISION) ? asString_DolbyVisionProfile(pl.mProfile) :"??";
                     const char *niceLevel =
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_MPEG2) ? asString_MPEG2Level(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_H263)  ? asString_H263Level(pl.mLevel) :
@@ -751,6 +767,7 @@ static void dumpCodecDetails(bool queryDecoders) {
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_HEVC)  ? asString_HEVCTierLevel(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)   ? asString_VP9Level(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Level(pl.mLevel) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_DOLBY_VISION) ? asString_DolbyVisionLevel(pl.mLevel) :
                         "??";
 
                     list.add(AStringPrintf("% 5u/% 5u (%s/%s)",
@@ -787,6 +804,7 @@ int main(int argc, char **argv) {
     bool useSurfaceTexAlloc = false;
     bool dumpStream = false;
     bool dumpPCMStream = false;
+    int32_t pixelFormat = 0;        // thumbnail pixel format
     String8 dumpStreamFilename;
     gNumRepetitions = 1;
     gMaxNumFrames = 0;
@@ -800,7 +818,7 @@ int main(int argc, char **argv) {
     sp<android::ALooper> looper;
 
     int res;
-    while ((res = getopt(argc, argv, "vhaqn:lm:b:itsrow:kN:xSTd:D:")) >= 0) {
+    while ((res = getopt(argc, argv, "vhaqn:lm:b:itsrow:kN:xSTd:D:P:")) >= 0) {
         switch (res) {
             case 'a':
             {
@@ -817,7 +835,7 @@ int main(int argc, char **argv) {
             case 'd':
             {
                 dumpStream = true;
-                dumpStreamFilename.setTo(optarg);
+                dumpStreamFilename = optarg;
                 break;
             }
 
@@ -825,13 +843,13 @@ int main(int argc, char **argv) {
             {
                 dumpPCMStream = true;
                 audioOnly = true;
-                dumpStreamFilename.setTo(optarg);
+                dumpStreamFilename = optarg;
                 break;
             }
 
             case 'N':
             {
-                gComponentNameOverride.setTo(optarg);
+                gComponentNameOverride = optarg;
                 break;
             }
 
@@ -841,6 +859,7 @@ int main(int argc, char **argv) {
                 break;
             }
 
+            case 'P':
             case 'm':
             case 'n':
             case 'b':
@@ -856,6 +875,8 @@ int main(int argc, char **argv) {
                     gNumRepetitions = x;
                 } else if (res == 'm') {
                     gMaxNumFrames = x;
+                } else if (res == 'P') {
+                    pixelFormat = x;
                 } else {
                     CHECK_EQ(res, 'b');
                     gReproduceBug = x;
@@ -866,7 +887,7 @@ int main(int argc, char **argv) {
             case 'w':
             {
                 gWriteMP4 = true;
-                gWriteMP4Filename.setTo(optarg);
+                gWriteMP4Filename = optarg;
                 break;
             }
 
@@ -978,24 +999,71 @@ int main(int argc, char **argv) {
             close(fd);
             fd = -1;
 
+            uint32_t retrieverPixelFormat = HAL_PIXEL_FORMAT_RGB_565;
+            if (pixelFormat == PIXEL_FORMAT_RGBA_1010102_AS_8888) {
+                retrieverPixelFormat = HAL_PIXEL_FORMAT_RGBA_1010102;
+            } else if (pixelFormat) {
+                retrieverPixelFormat = pixelFormat;
+            }
             sp<IMemory> mem =
                     retriever->getFrameAtTime(-1,
                             MediaSource::ReadOptions::SEEK_PREVIOUS_SYNC,
-                            HAL_PIXEL_FORMAT_RGB_565,
-                            false /*metaOnly*/);
+                            retrieverPixelFormat, false /*metaOnly*/);
 
             if (mem != NULL) {
                 failed = false;
-                printf("getFrameAtTime(%s) => OK\n", filename);
+                printf("getFrameAtTime(%s) format=%d => OK\n", filename, retrieverPixelFormat);
 
                 VideoFrame *frame = (VideoFrame *)mem->unsecurePointer();
 
-                CHECK_EQ(writeJpegFile("/sdcard/out.jpg",
-                            frame->getFlattenedData(),
-                            frame->mWidth, frame->mHeight), 0);
+                if (pixelFormat) {
+                    int bpp = 0;
+                    switch (pixelFormat) {
+                    case HAL_PIXEL_FORMAT_RGB_565:
+                        bpp = 2;
+                        break;
+                    case PIXEL_FORMAT_RGBA_1010102_AS_8888:
+                        // convert RGBA_1010102 to RGBA_8888
+                        {
+                            uint32_t *data = (uint32_t *)frame->getFlattenedData();
+                            uint32_t *end = data + frame->mWidth * frame->mHeight;
+                            for (; data < end; ++data) {
+                                *data =
+                                    // pick out 8-bit R, G, B values and move them to the
+                                    // correct position
+                                    ( (*data &      0x3fc) >> 2) | // R
+                                    ( (*data &    0xff000) >> 4) | // G
+                                    ( (*data & 0x3fc00000) >> 6) | // B
+                                    // pick out 2-bit A and expand to 8-bits
+                                    (((*data & 0xc0000000) >> 6) * 0x55);
+                            }
+                        }
+
+                        FALLTHROUGH_INTENDED;
+
+                    case HAL_PIXEL_FORMAT_RGBA_1010102:
+                    case HAL_PIXEL_FORMAT_RGBA_8888:
+                    case HAL_PIXEL_FORMAT_BGRA_8888:
+                        bpp = 4;
+                        break;
+                    }
+                    if (bpp) {
+                        FILE *out = fopen("/sdcard/out.raw", "wb");
+                        fwrite(frame->getFlattenedData(), bpp * frame->mWidth, frame->mHeight, out);
+                        fclose(out);
+
+                        printf("write out %d x %d x %dbpp\n", frame->mWidth, frame->mHeight, bpp);
+                    } else {
+                        printf("unknown pixel format.\n");
+                    }
+                } else {
+                    CHECK_EQ(writeJpegFile("/sdcard/out.jpg",
+                                frame->getFlattenedData(),
+                                frame->mWidth, frame->mHeight), 0);
+                }
             }
 
-            {
+            if (!pixelFormat) {
                 mem = retriever->extractAlbumArt();
 
                 if (mem != NULL) {
@@ -1066,7 +1134,12 @@ int main(int argc, char **argv) {
             CHECK(gSurface != NULL);
         } else {
             CHECK(useSurfaceTexAlloc);
-
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+            sp<GLConsumer> texture =
+                    new GLConsumer(0 /* tex */, GLConsumer::TEXTURE_EXTERNAL,
+                                   true /* useFenceSync */, false /* isControlledByApp */);
+            gSurface = texture->getSurface();
+#else
             sp<IGraphicBufferProducer> producer;
             sp<IGraphicBufferConsumer> consumer;
             BufferQueue::createBufferQueue(&producer, &consumer);
@@ -1074,6 +1147,7 @@ int main(int argc, char **argv) {
                     GLConsumer::TEXTURE_EXTERNAL, true /* useFenceSync */,
                     false /* isControlledByApp */);
             gSurface = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
         }
     }
 

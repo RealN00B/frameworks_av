@@ -18,7 +18,8 @@
 #define AAUDIO_SERVICE_ENDPOINT_SHARED_H
 
 #include <atomic>
-#include <mutex>
+
+#include <android-base/thread_annotations.h>
 
 #include "AAudioServiceEndpoint.h"
 #include "client/AudioStreamInternal.h"
@@ -36,6 +37,8 @@ class AAudioServiceEndpointShared : public AAudioServiceEndpoint {
 
 public:
     explicit AAudioServiceEndpointShared(AudioStreamInternal *streamInternal);
+
+    ~AAudioServiceEndpointShared() override = default;
 
     std::string dump() const override;
 
@@ -55,15 +58,17 @@ public:
 
     virtual void   *callbackLoop() = 0;
 
-protected:
-
     AudioStreamInternal *getStreamInternal() const {
         return mStreamInternal.get();
     };
 
-    aaudio_result_t          startSharingThread_l();
+protected:
+
+    aaudio_result_t          startSharingThread_l() REQUIRES(mLockStreams);
 
     aaudio_result_t          stopSharingThread();
+
+    void                     handleDisconnectRegisteredStreamsAsync();
 
     // An MMAP stream that is shared by multiple clients.
     android::sp<AudioStreamInternal> mStreamInternal;
@@ -73,6 +78,6 @@ protected:
     std::atomic<int>         mRunningStreamCount{0};
 };
 
-}
+} // namespace aaudio
 
 #endif //AAUDIO_SERVICE_ENDPOINT_SHARED_H

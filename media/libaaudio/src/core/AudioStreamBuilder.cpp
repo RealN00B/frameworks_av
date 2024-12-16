@@ -20,9 +20,14 @@
 
 #include <new>
 #include <stdint.h>
+#include <vector>
 
 #include <aaudio/AAudio.h>
 #include <aaudio/AAudioTesting.h>
+#include <android/media/audio/common/AudioMMapPolicy.h>
+#include <android/media/audio/common/AudioMMapPolicyInfo.h>
+#include <android/media/audio/common/AudioMMapPolicyType.h>
+#include <media/AudioSystem.h>
 
 #include "binding/AAudioBinderClient.h"
 #include "client/AudioStreamInternalCapture.h"
@@ -32,38 +37,29 @@
 #include "core/AudioStreamBuilder.h"
 #include "legacy/AudioStreamRecord.h"
 #include "legacy/AudioStreamTrack.h"
+#include "utility/AAudioUtilities.h"
 
 using namespace aaudio;
 
+using android::media::audio::common::AudioMMapPolicy;
+using android::media::audio::common::AudioMMapPolicyInfo;
+using android::media::audio::common::AudioMMapPolicyType;
+
 #define AAUDIO_MMAP_POLICY_DEFAULT             AAUDIO_POLICY_NEVER
 #define AAUDIO_MMAP_EXCLUSIVE_POLICY_DEFAULT   AAUDIO_POLICY_NEVER
+#define AAUDIO_MMAP_POLICY_DEFAULT_AIDL        AudioMMapPolicy::NEVER
+#define AAUDIO_MMAP_EXCLUSIVE_POLICY_DEFAULT_AIDL AudioMMapPolicy::NEVER
 
-// These values are for a pre-check before we ask the lower level service to open a stream.
-// So they are just outside the maximum conceivable range of value,
-// on the edge of being ridiculous.
-// TODO These defines should be moved to a central place in audio.
-#define SAMPLES_PER_FRAME_MIN        1
-// TODO Remove 8 channel limitation.
-#define SAMPLES_PER_FRAME_MAX        FCC_8
-#define SAMPLE_RATE_HZ_MIN           8000
-// HDMI supports up to 32 channels at 1536000 Hz.
-#define SAMPLE_RATE_HZ_MAX           1600000
 #define FRAMES_PER_DATA_CALLBACK_MIN 1
 #define FRAMES_PER_DATA_CALLBACK_MAX (1024 * 1024)
 
 /*
  * AudioStreamBuilder
  */
-AudioStreamBuilder::AudioStreamBuilder() {
-}
-
-AudioStreamBuilder::~AudioStreamBuilder() {
-}
-
 static aaudio_result_t builder_createStream(aaudio_direction_t direction,
-                                         aaudio_sharing_mode_t sharingMode,
-                                         bool tryMMap,
-                                         android::sp<AudioStream> &stream) {
+                                            aaudio_sharing_mode_t /*sharingMode*/,
+                                            bool tryMMap,
+                                            android::sp<AudioStream> &stream) {
     aaudio_result_t result = AAUDIO_OK;
 
     switch (direction) {
@@ -111,25 +107,58 @@ aaudio_result_t AudioStreamBuilder::build(AudioStream** streamPtr) {
         return result;
     }
 
-    // The API setting is the highest priority.
+    std::vector<AudioMMapPolicyInfo> policyInfos;
     aaudio_policy_t mmapPolicy = AudioGlobal_getMMapPolicy();
-    // If not specified then get from a system property.
-    if (mmapPolicy == AAUDIO_UNSPECIFIED) {
-        mmapPolicy = AAudioProperty_getMMapPolicy();
+    ALOGD("%s, global mmap policy is %d", __func__, mmapPolicy);
+    if (status_t status = android::AudioSystem::getMmapPolicyInfo(
+            AudioMMapPolicyType::DEFAULT, &policyInfos); status == NO_ERROR) {
+        aaudio_policy_t systemMmapPolicy = AAudio_getAAudioPolicy(
+                policyInfos, AAUDIO_MMAP_POLICY_DEFAULT_AIDL);
+        ALOGD("%s, system mmap policy is %d", __func__, systemMmapPolicy);
+        if (mmapPolicy == AAUDIO_POLICY_ALWAYS && systemMmapPolicy == AAUDIO_POLICY_NEVER) {
+            // No need to try as AAudioService is not created and the client only wants MMAP path.
+            return AAUDIO_ERROR_NO_SERVICE;
+        }
+        // Use system property for mmap policy if
+        //    1. The API setting does not specify mmap policy or
+        //    2. The system property specifies MMAP policy as never. In this case, AAudioService
+        //       will not be started, no need to try mmap path.
+        if (mmapPolicy == AAUDIO_UNSPECIFIED || systemMmapPolicy == AAUDIO_POLICY_NEVER) {
+            mmapPolicy = systemMmapPolicy;
+        }
+    } else {
+        ALOGD("%s, failed to query system mmap policy, error=%d", __func__, status);
+        // If it fails querying mmap policy info, it is highly possible that the AAudioService is
+        // not created. In this case, we don't try mmap path.
+        if (mmapPolicy == AAUDIO_POLICY_ALWAYS) {
+            return AAUDIO_ERROR_NO_SERVICE;
+        }
+        mmapPolicy = AAUDIO_POLICY_NEVER;
     }
     // If still not specified then use the default.
     if (mmapPolicy == AAUDIO_UNSPECIFIED) {
         mmapPolicy = AAUDIO_MMAP_POLICY_DEFAULT;
     }
+    ALOGD("%s, final mmap policy is %d", __func__, mmapPolicy);
 
-    int32_t mapExclusivePolicy = AAudioProperty_getMMapExclusivePolicy();
-    if (mapExclusivePolicy == AAUDIO_UNSPECIFIED) {
-        mapExclusivePolicy = AAUDIO_MMAP_EXCLUSIVE_POLICY_DEFAULT;
+    policyInfos.clear();
+    aaudio_policy_t mmapExclusivePolicy = AAUDIO_UNSPECIFIED;
+    if (status_t status = android::AudioSystem::getMmapPolicyInfo(
+            AudioMMapPolicyType::EXCLUSIVE, &policyInfos); status == NO_ERROR) {
+        mmapExclusivePolicy = AAudio_getAAudioPolicy(
+                policyInfos, AAUDIO_MMAP_EXCLUSIVE_POLICY_DEFAULT_AIDL);
+        ALOGD("%s, system mmap exclusive policy is %d", __func__, mmapExclusivePolicy);
+    } else {
+        ALOGD("%s, failed to query mmap exclusive policy, error=%d", __func__, status);
     }
+    if (mmapExclusivePolicy == AAUDIO_UNSPECIFIED) {
+        mmapExclusivePolicy = AAUDIO_MMAP_EXCLUSIVE_POLICY_DEFAULT;
+    }
+    ALOGD("%s, final mmap exclusive policy is %d", __func__, mmapExclusivePolicy);
 
     aaudio_sharing_mode_t sharingMode = getSharingMode();
     if ((sharingMode == AAUDIO_SHARING_MODE_EXCLUSIVE)
-        && (mapExclusivePolicy == AAUDIO_POLICY_NEVER)) {
+        && (mmapExclusivePolicy == AAUDIO_POLICY_NEVER)) {
         ALOGD("%s() EXCLUSIVE sharing mode not supported. Use SHARED.", __func__);
         sharingMode = AAUDIO_SHARING_MODE_SHARED;
         setSharingMode(sharingMode);
@@ -149,6 +178,11 @@ aaudio_result_t AudioStreamBuilder::build(AudioStream** streamPtr) {
     // SessionID and Effects are only supported in Legacy mode.
     if (getSessionId() != AAUDIO_SESSION_ID_NONE) {
         ALOGD("%s() MMAP not used because sessionId specified.", __func__);
+        allowMMap = false;
+    }
+
+    if (getFormat() == AUDIO_FORMAT_IEC61937) {
+        ALOGD("%s IEC61937 format is selected, do not allow MMAP in this case.", __func__);
         allowMMap = false;
     }
 
@@ -188,7 +222,8 @@ aaudio_result_t AudioStreamBuilder::build(AudioStream** streamPtr) {
             }
         }
         if (result == AAUDIO_OK) {
-            audioStream->logOpen();
+            audioStream->registerPlayerBase();
+            audioStream->logOpenActual();
             *streamPtr = startUsingStream(audioStream);
         } // else audioStream will go out of scope and be deleted
     }
@@ -268,8 +303,8 @@ static const char *AAudio_convertDirectionToText(aaudio_direction_t direction) {
 
 void AudioStreamBuilder::logParameters() const {
     // This is very helpful for debugging in the future. Please leave it in.
-    ALOGI("rate   = %6d, channels  = %d, format   = %d, sharing = %s, dir = %s",
-          getSampleRate(), getSamplesPerFrame(), getFormat(),
+    ALOGI("rate   = %6d, channels  = %d, channelMask = %#x, format   = %d, sharing = %s, dir = %s",
+          getSampleRate(), getSamplesPerFrame(), getChannelMask(), getFormat(),
           AAudio_convertSharingModeToShortText(getSharingMode()),
           AAudio_convertDirectionToText(getDirection()));
     ALOGI("device = %6d, sessionId = %d, perfMode = %d, callback: %s with frames = %d",
@@ -280,5 +315,8 @@ void AudioStreamBuilder::logParameters() const {
           mFramesPerDataCallback);
     ALOGI("usage  = %6d, contentType = %d, inputPreset = %d, allowedCapturePolicy = %d",
           getUsage(), getContentType(), getInputPreset(), getAllowedCapturePolicy());
-    ALOGI("privacy sensitive = %s", isPrivacySensitive() ? "true" : "false");
+    ALOGI("privacy sensitive = %s, opPackageName = %s, attributionTag = %s",
+          isPrivacySensitive() ? "true" : "false",
+          !getOpPackageName().has_value() ? "(null)" : getOpPackageName().value().c_str(),
+          !getAttributionTag().has_value() ? "(null)" : getAttributionTag().value().c_str());
 }

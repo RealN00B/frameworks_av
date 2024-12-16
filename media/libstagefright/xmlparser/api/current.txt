@@ -65,6 +65,16 @@ package media.codecs {
     method public void set_default(String);
   }
 
+  public class Mapping {
+    ctor public Mapping();
+    method public String getKind();
+    method public String getName();
+    method public String getValue();
+    method public void setKind(String);
+    method public void setName(String);
+    method public void setValue(String);
+  }
+
   public class MediaCodec {
     ctor public MediaCodec();
     method public java.util.List<media.codecs.Alias> getAlias_optional();
@@ -73,9 +83,12 @@ package media.codecs {
     method public String getEnabled();
     method public java.util.List<media.codecs.Feature> getFeature_optional();
     method public java.util.List<media.codecs.Limit> getLimit_optional();
+    method public java.util.List<media.codecs.Mapping> getMapping_optional();
+    method public String getMinsdk();
     method public String getName();
     method public java.util.List<media.codecs.Quirk> getQuirk_optional();
     method public String getRank();
+    method public java.util.List<media.codecs.Tuning> getTuning_optional();
     method public String getType();
     method public java.util.List<media.codecs.Type> getType_optional();
     method public String getUpdate();
@@ -83,6 +96,7 @@ package media.codecs {
     method public java.util.List<media.codecs.Variant> getVariant_optional();
     method public void setDomain(String);
     method public void setEnabled(String);
+    method public void setMinsdk(String);
     method public void setName(String);
     method public void setRank(String);
     method public void setType(String);
@@ -125,6 +139,14 @@ package media.codecs {
     method public java.util.List<media.codecs.Setting> getVariant_optional();
   }
 
+  public class Tuning {
+    ctor public Tuning();
+    method public String getName();
+    method public String getValue();
+    method public void setName(String);
+    method public void setValue(String);
+  }
+
   public class Type {
     ctor public Type();
     method public java.util.List<media.codecs.Alias> getAlias();
@@ -149,7 +171,6 @@ package media.codecs {
 
   public class XmlParser {
     ctor public XmlParser();
-    method public static media.codecs.Included readIncluded(java.io.InputStream) throws javax.xml.datatype.DatatypeConfigurationException, java.io.IOException, org.xmlpull.v1.XmlPullParserException;
     method public static media.codecs.MediaCodecs readMediaCodecs(java.io.InputStream) throws javax.xml.datatype.DatatypeConfigurationException, java.io.IOException, org.xmlpull.v1.XmlPullParserException;
     method public static String readText(org.xmlpull.v1.XmlPullParser) throws java.io.IOException, org.xmlpull.v1.XmlPullParserException;
     method public static void skip(org.xmlpull.v1.XmlPullParser) throws java.io.IOException, org.xmlpull.v1.XmlPullParserException;

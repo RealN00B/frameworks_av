@@ -21,6 +21,7 @@
 #include <utils/String16.h>
 
 #include <camera/camera2/CaptureRequest.h>
+#include <camera/StringUtils.h>
 
 #include <binder/Parcel.h>
 #include <gui/Surface.h>
@@ -74,7 +75,7 @@ status_t CaptureRequest::readFromParcel(const android::Parcel* parcel) {
             return err;
         }
         ALOGV("%s: Read metadata from parcel", __FUNCTION__);
-        mPhysicalCameraSettings.push_back({std::string(String8(id).string()), settings});
+        mPhysicalCameraSettings.push_back({toStdString(id), settings});
     }
 
     int isReprocess = 0;
@@ -146,6 +147,20 @@ status_t CaptureRequest::readFromParcel(const android::Parcel* parcel) {
         mSurfaceIdxList.push_back(surfaceIdx);
     }
 
+    int32_t hasUserTag;
+    if ((err = parcel->readInt32(&hasUserTag)) != OK) {
+        ALOGE("%s: Failed to read user tag availability flag", __FUNCTION__);
+        return BAD_VALUE;
+    }
+    if (hasUserTag) {
+        String16 userTag;
+        if ((err = parcel->readString16(&userTag)) != OK) {
+            ALOGE("%s: Failed to read user tag!", __FUNCTION__);
+            return BAD_VALUE;
+        }
+        mUserTag = toStdString(userTag);
+    }
+
     return OK;
 }
 
@@ -165,7 +180,7 @@ status_t CaptureRequest::writeToParcel(android::Parcel* parcel) const {
     }
 
     for (const auto &it : mPhysicalCameraSettings) {
-        if ((err = parcel->writeString16(String16(it.id.c_str()))) != OK) {
+        if ((err = parcel->writeString16(toString16(it.id))) != OK) {
             ALOGE("%s: Failed to camera id!", __FUNCTION__);
             return err;
         }
@@ -213,6 +228,14 @@ status_t CaptureRequest::writeToParcel(android::Parcel* parcel) const {
             return err;
         }
     }
+
+    if (mUserTag.empty()) {
+        parcel->writeInt32(0);
+    } else {
+        parcel->writeInt32(1);
+        parcel->writeString16(toString16(mUserTag));
+    }
+
     return OK;
 }
 

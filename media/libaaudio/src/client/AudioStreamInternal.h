@@ -20,16 +20,15 @@
 #include <stdint.h>
 #include <aaudio/AAudio.h>
 
-#include "binding/IAAudioService.h"
 #include "binding/AudioEndpointParcelable.h"
 #include "binding/AAudioServiceInterface.h"
-#include "client/IsochronousClockModel.h"
+#include "client/AAudioFlowGraph.h"
 #include "client/AudioEndpoint.h"
+#include "client/IsochronousClockModel.h"
 #include "core/AudioStream.h"
 #include "utility/AudioClock.h"
 
 using android::sp;
-using android::IAAudioService;
 
 namespace aaudio {
 
@@ -46,27 +45,23 @@ public:
     AudioStreamInternal(AAudioServiceInterface  &serviceInterface, bool inService);
     virtual ~AudioStreamInternal();
 
-    aaudio_result_t requestStart() override;
-
-    aaudio_result_t requestStop() override;
-
     aaudio_result_t getTimestamp(clockid_t clockId,
                                        int64_t *framePosition,
                                        int64_t *timeNanoseconds) override;
 
-    virtual aaudio_result_t updateStateMachine() override;
+    virtual aaudio_result_t processCommands() override;
 
     aaudio_result_t open(const AudioStreamBuilder &builder) override;
-
-    aaudio_result_t release_l() override;
 
     aaudio_result_t setBufferSize(int32_t requestedFrames) override;
 
     int32_t getBufferSize() const override;
 
+    int32_t getDeviceBufferSize() const;
+
     int32_t getBufferCapacity() const override;
 
-    int32_t getFramesPerBurst() const override;
+    int32_t getDeviceBufferCapacity() const override;
 
     int32_t getXRunCount() const override {
         return mXRunCount;
@@ -76,11 +71,8 @@ public:
 
     aaudio_result_t unregisterThread() override;
 
-    aaudio_result_t joinThread(void** returnArg);
-
     // Called internally from 'C'
     virtual void *callbackLoop() = 0;
-
 
     bool isMMap() override {
         return true;
@@ -96,10 +88,18 @@ public:
     aaudio_result_t stopClient(audio_port_handle_t clientHandle);
 
     aaudio_handle_t getServiceHandle() const {
-        return mServiceStreamHandle;
+        return mServiceStreamHandleInfo.getHandle();
+    }
+
+    int32_t getServiceLifetimeId() const {
+        return mServiceStreamHandleInfo.getServiceLifetimeId();
     }
 
 protected:
+    aaudio_result_t requestStart_l() REQUIRES(mStreamLock) override;
+    aaudio_result_t requestStop_l() REQUIRES(mStreamLock) override;
+
+    aaudio_result_t release_l() REQUIRES(mStreamLock) override;
 
     aaudio_result_t processData(void *buffer,
                          int32_t numFrames,
@@ -119,11 +119,13 @@ protected:
 
     aaudio_result_t drainTimestampsFromService();
 
-    aaudio_result_t processCommands();
+    aaudio_result_t stopCallback_l();
 
-    aaudio_result_t stopCallback();
+    virtual void prepareBuffersForStart() {}
 
-    virtual void advanceClientToMatchServerPosition() = 0;
+    virtual void prepareBuffersForStop() {}
+
+    virtual void advanceClientToMatchServerPosition(int32_t serverMargin) = 0;
 
     virtual void onFlushFromServer() {}
 
@@ -137,8 +139,6 @@ protected:
 
     // Calculate timeout for an operation involving framesPerOperation.
     int64_t calculateReasonableTimeout(int32_t framesPerOperation);
-
-    int32_t getDeviceChannelCount() const { return mDeviceChannelCount; }
 
     /**
      * @return true if running in audio service, versus in app process
@@ -157,9 +157,9 @@ protected:
 
     std::unique_ptr<AudioEndpoint> mAudioEndpoint;   // source for reads or sink for writes
 
-    aaudio_handle_t          mServiceStreamHandle; // opaque handle returned from service
+    // opaque handle returned from service
+    AAudioHandleInfo         mServiceStreamHandleInfo;
 
-    int32_t                  mFramesPerBurst = MIN_FRAMES_PER_BURST; // frames per HAL transfer
     int32_t                  mXRunCount = 0;      // how many underrun events?
 
     // Offset from underlying frame position.
@@ -182,6 +182,8 @@ protected:
     int64_t                  mLastFramesWritten = 0;
     int64_t                  mLastFramesRead = 0;
 
+    AAudioFlowGraph          mFlowGraph;
+
 private:
     /*
      * Asynchronous write with data conversion.
@@ -192,8 +194,13 @@ private:
     aaudio_result_t writeNowWithConversion(const void *buffer,
                                      int32_t numFrames);
 
+    // Exit the stream from standby, will reconstruct data path.
+    aaudio_result_t exitStandby_l() REQUIRES(mStreamLock);
+
     // Adjust timing model based on timestamp from service.
     void processTimestamp(uint64_t position, int64_t time);
+
+    aaudio_result_t configureDataInformation(int32_t callbackFrames);
 
     // Thread on other side of FIFO will have wakeup jitter.
     // By delaying slightly we can avoid waking up before other side is ready.
@@ -206,13 +213,10 @@ private:
 
     int64_t                  mServiceLatencyNanos = 0;
 
-    // Sometimes the hardware is operating with a different channel count from the app.
-    // Then we require conversion in AAudio.
-    int32_t                  mDeviceChannelCount = 0;
-
     int32_t                  mBufferSizeInFrames = 0; // local threshold to control latency
+    int32_t                  mDeviceBufferSizeInFrames = 0;
     int32_t                  mBufferCapacityInFrames = 0;
-
+    int32_t                  mDeviceBufferCapacityInFrames = 0;
 
 };
 

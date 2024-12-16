@@ -40,6 +40,31 @@ typedef struct Timestamp {
     int64_t nanoseconds;
 } Timestamp;
 
+static constexpr int32_t   kWorkloadScaler = 500;
+
+// Linear congruential random number generator.
+static uint32_t s_random16() {
+    static uint32_t seed = 1234;
+    seed = ((seed * 31421) + 6927) & 0x0FFFF;
+    return seed;
+}
+
+/**
+ * The random number generator is good for burning CPU because the compiler cannot
+ * easily optimize away the computation.
+ * @param workload number of times to execute the loop
+ * @return a white noise value between -1.0 and +1.0
+ */
+static float s_burnCPU(int32_t workload) {
+    uint32_t random = 0;
+    for (int32_t i = 0; i < workload; i++) {
+        for (int32_t j = 0; j < 10; j++) {
+            random = random ^ s_random16();
+        }
+    }
+    return (random - 32768) * (1.0 / 32768);
+}
+
 /**
  * Simple wrapper for AAudio that opens an output stream either in callback or blocking write mode.
  */
@@ -268,11 +293,13 @@ typedef struct SineThreadedData_s {
     int32_t            timestampCount = 0; // in timestamps
     int32_t            sampleRate = 48000;
     int32_t            prefixToneFrames = 0;
+    double             workload = 0.0;
     bool               sweepSetup = false;
 
     int                scheduler = 0;
     bool               schedulerChecked = false;
     int32_t            hangTimeMSec = 0;
+    int                cpuAffinity = -1;
 
     AAudioSimplePlayer simplePlayer;
     int32_t            callbackCount = 0;
@@ -304,6 +331,14 @@ typedef struct SineThreadedData_s {
 
 } SineThreadedData_t;
 
+int setCpuAffinity(int cpuIndex) {
+cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(cpuIndex, &cpu_set);
+    int err = sched_setaffinity((pid_t) 0, sizeof(cpu_set_t), &cpu_set);
+    return err == 0 ? 0 : -errno;
+}
+
 // Callback function that fills the audio output buffer.
 aaudio_data_callback_result_t SimplePlayerDataCallbackProc(
         AAudioStream *stream,
@@ -319,6 +354,10 @@ aaudio_data_callback_result_t SimplePlayerDataCallbackProc(
     }
     SineThreadedData_t *sineData = (SineThreadedData_t *) userData;
 
+    if (sineData->cpuAffinity >= 0) {
+        setCpuAffinity(sineData->cpuAffinity);
+        sineData->cpuAffinity = -1;
+    }
     // Play an initial high tone so we can tell whether the beginning was truncated.
     if (!sineData->sweepSetup && sineData->framesTotal >= sineData->prefixToneFrames) {
         sineData->setupSineSweeps();
@@ -359,28 +398,46 @@ aaudio_data_callback_result_t SimplePlayerDataCallbackProc(
 
     int32_t samplesPerFrame = AAudioStream_getChannelCount(stream);
 
-
-    int numActiveOscilators = (samplesPerFrame > MAX_CHANNELS) ? MAX_CHANNELS : samplesPerFrame;
+    int numActiveOscillators = std::min(samplesPerFrame, MAX_CHANNELS);
     switch (AAudioStream_getFormat(stream)) {
         case AAUDIO_FORMAT_PCM_I16: {
             int16_t *audioBuffer = (int16_t *) audioData;
-            for (int i = 0; i < numActiveOscilators; ++i) {
-                sineData->sineOscillators[i].render(&audioBuffer[i], samplesPerFrame,
-                                                    numFrames);
+            for (int i = 0; i < numActiveOscillators; ++i) {
+                sineData->sineOscillators[i].render(&audioBuffer[i],
+                                                    samplesPerFrame, numFrames);
             }
         }
             break;
         case AAUDIO_FORMAT_PCM_FLOAT: {
             float *audioBuffer = (float *) audioData;
-            for (int i = 0; i < numActiveOscilators; ++i) {
-                sineData->sineOscillators[i].render(&audioBuffer[i], samplesPerFrame,
-                                                    numFrames);
+            for (int i = 0; i < numActiveOscillators; ++i) {
+                sineData->sineOscillators[i].render(&audioBuffer[i],
+                                                    samplesPerFrame, numFrames);
+            }
+        }
+            break;
+        case AAUDIO_FORMAT_PCM_I24_PACKED: {
+            uint8_t *audioBuffer = (uint8_t *) audioData;
+            for (int i = 0; i < numActiveOscillators; ++i) {
+                static const int bytesPerSample = getBytesPerSample(AAUDIO_FORMAT_PCM_I24_PACKED);
+                sineData->sineOscillators[i].render24(&audioBuffer[i * bytesPerSample],
+                                                      samplesPerFrame, numFrames);
+            }
+        }
+            break;
+        case AAUDIO_FORMAT_PCM_I32: {
+            int32_t *audioBuffer = (int32_t *) audioData;
+            for (int i = 0; i < numActiveOscillators; ++i) {
+                sineData->sineOscillators[i].render(&audioBuffer[i],
+                                                    samplesPerFrame, numFrames);
             }
         }
             break;
         default:
             return AAUDIO_CALLBACK_RESULT_STOP;
     }
+
+    s_burnCPU((int32_t)(sineData->workload * kWorkloadScaler * numFrames));
 
     sineData->callbackCount++;
     sineData->framesTotal += numFrames;

@@ -20,9 +20,6 @@
 #include <memory>
 #include <mutex>
 
-#include <utils/String8.h>
-#include <utils/String16.h>
-
 #include <android/hardware/camera/device/3.6/ICameraOfflineSession.h>
 
 #include <fmq/MessageQueue.h>
@@ -36,7 +33,6 @@
 #include "device3/RotateAndCropMapper.h"
 #include "device3/ZoomRatioMapper.h"
 #include "utils/TagMonitor.h"
-#include "utils/LatencyHistogram.h"
 #include <camera_metadata_hidden.h>
 
 namespace android {
@@ -55,7 +51,8 @@ class Camera3StreamInterface;
 struct Camera3OfflineStates {
     Camera3OfflineStates(
             const TagMonitor& tagMonitor, const metadata_vendor_id_t vendorTagId,
-            const bool useHalBufManager, const bool needFixupMonochromeTags,
+            const bool useHalBufManager, const std::set<int32_t> &halBufferManagedStreamIds,
+            const bool needFixupMonochromeTags,
             const bool usePartialResult, const uint32_t numPartialResults,
             const int64_t lastCompletedRegularFN, const int64_t lastCompletedReprocessFN,
             const int64_t lastCompletedZslFN, const uint32_t nextResultFN,
@@ -68,7 +65,8 @@ struct Camera3OfflineStates {
             const std::unordered_map<std::string, camera3::RotateAndCropMapper>&
                 rotateAndCropMappers) :
             mTagMonitor(tagMonitor), mVendorTagId(vendorTagId),
-            mUseHalBufManager(useHalBufManager), mNeedFixupMonochromeTags(needFixupMonochromeTags),
+            mUseHalBufManager(useHalBufManager), mHalBufManagedStreamIds(halBufferManagedStreamIds),
+            mNeedFixupMonochromeTags(needFixupMonochromeTags),
             mUsePartialResult(usePartialResult), mNumPartialResults(numPartialResults),
             mLastCompletedRegularFrameNumber(lastCompletedRegularFN),
             mLastCompletedReprocessFrameNumber(lastCompletedReprocessFN),
@@ -89,6 +87,7 @@ struct Camera3OfflineStates {
     const metadata_vendor_id_t mVendorTagId;
 
     const bool mUseHalBufManager;
+    const std::set<int32_t > &mHalBufManagedStreamIds;
     const bool mNeedFixupMonochromeTags;
 
     const bool mUsePartialResult;
@@ -132,7 +131,6 @@ struct Camera3OfflineStates {
  */
 class Camera3OfflineSession :
             public CameraOfflineSessionBase,
-            virtual public hardware::camera::device::V3_5::ICameraDeviceCallback,
             public camera3::SetErrorInterface,
             public camera3::InflightRequestUpdateInterface,
             public camera3::RequestBufferInterface,
@@ -140,17 +138,16 @@ class Camera3OfflineSession :
   public:
 
     // initialize by Camera3Device.
-    explicit Camera3OfflineSession(const String8& id,
+    explicit Camera3OfflineSession(const std::string& id,
             const sp<camera3::Camera3Stream>& inputStream,
             const camera3::StreamSet& offlineStreamSet,
             camera3::BufferRecords&& bufferRecords,
             const camera3::InFlightRequestMap& offlineReqs,
-            const Camera3OfflineStates& offlineStates,
-            sp<hardware::camera::device::V3_6::ICameraOfflineSession> offlineSession);
+            const Camera3OfflineStates& offlineStates);
 
     virtual ~Camera3OfflineSession();
 
-    virtual status_t initialize(wp<NotificationListener> listener) override;
+    virtual status_t initialize(wp<NotificationListener> /*listener*/) = 0;
 
     /**
      * CameraOfflineSessionBase interface
@@ -161,7 +158,7 @@ class Camera3OfflineSession :
     /**
      * FrameProducer interface
      */
-    const String8& getId() const override;
+    const std::string& getId() const override;
     const CameraMetadata& info() const override;
     status_t waitForNextFrame(nsecs_t timeout) override;
     status_t getNextResult(CaptureResult *frame) override;
@@ -172,53 +169,22 @@ class Camera3OfflineSession :
      * End of CameraOfflineSessionBase interface
      */
 
-    /**
-     * HIDL ICameraDeviceCallback interface
-     */
-
-    /**
-     * Implementation of android::hardware::camera::device::V3_5::ICameraDeviceCallback
-     */
-
-    hardware::Return<void> processCaptureResult_3_4(
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_4::CaptureResult>& results) override;
-    hardware::Return<void> processCaptureResult(
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_2::CaptureResult>& results) override;
-    hardware::Return<void> notify(
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_2::NotifyMsg>& msgs) override;
-
-    hardware::Return<void> requestStreamBuffers(
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_5::BufferRequest>& bufReqs,
-            requestStreamBuffers_cb _hidl_cb) override;
-
-    hardware::Return<void> returnStreamBuffers(
-            const hardware::hidl_vec<
-                    hardware::camera::device::V3_2::StreamBuffer>& buffers) override;
-
-    /**
-     * End of CameraOfflineSessionBase interface
-     */
-
-  private:
+  protected:
     // Camera device ID
-    const String8 mId;
+    const std::string mId;
     sp<camera3::Camera3Stream> mInputStream;
     camera3::StreamSet mOutputStreams;
     camera3::BufferRecords mBufferRecords;
+    SessionStatsBuilder mSessionStatsBuilder;
 
     std::mutex mOfflineReqsLock;
     camera3::InFlightRequestMap mOfflineReqs;
-
-    sp<hardware::camera::device::V3_6::ICameraOfflineSession> mSession;
 
     TagMonitor mTagMonitor;
     const metadata_vendor_id_t mVendorTagId;
 
     const bool mUseHalBufManager;
+    const std::set<int32_t > &mHalBufManagedStreamIds;
     const bool mNeedFixupMonochromeTags;
 
     const bool mUsePartialResult;
@@ -269,11 +235,9 @@ class Camera3OfflineSession :
     // End of mLock protect scope
 
     std::mutex mProcessCaptureResultLock;
-    // FMQ to write result on. Must be guarded by mProcessCaptureResultLock.
-    std::unique_ptr<ResultMetadataQueue> mResultMetadataQueue;
 
     // Tracking cause of fatal errors when in STATUS_ERROR
-    String8 mErrorCause;
+    std::string mErrorCause;
 
     // Lock to ensure requestStreamBuffers() callbacks are serialized
     std::mutex mRequestBufferInterfaceLock;
@@ -282,6 +246,12 @@ class Camera3OfflineSession :
 
     // For client methods such as disconnect/dump
     std::mutex mInterfaceLock;
+
+    // The current minimum expected frame duration based on AE_TARGET_FPS_RANGE
+    nsecs_t mMinExpectedDuration = 0;
+    // Whether the camera device runs at fixed frame rate based on AE_MODE and
+    // AE_TARGET_FPS_RANGE
+    bool mIsFixedFps = false;
 
     // SetErrorInterface
     void setErrorState(const char *fmt, ...) override;
@@ -305,6 +275,13 @@ class Camera3OfflineSession :
     void setErrorStateLockedV(const char *fmt, va_list args);
 
     status_t disconnectImpl();
+
+    // Clients need to ensure that 'mInterfaceLock' is acquired before calling this method
+    virtual void closeSessionLocked() = 0;
+
+    // Clients need to ensure that 'mLock' is acquired before calling this method
+    virtual void releaseSessionLocked() = 0;
+
 }; // class Camera3OfflineSession
 
 }; // namespace android

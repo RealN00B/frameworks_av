@@ -160,11 +160,9 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             false/*hasZoomRatioRange*/, zoomRatioRange,
             usePreCorrectArray));
 
-    size_t index = 0;
     int32_t width = testActiveArraySize[2];
     int32_t height = testActiveArraySize[3];
     if (usePreCorrectArray) {
-        index = 1;
         width = testPreCorrActiveArraySize[2];
         height = testPreCorrActiveArraySize[3];
     }
@@ -182,7 +180,7 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
 
     // Verify 1.0x zoom doesn't change the coordinates
     auto coords = originalCoords;
-    mapper.scaleCoordinates(coords.data(), coords.size()/2, 1.0f, false /*clamp*/);
+    mapper.scaleCoordinates(coords.data(), coords.size()/2, 1.0f, false /*clamp*/, width, height);
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_EQ(coords[i], originalCoords[i]);
     }
@@ -199,7 +197,7 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             (width - 1) * 5.0f / 4.0f, (height - 1) / 2.0f, // middle-right after 1.33x zoom
     };
     coords = originalCoords;
-    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, false /*clamp*/);
+    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, false /*clamp*/, width, height);
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_LE(std::abs(coords[i] - expected2xCoords[i]), kMaxAllowedPixelError);
     }
@@ -216,7 +214,7 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             width - 1.0f,  (height - 1) / 2.0f, // middle-right after 1.33x zoom
     };
     coords = originalCoords;
-    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, true /*clamp*/);
+    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, true /*clamp*/, width, height);
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_LE(std::abs(coords[i] - expected2xCoordsClampedInc[i]), kMaxAllowedPixelError);
     }
@@ -233,7 +231,7 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             width - 1.0f,  height / 2.0f, // middle-right after 1.33x zoom
     };
     coords = originalCoords;
-    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, true /*clamp*/);
+    mapper.scaleCoordinates(coords.data(), coords.size()/2, 2.0f, true /*clamp*/, width, height);
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_LE(std::abs(coords[i] - expected2xCoordsClampedExc[i]), kMaxAllowedPixelError);
     }
@@ -250,9 +248,22 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             (width - 1) * 5 / 8.0f, (height - 1) / 2.0f, // middle-right after 1.33x zoom-in
     };
     coords = originalCoords;
-    mapper.scaleCoordinates(coords.data(), coords.size()/2, 1.0f/3, false /*clamp*/);
+    mapper.scaleCoordinates(coords.data(), coords.size()/2, 1.0f/3, false /*clamp*/, width, height);
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_LE(std::abs(coords[i] - expectedZoomOutCoords[i]), kMaxAllowedPixelError);
+    }
+
+    // Verify region zoom scaling doesn't generate invalid metering region
+    // (width < 0, or height < 0)
+    std::array<float, 3> scaleRatios = {10.0f, 1.0f, 0.1f};
+    for (float scaleRatio : scaleRatios) {
+        for (size_t i = 0; i < originalCoords.size(); i+= 2) {
+            int32_t coordinates[] = {originalCoords[i], originalCoords[i+1],
+                    originalCoords[i], originalCoords[i+1]};
+            mapper.scaleRegion(coordinates, scaleRatio, width, height);
+            EXPECT_LE(coordinates[0], coordinates[2]);
+            EXPECT_LE(coordinates[1], coordinates[3]);
+        }
     }
 }
 

@@ -19,15 +19,15 @@
 
 #include <random>
 
+#include <fmt/printf.h>
 #include <gtest/gtest.h>
-#include <android-base/stringprintf.h>
 #include <android-base/chrono_utils.h>
 
 #include "../device3/DistortionMapper.h"
 
 using namespace android;
 using namespace android::camera3;
-
+using DistortionMapperInfo = android::camera3::DistortionMapper::DistortionMapperInfo;
 
 int32_t testActiveArray[] = {100, 100, 1000, 750};
 int32_t testPreCorrActiveArray[] = {90, 90, 1020, 770};
@@ -132,14 +132,15 @@ TEST(DistortionMapperTest, IdentityTransform) {
             /*preCorrectionActiveArray*/ testActiveArray);
 
     auto coords = basicCoords;
-    res = m.mapCorrectedToRaw(coords.data(), 5,  /*clamp*/true);
+    DistortionMapperInfo *mapperInfo = m.getMapperInfo();
+    res = m.mapCorrectedToRaw(coords.data(), 5, mapperInfo, /*clamp*/true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_EQ(coords[i], basicCoords[i]);
     }
 
-    res = m.mapRawToCorrected(coords.data(), 5, /*clamp*/true);
+    res = m.mapRawToCorrected(coords.data(), 5, mapperInfo, /*clamp*/true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < coords.size(); i++) {
@@ -152,14 +153,14 @@ TEST(DistortionMapperTest, IdentityTransform) {
     };
 
     auto rectsOrig = rects;
-    res = m.mapCorrectedRectToRaw(rects.data(), 2, /*clamp*/true);
+    res = m.mapCorrectedRectToRaw(rects.data(), 2, mapperInfo, /*clamp*/true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < rects.size(); i++) {
         EXPECT_EQ(rects[i], rectsOrig[i]);
     }
 
-    res = m.mapRawRectToCorrected(rects.data(), 2, /*clamp*/true);
+    res = m.mapRawRectToCorrected(rects.data(), 2, mapperInfo, /*clamp*/true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < rects.size(); i++) {
@@ -176,14 +177,17 @@ TEST(DistortionMapperTest, ClampConsistency) {
             /*preCorrectionActiveArray*/ activeArray.data());
 
     auto rectsOrig = activeArray;
-    res = m.mapCorrectedRectToRaw(activeArray.data(), 1, /*clamp*/true, /*simple*/ true);
+    DistortionMapperInfo *mapperInfo = m.getMapperInfo();
+    res = m.mapCorrectedRectToRaw(activeArray.data(), 1, mapperInfo, /*clamp*/true,
+            /*simple*/ true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < activeArray.size(); i++) {
         EXPECT_EQ(activeArray[i], rectsOrig[i]);
     }
 
-    res = m.mapRawRectToCorrected(activeArray.data(), 1, /*clamp*/true, /*simple*/ true);
+    res = m.mapRawRectToCorrected(activeArray.data(), 1, mapperInfo, /*clamp*/true,
+            /*simple*/ true);
     ASSERT_EQ(res, OK);
 
     for (size_t i = 0; i < activeArray.size(); i++) {
@@ -200,7 +204,8 @@ TEST(DistortionMapperTest, SimpleTransform) {
             /*preCorrectionActiveArray*/ testPreCorrActiveArray);
 
     auto coords = basicCoords;
-    res = m.mapCorrectedToRaw(coords.data(), 5,  /*clamp*/true, /*simple*/true);
+    DistortionMapperInfo *mapperInfo = m.getMapperInfo();
+    res = m.mapCorrectedToRaw(coords.data(), 5, mapperInfo, /*clamp*/true, /*simple*/true);
     ASSERT_EQ(res, OK);
 
     ASSERT_EQ(coords[0], 0); ASSERT_EQ(coords[1], 0);
@@ -237,12 +242,13 @@ void RandomTransformTest(::testing::Test *test,
     auto origCoords = randCoords;
 
     base::Timer correctedToRawTimer;
-    res = m.mapCorrectedToRaw(randCoords.data(), randCoords.size() / 2, clamp, simple);
+    DistortionMapperInfo *mapperInfo = m.getMapperInfo();
+    res = m.mapCorrectedToRaw(randCoords.data(), randCoords.size() / 2, mapperInfo, clamp, simple);
     auto correctedToRawDurationMs = correctedToRawTimer.duration();
     EXPECT_EQ(res, OK);
 
     base::Timer rawToCorrectedTimer;
-    res = m.mapRawToCorrected(randCoords.data(), randCoords.size() / 2, clamp, simple);
+    res = m.mapRawToCorrected(randCoords.data(), randCoords.size() / 2, mapperInfo, clamp, simple);
     auto rawToCorrectedDurationMs = rawToCorrectedTimer.duration();
     EXPECT_EQ(res, OK);
 
@@ -254,9 +260,9 @@ void RandomTransformTest(::testing::Test *test,
                 rawToCorrectedDurationMs) / (randCoords.size() / 2) ).count();
 
     test->RecordProperty("CorrectedToRawDurationPerCoordUs",
-            base::StringPrintf("%f", correctedToRawDurationPerCoordUs));
+            fmt::sprintf("%f", correctedToRawDurationPerCoordUs));
     test->RecordProperty("RawToCorrectedDurationPerCoordUs",
-            base::StringPrintf("%f", rawToCorrectedDurationPerCoordUs));
+            fmt::sprintf("%f", rawToCorrectedDurationPerCoordUs));
 
     // Calculate mapping errors after round trip
     float totalErrorSq = 0;
@@ -290,9 +296,9 @@ void RandomTransformTest(::testing::Test *test,
     }
 
     float rmsError = std::sqrt(totalErrorSq / randCoords.size());
-    test->RecordProperty("RmsError", base::StringPrintf("%f", rmsError));
+    test->RecordProperty("RmsError", fmt::sprintf("%f", rmsError));
     for (size_t i = 0; i < histogram.size(); i++) {
-        std::string label = base::StringPrintf("HistogramBin[%f,%f)",
+        std::string label = fmt::sprintf("HistogramBin[%f,%f)",
                 (float)i/bucketsPerPixel, (float)(i + 1)/bucketsPerPixel);
         test->RecordProperty(label, histogram[i]);
     }
@@ -349,8 +355,6 @@ TEST(DistortionMapperTest, LargeTransform) {
 #include "DistortionMapperTest_OpenCvData.h"
 
 TEST(DistortionMapperTest, CompareToOpenCV) {
-    status_t res;
-
     float bigDistortion[] = {0.1, -0.003, 0.004, 0.02, 0.01};
 
     // Expect to match within sqrt(2) radius pixels
@@ -363,7 +367,8 @@ TEST(DistortionMapperTest, CompareToOpenCV) {
 
     using namespace openCvData;
 
-    res = m.mapRawToCorrected(rawCoords.data(), rawCoords.size() / 2, /*clamp*/false,
+    DistortionMapperInfo *mapperInfo = m.getMapperInfo();
+    m.mapRawToCorrected(rawCoords.data(), rawCoords.size() / 2, mapperInfo, /*clamp*/false,
             /*simple*/false);
 
     for (size_t i = 0; i < rawCoords.size(); i+=2) {

@@ -19,7 +19,6 @@
 
 #include <atomic>
 #include <functional>
-#include <mutex>
 #include <vector>
 
 #include "client/AudioStreamInternal.h"
@@ -30,6 +29,7 @@
 #include "AAudioServiceStreamMMAP.h"
 #include "AAudioMixer.h"
 #include "AAudioService.h"
+#include "SharedMemoryWrapper.h"
 
 namespace aaudio {
 
@@ -44,13 +44,13 @@ class AAudioServiceEndpointMMAP
 public:
     explicit AAudioServiceEndpointMMAP(android::AAudioService &audioService);
 
-    virtual ~AAudioServiceEndpointMMAP();
+    ~AAudioServiceEndpointMMAP() override = default;
 
     std::string dump() const override;
 
     aaudio_result_t open(const aaudio::AAudioStreamRequest &request) override;
 
-    void close() override;
+    void close() override EXCLUDES(mMmapStreamLock);
 
     aaudio_result_t startStream(android::sp<AAudioServiceStreamBase> stream,
                                 audio_port_handle_t *clientHandle) override;
@@ -60,11 +60,19 @@ public:
 
     aaudio_result_t startClient(const android::AudioClient& client,
                                 const audio_attributes_t *attr,
-                                audio_port_handle_t *clientHandle)  override;
+                                audio_port_handle_t *clientHandle)  override
+                                EXCLUDES(mMmapStreamLock);
 
-    aaudio_result_t stopClient(audio_port_handle_t clientHandle)  override;
+    aaudio_result_t stopClient(audio_port_handle_t clientHandle)  override
+            EXCLUDES(mMmapStreamLock);
 
-    aaudio_result_t getFreeRunningPosition(int64_t *positionFrames, int64_t *timeNanos) override;
+    aaudio_result_t standby() override EXCLUDES(mMmapStreamLock);
+
+    aaudio_result_t exitStandby(AudioEndpointParcelable* parcelable) override
+            EXCLUDES(mMmapStreamLock);
+
+    aaudio_result_t getFreeRunningPosition(int64_t *positionFrames, int64_t *timeNanos) override
+             EXCLUDES(mMmapStreamLock);
 
     aaudio_result_t getTimestamp(int64_t *positionFrames, int64_t *timeNanos) override;
 
@@ -73,23 +81,42 @@ public:
     // -------------- Callback functions for MmapStreamCallback ---------------------
     void onTearDown(audio_port_handle_t portHandle) override;
 
-    void onVolumeChanged(audio_channel_mask_t channels,
-                         android::Vector<float> values) override;
+    void onVolumeChanged(float volume) override;
 
     void onRoutingChanged(audio_port_handle_t portHandle) override;
     // ------------------------------------------------------------------------------
 
-    aaudio_result_t getDownDataDescription(AudioEndpointParcelable &parcelable);
+    aaudio_result_t getDownDataDescription(AudioEndpointParcelable* parcelable);
 
     int64_t getHardwareTimeOffsetNanos() const {
         return mHardwareTimeOffsetNanos;
     }
 
+    aaudio_result_t getExternalPosition(uint64_t *positionFrames, int64_t *timeNanos)
+            EXCLUDES(mMmapStreamLock);
+
+    int64_t nextDataReportTime() EXCLUDES(mMmapStreamLock);
+
+    void reportData() EXCLUDES(mMmapStreamLock);
+
 private:
+
+    /**
+     *
+     * @return true if mMapStream was cleared
+     */
+    bool close_l() REQUIRES(mMmapStreamLock);
+
+    aaudio_result_t openWithConfig(audio_config_base_t* config) EXCLUDES(mMmapStreamLock);
+
+    aaudio_result_t createMmapBuffer_l() REQUIRES(mMmapStreamLock);
+
     MonotonicCounter                          mFramesTransferred;
 
     // Interface to the AudioFlinger MMAP support.
-    android::sp<android::MmapStreamInterface> mMmapStream;
+    mutable std::mutex                        mMmapStreamLock;
+    android::sp<android::MmapStreamInterface> mMmapStream GUARDED_BY(mMmapStreamLock);
+
     struct audio_mmap_buffer_info             mMmapBufferinfo;
 
     // There is only one port associated with an MMAP endpoint.
@@ -97,9 +124,17 @@ private:
 
     android::AAudioService                    &mAAudioService;
 
-    android::base::unique_fd                  mAudioDataFileDescriptor;
+    std::unique_ptr<SharedMemoryWrapper>      mAudioDataWrapper;
 
     int64_t                                   mHardwareTimeOffsetNanos = 0; // TODO get from HAL
+
+    aaudio_result_t                           mHalExternalPositionStatus = AAUDIO_OK;
+    uint64_t                                  mLastPositionFrames = 0;
+    int64_t                                   mTimestampNanosForLastPosition = 0;
+    int32_t                                   mTimestampGracePeriodMs;
+    int32_t                                   mFrozenPositionCount = 0;
+    int32_t                                   mFrozenTimestampCount = 0;
+    int64_t                                   mDataReportOffsetNanos = 0;
 
 };
 

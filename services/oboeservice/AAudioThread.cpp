@@ -16,9 +16,10 @@
 
 #define LOG_TAG "AAudioThread"
 //#define LOG_NDEBUG 0
-#include <utils/Log.h>
 
-#include <pthread.h>
+#include <system_error>
+
+#include <utils/Log.h>
 
 #include <aaudio/AAudio.h>
 #include <utility/AAudioUtilities.h>
@@ -37,10 +38,13 @@ AAudioThread::AAudioThread() {
     setup("AAudio");
 }
 
-void AAudioThread::setup(const char *prefix) {
-    // mThread is a pthread_t of unknown size so we need memset().
-    memset(&mThread, 0, sizeof(mThread));
+AAudioThread::~AAudioThread() {
+    ALOGE_IF(mThread.get_id() == std::this_thread::get_id(),
+            "%s() destructor running in thread", __func__);
+    ALOGE_IF(mHasThread, "%s() thread never joined", __func__);
+}
 
+void AAudioThread::setup(const char *prefix) {
     // Name the thread with an increasing index, "prefix_#", for debugging.
     uint32_t index = mNextThreadIndex++;
     // Wrap the index so that we do not hit the 16 char limit
@@ -57,46 +61,37 @@ void AAudioThread::dispatch() {
     }
 }
 
-// This is the entry point for the new thread created by createThread().
-// It converts the 'C' function call to a C++ method call.
-static void * AAudioThread_internalThreadProc(void *arg) {
-    AAudioThread *aaudioThread = (AAudioThread *) arg;
-    aaudioThread->dispatch();
-    return nullptr;
-}
-
 aaudio_result_t AAudioThread::start(Runnable *runnable) {
     if (mHasThread) {
         ALOGE("start() - mHasThread already true");
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    // mRunnable will be read by the new thread when it starts.
-    // pthread_create() forces a memory synchronization so mRunnable does not need to be atomic.
+    // mRunnable will be read by the new thread when it starts. A std::thread is created.
     mRunnable = runnable;
-    int err = pthread_create(&mThread, nullptr, AAudioThread_internalThreadProc, this);
-    if (err != 0) {
-        ALOGE("start() - pthread_create() returned %d %s", err, strerror(err));
-        return AAudioConvert_androidToAAudioResult(-err);
-    } else {
-        int err = pthread_setname_np(mThread, mName);
-        ALOGW_IF((err != 0), "Could not set name of AAudioThread. err = %d", err);
-        mHasThread = true;
-        return AAUDIO_OK;
-    }
+    mHasThread = true;
+    mThread = std::thread(&AAudioThread::dispatch, this);
+    return AAUDIO_OK;
 }
 
 aaudio_result_t AAudioThread::stop() {
     if (!mHasThread) {
-        ALOGE("stop() but no thread running");
+        // There can be cases that the thread is just created but not started.
+        // Logging as warning to attract attention but not too serious.
+        ALOGW("stop() but no thread running");
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    int err = pthread_join(mThread, nullptr);
-    mHasThread = false;
-    if (err != 0) {
-        ALOGE("stop() - pthread_join() returned %d %s", err, strerror(err));
-        return AAudioConvert_androidToAAudioResult(-err);
-    } else {
+
+    if (mThread.get_id() == std::this_thread::get_id()) {
+        // The thread must not be joined by itself.
+        ALOGE("%s() attempt to join() from launched thread!", __func__);
+        return AAUDIO_ERROR_INTERNAL;
+    } else if (mThread.joinable()) {
+        // Double check if the thread is joinable to avoid exception when calling join.
+        mThread.join();
+        mHasThread = false;
         return AAUDIO_OK;
+    } else {
+        ALOGE("%s() the thread is not joinable", __func__);
+        return AAUDIO_ERROR_INTERNAL;
     }
 }
-

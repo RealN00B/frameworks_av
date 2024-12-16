@@ -23,13 +23,17 @@
 
 #include <aaudio/AAudio.h>
 #include <system/audio.h>
-#include "utility/AudioClock.h"
+
+#include "core/AudioGlobal.h"
 #include "legacy/AudioStreamLegacy.h"
 #include "legacy/AudioStreamTrack.h"
+#include "utility/AudioClock.h"
 #include "utility/FixedBlockReader.h"
 
 using namespace android;
 using namespace aaudio;
+
+using android::content::AttributionSourceState;
 
 // Arbitrary and somewhat generous number of bursts.
 #define DEFAULT_BURSTS_PER_BUFFER_CAPACITY     8
@@ -62,24 +66,27 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
     const aaudio_session_id_t requestedSessionId = builder.getSessionId();
     const audio_session_t sessionId = AAudioConvert_aaudioToAndroidSessionId(requestedSessionId);
 
-    // Try to create an AudioTrack
-    // Use stereo if unspecified.
-    int32_t samplesPerFrame = (getSamplesPerFrame() == AAUDIO_UNSPECIFIED)
-                              ? 2 : getSamplesPerFrame();
-    audio_channel_mask_t channelMask = samplesPerFrame <= 2 ?
-                            audio_channel_out_mask_from_count(samplesPerFrame) :
-                            audio_channel_mask_for_index_assignment_from_count(samplesPerFrame);
+    audio_channel_mask_t channelMask =
+            AAudio_getChannelMaskForOpen(getChannelMask(), getSamplesPerFrame(), false /*isInput*/);
 
+    // Set flags based on selected parameters.
     audio_output_flags_t flags;
     aaudio_performance_mode_t perfMode = getPerformanceMode();
     switch(perfMode) {
-        case AAUDIO_PERFORMANCE_MODE_LOW_LATENCY:
+        case AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: {
             // Bypass the normal mixer and go straight to the FAST mixer.
-            // If the app asks for a sessionId then it means they want to use effects.
-            // So don't use RAW flag.
-            flags = (audio_output_flags_t) ((requestedSessionId == AAUDIO_SESSION_ID_NONE)
-                    ? (AUDIO_OUTPUT_FLAG_FAST | AUDIO_OUTPUT_FLAG_RAW)
-                    : (AUDIO_OUTPUT_FLAG_FAST));
+            // Some Usages need RAW mode so they can get the lowest possible latency.
+            // Other Usages should avoid RAW because it can interfere with
+            // dual sink routing or other features.
+            bool usageBenefitsFromRaw = getUsage() == AAUDIO_USAGE_GAME ||
+                    getUsage() == AAUDIO_USAGE_MEDIA;
+            // If an app does not ask for a sessionId then there will be no effects.
+            // So we can use the use RAW flag.
+            flags = (audio_output_flags_t) (((requestedSessionId == AAUDIO_SESSION_ID_NONE)
+                                             && usageBenefitsFromRaw)
+                                            ? (AUDIO_OUTPUT_FLAG_FAST | AUDIO_OUTPUT_FLAG_RAW)
+                                            : (AUDIO_OUTPUT_FLAG_FAST));
+        }
             break;
 
         case AAUDIO_PERFORMANCE_MODE_POWER_SAVING:
@@ -96,6 +103,7 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
 
     size_t frameCount = (size_t)builder.getBufferCapacity();
 
+    // To avoid glitching, let AudioFlinger pick the optimal burst size.
     int32_t notificationFrames = 0;
 
     const audio_format_t format = (getFormat() == AUDIO_FORMAT_DEFAULT)
@@ -103,14 +111,12 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
             : getFormat();
 
     // Setup the callback if there is one.
-    AudioTrack::callback_t callback = nullptr;
-    void *callbackData = nullptr;
+    wp<AudioTrack::IAudioTrackCallback> callback;
     // Note that TRANSFER_SYNC does not allow FAST track
     AudioTrack::transfer_type streamTransferType = AudioTrack::transfer_type::TRANSFER_SYNC;
     if (builder.getDataCallbackProc() != nullptr) {
         streamTransferType = AudioTrack::transfer_type::TRANSFER_CALLBACK;
-        callback = getLegacyCallback();
-        callbackData = this;
+        callback = wp<AudioTrack::IAudioTrackCallback>::fromExisting(this);
 
         // If the total buffer size is unspecified then base the size on the burst size.
         if (frameCount == 0
@@ -118,8 +124,6 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
             // Take advantage of a special trick that allows us to create a buffer
             // that is some multiple of the burst size.
             notificationFrames = 0 - DEFAULT_BURSTS_PER_BUFFER_CAPACITY;
-        } else {
-            notificationFrames = builder.getFramesPerDataCallback();
         }
     }
     mCallbackBufferSize = builder.getFramesPerDataCallback();
@@ -136,8 +140,11 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
             AAudioConvert_contentTypeToInternal(builder.getContentType());
     const audio_usage_t usage =
             AAudioConvert_usageToInternal(builder.getUsage());
-    const audio_flags_mask_t attributesFlags =
-        AAudioConvert_allowCapturePolicyToAudioFlagsMask(builder.getAllowedCapturePolicy());
+    const audio_flags_mask_t attributesFlags = AAudio_computeAudioFlagsMask(
+                                                            builder.getAllowedCapturePolicy(),
+                                                            builder.getSpatializationBehavior(),
+                                                            builder.isContentSpatialized(),
+                                                            flags);
 
     const audio_attributes_t attributes = {
             .content_type = contentType,
@@ -148,6 +155,7 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
     };
 
     mAudioTrack = new AudioTrack();
+    // TODO b/182392769: use attribution source util
     mAudioTrack->set(
             AUDIO_STREAM_DEFAULT,  // ignored because we pass attributes below
             getSampleRate(),
@@ -156,15 +164,13 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
             frameCount,
             flags,
             callback,
-            callbackData,
             notificationFrames,
-            0,       // DEFAULT sharedBuffer*/,
+            nullptr,       // DEFAULT sharedBuffer*/,
             false,   // DEFAULT threadCanCallJava
             sessionId,
             streamTransferType,
-            NULL,    // DEFAULT audio_offload_info_t
-            AUDIO_UID_INVALID, // DEFAULT uid
-            -1,      // DEFAULT pid
+            nullptr,    // DEFAULT audio_offload_info_t
+            AttributionSourceState(), // DEFAULT uid and pid
             &attributes,
             // WARNING - If doNotReconnect set true then audio stops after plugging and unplugging
             // headphones a few times.
@@ -179,26 +185,41 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
     // Did we get a valid track?
     status_t status = mAudioTrack->initCheck();
     if (status != NO_ERROR) {
-        releaseCloseFinal();
+        safeReleaseClose();
         ALOGE("open(), initCheck() returned %d", status);
         return AAudioConvert_androidToAAudioResult(status);
     }
 
     mMetricsId = std::string(AMEDIAMETRICS_KEY_PREFIX_AUDIO_TRACK)
             + std::to_string(mAudioTrack->getPortId());
+    android::mediametrics::LogItem(mMetricsId)
+            .set(AMEDIAMETRICS_PROP_PERFORMANCEMODE,
+                 AudioGlobal_convertPerformanceModeToText(builder.getPerformanceMode()))
+            .set(AMEDIAMETRICS_PROP_SHARINGMODE,
+                 AudioGlobal_convertSharingModeToText(builder.getSharingMode()))
+            .set(AMEDIAMETRICS_PROP_ENCODINGCLIENT, toString(getFormat()).c_str()).record();
 
     doSetVolume();
 
     // Get the actual values from the AudioTrack.
-    setSamplesPerFrame(mAudioTrack->channelCount());
+    setChannelMask(AAudioConvert_androidToAAudioChannelMask(
+        mAudioTrack->channelMask(), false /*isInput*/,
+        AAudio_isChannelIndexMask(getChannelMask())));
     setFormat(mAudioTrack->format());
     setDeviceFormat(mAudioTrack->format());
+    setSampleRate(mAudioTrack->getSampleRate());
+    setBufferCapacity(getBufferCapacityFromDevice());
+    setFramesPerBurst(getFramesPerBurstFromDevice());
 
-    int32_t actualSampleRate = mAudioTrack->getSampleRate();
-    ALOGW_IF(actualSampleRate != getSampleRate(),
-             "open() sampleRate changed from %d to %d",
-             getSampleRate(), actualSampleRate);
-    setSampleRate(actualSampleRate);
+    // Use the same values for device values.
+    setDeviceSamplesPerFrame(getSamplesPerFrame());
+    setDeviceSampleRate(mAudioTrack->getSampleRate());
+    setDeviceBufferCapacity(getBufferCapacityFromDevice());
+    setDeviceFramesPerBurst(getFramesPerBurstFromDevice());
+
+    setHardwareSamplesPerFrame(mAudioTrack->getHalChannelCount());
+    setHardwareSampleRate(mAudioTrack->getHalSampleRate());
+    setHardwareFormat(mAudioTrack->getHalFormat());
 
     // We may need to pass the data through a block size adapter to guarantee constant size.
     if (mCallbackBufferSize != AAUDIO_UNSPECIFIED) {
@@ -212,7 +233,6 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
         mBlockAdapter = nullptr;
     }
 
-    setState(AAUDIO_STREAM_STATE_OPEN);
     setDeviceId(mAudioTrack->getRoutedDeviceId());
 
     aaudio_session_id_t actualSessionId =
@@ -220,9 +240,6 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
             ? AAUDIO_SESSION_ID_NONE
             : (aaudio_session_id_t) mAudioTrack->getSessionId();
     setSessionId(actualSessionId);
-
-    mInitialBufferCapacity = getBufferCapacity();
-    mInitialFramesPerBurst = getFramesPerBurst();
 
     mAudioTrack->addAudioDeviceCallback(this);
 
@@ -240,14 +257,27 @@ aaudio_result_t AudioStreamTrack::open(const AudioStreamBuilder& builder)
 
     setSharingMode(AAUDIO_SHARING_MODE_SHARED); // EXCLUSIVE mode not supported in legacy
 
-    // Log warning if we did not get what we asked for.
-    ALOGW_IF(actualFlags != flags,
+    // Log if we did not get what we asked for.
+    ALOGD_IF(actualFlags != flags,
              "open() flags changed from 0x%08X to 0x%08X",
              flags, actualFlags);
-    ALOGW_IF(actualPerformanceMode != perfMode,
+    ALOGD_IF(actualPerformanceMode != perfMode,
              "open() perfMode changed from %d to %d",
              perfMode, actualPerformanceMode);
 
+    if (getState() != AAUDIO_STREAM_STATE_UNINITIALIZED) {
+        ALOGE("%s - Open canceled since state = %d", __func__, getState());
+        if (isDisconnected())
+        {
+            ALOGE("%s - Opening while state is disconnected", __func__);
+            safeReleaseClose();
+            return AAUDIO_ERROR_DISCONNECTED;
+        }
+        safeReleaseClose();
+        return AAUDIO_ERROR_INVALID_STATE;
+    }
+
+    setState(AAUDIO_STREAM_STATE_OPEN);
     return AAUDIO_OK;
 }
 
@@ -264,43 +294,37 @@ aaudio_result_t AudioStreamTrack::release_l() {
 }
 
 void AudioStreamTrack::close_l() {
-    // Stop callbacks before deleting mFixedBlockReader memory.
+    // The callbacks are normally joined in the AudioTrack destructor.
+    // But if another object has a reference to the AudioTrack then
+    // it will not get deleted here.
+    // So we should join callbacks explicitly before returning.
+    // Unlock around the join to avoid deadlocks if the callback tries to lock.
+    // This can happen if the callback returns AAUDIO_CALLBACK_RESULT_STOP
+    mStreamLock.unlock();
+    mAudioTrack->stopAndJoinCallbacks();
+    mStreamLock.lock();
     mAudioTrack.clear();
-    // Do not close mFixedBlockReader because a data callback
-    // thread might still be running if someone else has a reference
-    // to mAudioRecord.
-    // It has a unique_ptr to its buffer so it will clean up by itself.
+    // Do not close mFixedBlockReader. It has a unique_ptr to its buffer
+    // so it will clean up by itself.
     AudioStream::close_l();
 }
 
-void AudioStreamTrack::processCallback(int event, void *info) {
 
-    switch (event) {
-        case AudioTrack::EVENT_MORE_DATA:
-            processCallbackCommon(AAUDIO_CALLBACK_OPERATION_PROCESS_DATA, info);
-            break;
-
-            // Stream got rerouted so we disconnect.
-        case AudioTrack::EVENT_NEW_IAUDIOTRACK:
-            // request stream disconnect if the restored AudioTrack has properties not matching
-            // what was requested initially
-            if (mAudioTrack->channelCount() != getSamplesPerFrame()
-                    || mAudioTrack->format() != getFormat()
-                    || mAudioTrack->getSampleRate() != getSampleRate()
-                    || mAudioTrack->getRoutedDeviceId() != getDeviceId()
-                    || getBufferCapacity() != mInitialBufferCapacity
-                    || getFramesPerBurst() != mInitialFramesPerBurst) {
-                processCallbackCommon(AAUDIO_CALLBACK_OPERATION_DISCONNECTED, info);
-            }
-            break;
-
-        default:
-            break;
+void AudioStreamTrack::onNewIAudioTrack() {
+    // Stream got rerouted so we disconnect.
+    // request stream disconnect if the restored AudioTrack has properties not matching
+    // what was requested initially
+    if (mAudioTrack->channelCount() != getSamplesPerFrame()
+          || mAudioTrack->format() != getFormat()
+          || mAudioTrack->getSampleRate() != getSampleRate()
+          || mAudioTrack->getRoutedDeviceId() != getDeviceId()
+          || getBufferCapacityFromDevice() != getBufferCapacity()
+          || getFramesPerBurstFromDevice() != getFramesPerBurst()) {
+        AudioStreamLegacy::onNewIAudioTrack();
     }
-    return;
 }
 
-aaudio_result_t AudioStreamTrack::requestStart() {
+aaudio_result_t AudioStreamTrack::requestStart_l() {
     if (mAudioTrack.get() == nullptr) {
         ALOGE("requestStart() no AudioTrack");
         return AAUDIO_ERROR_INVALID_STATE;
@@ -327,7 +351,7 @@ aaudio_result_t AudioStreamTrack::requestStart() {
     return AAUDIO_OK;
 }
 
-aaudio_result_t AudioStreamTrack::requestPause() {
+aaudio_result_t AudioStreamTrack::requestPause_l() {
     if (mAudioTrack.get() == nullptr) {
         ALOGE("%s() no AudioTrack", __func__);
         return AAUDIO_ERROR_INVALID_STATE;
@@ -343,7 +367,7 @@ aaudio_result_t AudioStreamTrack::requestPause() {
     return checkForDisconnectRequest(false);
 }
 
-aaudio_result_t AudioStreamTrack::requestFlush() {
+aaudio_result_t AudioStreamTrack::requestFlush_l() {
     if (mAudioTrack.get() == nullptr) {
         ALOGE("%s() no AudioTrack", __func__);
         return AAUDIO_ERROR_INVALID_STATE;
@@ -357,7 +381,7 @@ aaudio_result_t AudioStreamTrack::requestFlush() {
     return AAUDIO_OK;
 }
 
-aaudio_result_t AudioStreamTrack::requestStop() {
+aaudio_result_t AudioStreamTrack::requestStop_l() {
     if (mAudioTrack.get() == nullptr) {
         ALOGE("%s() no AudioTrack", __func__);
         return AAUDIO_ERROR_INVALID_STATE;
@@ -373,8 +397,7 @@ aaudio_result_t AudioStreamTrack::requestStop() {
     return checkForDisconnectRequest(false);;
 }
 
-aaudio_result_t AudioStreamTrack::updateStateMachine()
-{
+aaudio_result_t AudioStreamTrack::processCommands() {
     status_t err;
     aaudio_wrapping_frames_t position;
     switch (getState()) {
@@ -402,7 +425,6 @@ aaudio_result_t AudioStreamTrack::updateStateMachine()
             if (err != OK) {
                 return AAudioConvert_androidToAAudioResult(err);
             } else if (position == 0) {
-                // TODO Advance frames read to match written.
                 setState(AAUDIO_STREAM_STATE_FLUSHED);
             }
         }
@@ -429,7 +451,7 @@ aaudio_result_t AudioStreamTrack::write(const void *buffer,
         return result;
     }
 
-    if (getState() == AAUDIO_STREAM_STATE_DISCONNECTED) {
+    if (isDisconnected()) {
         return AAUDIO_ERROR_DISCONNECTED;
     }
 
@@ -443,7 +465,7 @@ aaudio_result_t AudioStreamTrack::write(const void *buffer,
         // in this context, a DEAD_OBJECT is more likely to be a disconnect notification due to
         // AudioTrack invalidation
         if (bytesWritten == DEAD_OBJECT) {
-            setState(AAUDIO_STREAM_STATE_DISCONNECTED);
+            setDisconnected();
             return AAUDIO_ERROR_DISCONNECTED;
         }
         return AAudioConvert_androidToAAudioResult(bytesWritten);
@@ -478,7 +500,7 @@ int32_t AudioStreamTrack::getBufferSize() const
     return static_cast<int32_t>(mAudioTrack->getBufferSizeInFrames());
 }
 
-int32_t AudioStreamTrack::getBufferCapacity() const
+int32_t AudioStreamTrack::getBufferCapacityFromDevice() const
 {
     return static_cast<int32_t>(mAudioTrack->frameCount());
 }
@@ -488,8 +510,7 @@ int32_t AudioStreamTrack::getXRunCount() const
     return static_cast<int32_t>(mAudioTrack->getUnderrunCount());
 }
 
-int32_t AudioStreamTrack::getFramesPerBurst() const
-{
+int32_t AudioStreamTrack::getFramesPerBurstFromDevice() const {
     return static_cast<int32_t>(mAudioTrack->getNotificationPeriodInFrames());
 }
 
@@ -504,7 +525,7 @@ int64_t AudioStreamTrack::getFramesRead() {
     case AAUDIO_STREAM_STATE_PAUSED:
         result = mAudioTrack->getPosition(&position);
         if (result == OK) {
-            mFramesRead.update32(position);
+            mFramesRead.update32((int32_t)position);
         }
         break;
     default:
@@ -549,6 +570,16 @@ status_t AudioStreamTrack::doSetVolume() {
     return status;
 }
 
+void AudioStreamTrack::registerPlayerBase() {
+    AudioStream::registerPlayerBase();
+
+    if (mAudioTrack == nullptr) {
+        ALOGW("%s: cannot set piid, AudioTrack is null", __func__);
+        return;
+    }
+    mAudioTrack->setPlayerIId(mPlayerBase->getPlayerIId());
+}
+
 #if AAUDIO_USE_VOLUME_SHAPER
 
 using namespace android::media::VolumeShaper;
@@ -566,7 +597,7 @@ binder::Status AudioStreamTrack::applyVolumeShaper(
         if (status < 0) { // a non-negative value is the volume shaper id.
             ALOGE("applyVolumeShaper() failed with status %d", status);
         }
-        return binder::Status::fromStatusT(status);
+        return aidl_utils::binderStatusFromStatusT(status);
     } else {
         ALOGD("applyVolumeShaper()"
                       " no AudioTrack for volume control from IPlayer");

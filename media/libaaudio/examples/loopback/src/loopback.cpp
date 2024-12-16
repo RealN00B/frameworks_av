@@ -36,8 +36,12 @@
 #include "AAudioSimpleRecorder.h"
 #include "AAudioExampleUtils.h"
 
+// Get logging macros from OboeTester
+#include "android_debug.h"
+// Get signal analyzers from OboeTester
 #include "analyzer/GlitchAnalyzer.h"
 #include "analyzer/LatencyAnalyzer.h"
+
 #include "../../utils/AAudioExampleUtils.h"
 
 // V0.4.00 = rectify and low-pass filter the echos, auto-correlate entire echo
@@ -45,8 +49,9 @@
 //           fix -n option to set output buffer for -tm
 //           plot first glitch
 // V0.4.02 = allow -n0 for minimal buffer size
-// V0.5.00 = use latency analyzer from OboeTester, uses random noise for latency
-#define APP_VERSION             "0.5.00"
+// V0.5.00 = use latency analyzer copied from OboeTester, uses random noise for latency
+// V0.5.01 = use latency analyzer directly from OboeTester in external/oboe
+#define APP_VERSION             "0.5.01"
 
 // Tag for machine readable results as property = value pairs
 #define RESULT_TAG              "RESULT: "
@@ -103,7 +108,7 @@ struct LoopbackData {
     aaudio_result_t    outputError = AAUDIO_OK;
 
     GlitchAnalyzer     sineAnalyzer;
-    PulseLatencyAnalyzer echoAnalyzer;
+    WhiteNoiseLatencyAnalyzer echoAnalyzer;
     AudioRecording     audioRecording;
     LoopbackProcessor *loopbackProcessor;
 
@@ -318,7 +323,6 @@ static void usage() {
     printf("      -C{channels}      number of input channels\n");
     printf("      -D{deviceId}      input device ID\n");
     printf("      -F{0,1,2}         input format, 1=I16, 2=FLOAT\n");
-    printf("      -g{gain}          recirculating loopback gain\n");
     printf("      -h{hangMillis}    occasionally hang in the callback\n");
     printf("      -P{inPerf}        set input AAUDIO_PERFORMANCE_MODE*\n");
     printf("          n for _NONE\n");
@@ -431,7 +435,6 @@ int main(int argc, const char **argv)
     int                   written                    = 0;
 
     int                   testMode                   = TEST_LATENCY;
-    double                gain                       = 1.0;
     int                   hangTimeMillis             = 0;
     std::string           report;
 
@@ -462,9 +465,6 @@ int main(int argc, const char **argv)
                         break;
                     case 'F':
                         requestedInputFormat = atoi(&arg[2]);
-                        break;
-                    case 'g':
-                        gain = atof(&arg[2]);
                         break;
                     case 'h':
                         // Was there a number after the "-h"?

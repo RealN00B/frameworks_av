@@ -16,23 +16,27 @@
 
 #define LOG_TAG "AAudio"
 //#define LOG_NDEBUG 0
-#include <utils/Log.h>
 
-#include <cutils/properties.h>
+#include <assert.h>
+#include <math.h>
 #include <stdint.h>
+
+#include <aaudio/AAudioTesting.h>
+#include <android/media/audio/common/AudioMMapPolicy.h>
+#include <cutils/properties.h>
 #include <sys/types.h>
+#include <system/audio.h>
 #include <utils/Errors.h>
+#include <utils/Log.h>
 
 #include "aaudio/AAudio.h"
 #include "core/AudioGlobal.h"
-#include <aaudio/AAudioTesting.h>
-#include <math.h>
-#include <system/audio.h>
-#include <assert.h>
-
 #include "utility/AAudioUtilities.h"
 
 using namespace android;
+
+using android::media::audio::common::AudioMMapPolicy;
+using android::media::audio::common::AudioMMapPolicyInfo;
 
 status_t AAudioConvert_aaudioToAndroidStatus(aaudio_result_t result) {
     // This covers the case for AAUDIO_OK and for positive results.
@@ -134,6 +138,15 @@ audio_format_t AAudioConvert_aaudioToAndroidDataFormat(aaudio_format_t aaudioFor
     case AAUDIO_FORMAT_PCM_FLOAT:
         androidFormat = AUDIO_FORMAT_PCM_FLOAT;
         break;
+    case AAUDIO_FORMAT_PCM_I24_PACKED:
+        androidFormat = AUDIO_FORMAT_PCM_24_BIT_PACKED;
+        break;
+    case AAUDIO_FORMAT_PCM_I32:
+        androidFormat = AUDIO_FORMAT_PCM_32_BIT;
+        break;
+    case AAUDIO_FORMAT_IEC61937:
+        androidFormat = AUDIO_FORMAT_IEC61937;
+        break;
     default:
         androidFormat = AUDIO_FORMAT_INVALID;
         ALOGE("%s() 0x%08X unrecognized", __func__, aaudioFormat);
@@ -154,12 +167,32 @@ aaudio_format_t AAudioConvert_androidToAAudioDataFormat(audio_format_t androidFo
     case AUDIO_FORMAT_PCM_FLOAT:
         aaudioFormat = AAUDIO_FORMAT_PCM_FLOAT;
         break;
+    case AUDIO_FORMAT_PCM_24_BIT_PACKED:
+        aaudioFormat = AAUDIO_FORMAT_PCM_I24_PACKED;
+        break;
+    case AUDIO_FORMAT_PCM_32_BIT:
+        aaudioFormat = AAUDIO_FORMAT_PCM_I32;
+        break;
+    case AUDIO_FORMAT_IEC61937:
+        aaudioFormat = AAUDIO_FORMAT_IEC61937;
+        break;
     default:
         aaudioFormat = AAUDIO_FORMAT_INVALID;
         ALOGE("%s() 0x%08X unrecognized", __func__, androidFormat);
         break;
     }
     return aaudioFormat;
+}
+
+aaudio_format_t AAudioConvert_androidToNearestAAudioDataFormat(audio_format_t androidFormat) {
+    // Special case AUDIO_FORMAT_PCM_8_24_BIT because this function should be used to find the
+    // resolution of the data format. Setting AUDIO_FORMAT_PCM_8_24_BIT directly is not available
+    // from AAudio but hardware may use AUDIO_FORMAT_PCM_8_24_BIT under the hood.
+    if (androidFormat == AUDIO_FORMAT_PCM_8_24_BIT) {
+        ALOGD("%s() converting 8.24 to 24 bit packed", __func__);
+        return AAUDIO_FORMAT_PCM_I24_PACKED;
+    }
+    return AAudioConvert_androidToAAudioDataFormat(androidFormat);
 }
 
 // Make a message string from the condition.
@@ -222,26 +255,302 @@ audio_source_t AAudioConvert_inputPresetToAudioSource(aaudio_input_preset_t pres
     return (audio_source_t) preset; // same value
 }
 
-audio_flags_mask_t AAudioConvert_allowCapturePolicyToAudioFlagsMask(
-        aaudio_allowed_capture_policy_t policy) {
+audio_flags_mask_t AAudio_computeAudioFlagsMask(
+        aaudio_allowed_capture_policy_t policy,
+        aaudio_spatialization_behavior_t spatializationBehavior,
+        bool isContentSpatialized,
+        audio_output_flags_t outputFlags) {
+    audio_flags_mask_t flagsMask = AUDIO_FLAG_NONE;
     switch (policy) {
         case AAUDIO_UNSPECIFIED:
         case AAUDIO_ALLOW_CAPTURE_BY_ALL:
-            return AUDIO_FLAG_NONE;
+            // flagsMask is not modified
+            break;
         case AAUDIO_ALLOW_CAPTURE_BY_SYSTEM:
-            return AUDIO_FLAG_NO_MEDIA_PROJECTION;
+            flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_NO_MEDIA_PROJECTION);
+            break;
         case AAUDIO_ALLOW_CAPTURE_BY_NONE:
-            return static_cast<audio_flags_mask_t>(
+            flagsMask = static_cast<audio_flags_mask_t>(flagsMask |
                     AUDIO_FLAG_NO_MEDIA_PROJECTION | AUDIO_FLAG_NO_SYSTEM_CAPTURE);
+            break;
         default:
-            ALOGE("%s() 0x%08X unrecognized", __func__, policy);
-            return AUDIO_FLAG_NONE; //
+            ALOGE("%s() 0x%08X unrecognized capture policy", __func__, policy);
+            // flagsMask is not modified
     }
+
+    switch (spatializationBehavior) {
+        case AAUDIO_UNSPECIFIED:
+        case AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO:
+            // flagsMask is not modified
+            break;
+        case AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER:
+            flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_NEVER_SPATIALIZE);
+            break;
+        default:
+            ALOGE("%s() 0x%08X unrecognized spatialization behavior",
+                  __func__, spatializationBehavior);
+            // flagsMask is not modified
+    }
+
+    if (isContentSpatialized) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_CONTENT_SPATIALIZED);
+    }
+
+    if ((outputFlags & AUDIO_OUTPUT_FLAG_HW_AV_SYNC) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_HW_AV_SYNC);
+    }
+    if ((outputFlags & AUDIO_OUTPUT_FLAG_FAST) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_LOW_LATENCY);
+    } else if ((outputFlags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_DEEP_BUFFER);
+    }
+
+    return flagsMask;
 }
 
 audio_flags_mask_t AAudioConvert_privacySensitiveToAudioFlagsMask(
         bool privacySensitive) {
     return privacySensitive ? AUDIO_FLAG_CAPTURE_PRIVATE : AUDIO_FLAG_NONE;
+}
+
+audio_channel_mask_t AAudioConvert_aaudioToAndroidChannelLayoutMask(
+        aaudio_channel_mask_t channelMask, bool isInput) {
+    if (isInput) {
+        switch (channelMask) {
+            case AAUDIO_CHANNEL_MONO:
+                return AUDIO_CHANNEL_IN_MONO;
+            case AAUDIO_CHANNEL_STEREO:
+                return AUDIO_CHANNEL_IN_STEREO;
+            case AAUDIO_CHANNEL_FRONT_BACK:
+                return AUDIO_CHANNEL_IN_FRONT_BACK;
+            case AAUDIO_CHANNEL_2POINT0POINT2:
+                return AUDIO_CHANNEL_IN_2POINT0POINT2;
+            case AAUDIO_CHANNEL_2POINT1POINT2:
+                return AUDIO_CHANNEL_IN_2POINT1POINT2;
+            case AAUDIO_CHANNEL_3POINT0POINT2:
+                return AUDIO_CHANNEL_IN_3POINT0POINT2;
+            case AAUDIO_CHANNEL_3POINT1POINT2:
+                return AUDIO_CHANNEL_IN_3POINT1POINT2;
+            case AAUDIO_CHANNEL_5POINT1:
+                return AUDIO_CHANNEL_IN_5POINT1;
+            default:
+                ALOGE("%s() %#x unrecognized", __func__, channelMask);
+                return AUDIO_CHANNEL_INVALID;
+        }
+    } else {
+        switch (channelMask) {
+            case AAUDIO_CHANNEL_MONO:
+                return AUDIO_CHANNEL_OUT_MONO;
+            case AAUDIO_CHANNEL_STEREO:
+                return AUDIO_CHANNEL_OUT_STEREO;
+            case AAUDIO_CHANNEL_2POINT1:
+                return AUDIO_CHANNEL_OUT_2POINT1;
+            case AAUDIO_CHANNEL_TRI:
+                return AUDIO_CHANNEL_OUT_TRI;
+            case AAUDIO_CHANNEL_TRI_BACK:
+                return AUDIO_CHANNEL_OUT_TRI_BACK;
+            case AAUDIO_CHANNEL_3POINT1:
+                return AUDIO_CHANNEL_OUT_3POINT1;
+            case AAUDIO_CHANNEL_2POINT0POINT2:
+                return AUDIO_CHANNEL_OUT_2POINT0POINT2;
+            case AAUDIO_CHANNEL_2POINT1POINT2:
+                return AUDIO_CHANNEL_OUT_2POINT1POINT2;
+            case AAUDIO_CHANNEL_3POINT0POINT2:
+                return AUDIO_CHANNEL_OUT_3POINT0POINT2;
+            case AAUDIO_CHANNEL_3POINT1POINT2:
+                return AUDIO_CHANNEL_OUT_3POINT1POINT2;
+            case AAUDIO_CHANNEL_QUAD:
+                return AUDIO_CHANNEL_OUT_QUAD;
+            case AAUDIO_CHANNEL_QUAD_SIDE:
+                return AUDIO_CHANNEL_OUT_QUAD_SIDE;
+            case AAUDIO_CHANNEL_SURROUND:
+                return AUDIO_CHANNEL_OUT_SURROUND;
+            case AAUDIO_CHANNEL_PENTA:
+                return AUDIO_CHANNEL_OUT_PENTA;
+            case AAUDIO_CHANNEL_5POINT1:
+                return AUDIO_CHANNEL_OUT_5POINT1;
+            case AAUDIO_CHANNEL_5POINT1_SIDE:
+                return AUDIO_CHANNEL_OUT_5POINT1_SIDE;
+            case AAUDIO_CHANNEL_5POINT1POINT2:
+                return AUDIO_CHANNEL_OUT_5POINT1POINT2;
+            case AAUDIO_CHANNEL_5POINT1POINT4:
+                return AUDIO_CHANNEL_OUT_5POINT1POINT4;
+            case AAUDIO_CHANNEL_6POINT1:
+                return AUDIO_CHANNEL_OUT_6POINT1;
+            case AAUDIO_CHANNEL_7POINT1:
+                return AUDIO_CHANNEL_OUT_7POINT1;
+            case AAUDIO_CHANNEL_7POINT1POINT2:
+                return AUDIO_CHANNEL_OUT_7POINT1POINT2;
+            case AAUDIO_CHANNEL_7POINT1POINT4:
+                return AUDIO_CHANNEL_OUT_7POINT1POINT4;
+            case AAUDIO_CHANNEL_9POINT1POINT4:
+                return AUDIO_CHANNEL_OUT_9POINT1POINT4;
+            case AAUDIO_CHANNEL_9POINT1POINT6:
+                return AUDIO_CHANNEL_OUT_9POINT1POINT6;
+            default:
+                ALOGE("%s() %#x unrecognized", __func__, channelMask);
+                return AUDIO_CHANNEL_INVALID;
+        }
+    }
+}
+
+aaudio_channel_mask_t AAudioConvert_androidToAAudioChannelLayoutMask(
+        audio_channel_mask_t channelMask, bool isInput) {
+    if (isInput) {
+        switch (channelMask) {
+            case AUDIO_CHANNEL_IN_MONO:
+                return AAUDIO_CHANNEL_MONO;
+            case AUDIO_CHANNEL_IN_STEREO:
+                return AAUDIO_CHANNEL_STEREO;
+            case AUDIO_CHANNEL_IN_FRONT_BACK:
+                return AAUDIO_CHANNEL_FRONT_BACK;
+            case AUDIO_CHANNEL_IN_2POINT0POINT2:
+                return AAUDIO_CHANNEL_2POINT0POINT2;
+            case AUDIO_CHANNEL_IN_2POINT1POINT2:
+                return AAUDIO_CHANNEL_2POINT1POINT2;
+            case AUDIO_CHANNEL_IN_3POINT0POINT2:
+                return AAUDIO_CHANNEL_3POINT0POINT2;
+            case AUDIO_CHANNEL_IN_3POINT1POINT2:
+                return AAUDIO_CHANNEL_3POINT1POINT2;
+            case AUDIO_CHANNEL_IN_5POINT1:
+                return AAUDIO_CHANNEL_5POINT1;
+            default:
+                ALOGE("%s() %#x unrecognized", __func__, channelMask);
+                return AAUDIO_CHANNEL_INVALID;
+        }
+    } else {
+        switch (channelMask) {
+            case AUDIO_CHANNEL_OUT_MONO:
+                return AAUDIO_CHANNEL_MONO;
+            case AUDIO_CHANNEL_OUT_STEREO:
+                return AAUDIO_CHANNEL_STEREO;
+            case AUDIO_CHANNEL_OUT_2POINT1:
+                return AAUDIO_CHANNEL_2POINT1;
+            case AUDIO_CHANNEL_OUT_TRI:
+                return AAUDIO_CHANNEL_TRI;
+            case AUDIO_CHANNEL_OUT_TRI_BACK:
+                return AAUDIO_CHANNEL_TRI_BACK;
+            case AUDIO_CHANNEL_OUT_3POINT1:
+                return AAUDIO_CHANNEL_3POINT1;
+            case AUDIO_CHANNEL_OUT_2POINT0POINT2:
+                return AAUDIO_CHANNEL_2POINT0POINT2;
+            case AUDIO_CHANNEL_OUT_2POINT1POINT2:
+                return AAUDIO_CHANNEL_2POINT1POINT2;
+            case AUDIO_CHANNEL_OUT_3POINT0POINT2:
+                return AAUDIO_CHANNEL_3POINT0POINT2;
+            case AUDIO_CHANNEL_OUT_3POINT1POINT2:
+                return AAUDIO_CHANNEL_3POINT1POINT2;
+            case AUDIO_CHANNEL_OUT_QUAD:
+                return AAUDIO_CHANNEL_QUAD;
+            case AUDIO_CHANNEL_OUT_QUAD_SIDE:
+                return AAUDIO_CHANNEL_QUAD_SIDE;
+            case AUDIO_CHANNEL_OUT_SURROUND:
+                return AAUDIO_CHANNEL_SURROUND;
+            case AUDIO_CHANNEL_OUT_PENTA:
+                return AAUDIO_CHANNEL_PENTA;
+            case AUDIO_CHANNEL_OUT_5POINT1:
+                return AAUDIO_CHANNEL_5POINT1;
+            case AUDIO_CHANNEL_OUT_5POINT1_SIDE:
+                return AAUDIO_CHANNEL_5POINT1_SIDE;
+            case AUDIO_CHANNEL_OUT_5POINT1POINT2:
+                return AAUDIO_CHANNEL_5POINT1POINT2;
+            case AUDIO_CHANNEL_OUT_5POINT1POINT4:
+                return AAUDIO_CHANNEL_5POINT1POINT4;
+            case AUDIO_CHANNEL_OUT_6POINT1:
+                return AAUDIO_CHANNEL_6POINT1;
+            case AUDIO_CHANNEL_OUT_7POINT1:
+                return AAUDIO_CHANNEL_7POINT1;
+            case AUDIO_CHANNEL_OUT_7POINT1POINT2:
+                return AAUDIO_CHANNEL_7POINT1POINT2;
+            case AUDIO_CHANNEL_OUT_7POINT1POINT4:
+                return AAUDIO_CHANNEL_7POINT1POINT4;
+            case AUDIO_CHANNEL_OUT_9POINT1POINT4:
+                return AAUDIO_CHANNEL_9POINT1POINT4;
+            case AUDIO_CHANNEL_OUT_9POINT1POINT6:
+                return AAUDIO_CHANNEL_9POINT1POINT6;
+            default:
+                ALOGE("%s() %#x unrecognized", __func__, channelMask);
+                return AAUDIO_CHANNEL_INVALID;
+        }
+    }
+}
+
+int32_t AAudioConvert_channelMaskToCount(aaudio_channel_mask_t channelMask) {
+    return __builtin_popcount(channelMask & ~AAUDIO_CHANNEL_BIT_INDEX);
+}
+
+aaudio_channel_mask_t AAudioConvert_channelCountToMask(int32_t channelCount) {
+    if (channelCount < 0 || channelCount > AUDIO_CHANNEL_COUNT_MAX) {
+        return AAUDIO_CHANNEL_INVALID;
+    }
+
+    if (channelCount == 0) {
+        return AAUDIO_UNSPECIFIED;
+    }
+
+    // Return index mask if the channel count is greater than 2.
+    return AAUDIO_CHANNEL_BIT_INDEX | ((1 << channelCount) - 1);
+}
+
+aaudio_channel_mask_t AAudioConvert_androidToAAudioChannelIndexMask(
+        audio_channel_mask_t channelMask) {
+    if (audio_channel_mask_get_representation(channelMask) != AUDIO_CHANNEL_REPRESENTATION_INDEX) {
+        ALOGE("%s() %#x not an index mask", __func__, channelMask);
+        return AAUDIO_CHANNEL_INVALID;
+    }
+    return (channelMask & ~AUDIO_CHANNEL_INDEX_HDR) | AAUDIO_CHANNEL_BIT_INDEX;
+}
+
+audio_channel_mask_t AAudioConvert_aaudioToAndroidChannelIndexMask(
+        aaudio_channel_mask_t channelMask) {
+    if (!AAudio_isChannelIndexMask(channelMask)) {
+        ALOGE("%s() %#x not an index mask", __func__, channelMask);
+        return AUDIO_CHANNEL_INVALID;
+    }
+    return audio_channel_mask_for_index_assignment_from_count(
+            AAudioConvert_channelMaskToCount(channelMask));
+}
+
+aaudio_channel_mask_t AAudioConvert_androidToAAudioChannelMask(
+        audio_channel_mask_t channelMask, bool isInput, bool indexMaskRequired) {
+    if (audio_channel_mask_get_representation(channelMask) == AUDIO_CHANNEL_REPRESENTATION_INDEX) {
+        return AAudioConvert_androidToAAudioChannelIndexMask(channelMask);
+    }
+    if (indexMaskRequired) {
+        // Require index mask, `channelMask` here is a position mask.
+        const int channelCount = isInput ? audio_channel_count_from_in_mask(channelMask)
+                                         : audio_channel_count_from_out_mask(channelMask);
+        return AAudioConvert_channelCountToMask(channelCount);
+    }
+    return AAudioConvert_androidToAAudioChannelLayoutMask(channelMask, isInput);
+}
+
+audio_channel_mask_t AAudioConvert_aaudioToAndroidChannelMask(
+        aaudio_channel_mask_t channelMask, bool isInput) {
+    return AAudio_isChannelIndexMask(channelMask)
+            ? AAudioConvert_aaudioToAndroidChannelIndexMask(channelMask)
+            : AAudioConvert_aaudioToAndroidChannelLayoutMask(channelMask, isInput);
+}
+
+bool AAudio_isChannelIndexMask(aaudio_channel_mask_t channelMask) {
+    return (channelMask & AAUDIO_CHANNEL_BIT_INDEX) == AAUDIO_CHANNEL_BIT_INDEX;
+}
+
+audio_channel_mask_t AAudio_getChannelMaskForOpen(
+        aaudio_channel_mask_t channelMask, int32_t samplesPerFrame, bool isInput) {
+    if (channelMask != AAUDIO_UNSPECIFIED) {
+        if (AAudio_isChannelIndexMask(channelMask) && samplesPerFrame <= 2) {
+            // When it is index mask and the count is less than 3, use position mask
+            // instead of index mask for opening a stream. This may need to be revisited
+            // when making channel index mask public.
+            return isInput ? audio_channel_in_mask_from_count(samplesPerFrame)
+                           : audio_channel_out_mask_from_count(samplesPerFrame);
+        }
+        return AAudioConvert_aaudioToAndroidChannelMask(channelMask, isInput);
+    }
+
+    // Return stereo when unspecified.
+    return isInput ? AUDIO_CHANNEL_IN_STEREO : AUDIO_CHANNEL_OUT_STEREO;
 }
 
 int32_t AAudioConvert_framesToBytes(int32_t numFrames,
@@ -264,45 +573,6 @@ int32_t AAudioConvert_framesToBytes(int32_t numFrames,
     return AAUDIO_OK;
 }
 
-static int32_t AAudioProperty_getMMapProperty(const char *propName,
-                                              int32_t defaultValue,
-                                              const char * caller) {
-    int32_t prop = property_get_int32(propName, defaultValue);
-    switch (prop) {
-        case AAUDIO_UNSPECIFIED:
-        case AAUDIO_POLICY_NEVER:
-        case AAUDIO_POLICY_ALWAYS:
-        case AAUDIO_POLICY_AUTO:
-            break;
-        default:
-            ALOGE("%s: invalid = %d", caller, prop);
-            prop = defaultValue;
-            break;
-    }
-    return prop;
-}
-
-int32_t AAudioProperty_getMMapPolicy() {
-    return AAudioProperty_getMMapProperty(AAUDIO_PROP_MMAP_POLICY,
-                                          AAUDIO_UNSPECIFIED, __func__);
-}
-
-int32_t AAudioProperty_getMMapExclusivePolicy() {
-    return AAudioProperty_getMMapProperty(AAUDIO_PROP_MMAP_EXCLUSIVE_POLICY,
-                                          AAUDIO_UNSPECIFIED, __func__);
-}
-
-int32_t AAudioProperty_getMixerBursts() {
-    const int32_t defaultBursts = 2; // arbitrary, use 2 for double buffered
-    const int32_t maxBursts = 1024; // arbitrary
-    int32_t prop = property_get_int32(AAUDIO_PROP_MIXER_BURSTS, defaultBursts);
-    if (prop < 1 || prop > maxBursts) {
-        ALOGE("AAudioProperty_getMixerBursts: invalid = %d", prop);
-        prop = defaultBursts;
-    }
-    return prop;
-}
-
 int32_t AAudioProperty_getWakeupDelayMicros() {
     const int32_t minMicros = 0; // arbitrary
     const int32_t defaultMicros = 200; // arbitrary, based on some observed jitter
@@ -319,9 +589,12 @@ int32_t AAudioProperty_getWakeupDelayMicros() {
 }
 
 int32_t AAudioProperty_getMinimumSleepMicros() {
-    const int32_t minMicros = 20; // arbitrary
-    const int32_t defaultMicros = 200; // arbitrary
-    const int32_t maxMicros = 2000; // arbitrary
+    const int32_t minMicros = 1; // arbitrary
+    // Higher values can increase latency for moderate workloads.
+    // Short values can cause the CPU to short cycle if there is a bug in
+    // calculating the wakeup times.
+    const int32_t defaultMicros = 100; // arbitrary
+    const int32_t maxMicros = 200; // arbitrary
     int32_t prop = property_get_int32(AAUDIO_PROP_MINIMUM_SLEEP_USEC, defaultMicros);
     if (prop < minMicros) {
         ALOGW("AAudioProperty_getMinimumSleepMicros: clipped %d to %d", prop, minMicros);
@@ -329,18 +602,6 @@ int32_t AAudioProperty_getMinimumSleepMicros() {
     } else if (prop > maxMicros) {
         ALOGW("AAudioProperty_getMinimumSleepMicros: clipped %d to %d", prop, maxMicros);
         prop = maxMicros;
-    }
-    return prop;
-}
-
-int32_t AAudioProperty_getHardwareBurstMinMicros() {
-    const int32_t defaultMicros = 1000; // arbitrary
-    const int32_t maxMicros = 1000 * 1000; // arbitrary
-    int32_t prop = property_get_int32(AAUDIO_PROP_HW_BURST_MIN_USEC, defaultMicros);
-    if (prop < 1 || prop > maxMicros) {
-        ALOGE("AAudioProperty_getHardwareBurstMinMicros: invalid = %d, use %d",
-              prop, defaultMicros);
-        prop = defaultMicros;
     }
     return prop;
 }
@@ -399,4 +660,36 @@ aaudio_result_t AAudio_isFlushAllowed(aaudio_stream_state_t state) {
             break;
     }
     return result;
+}
+
+namespace {
+
+aaudio_policy_t aidl2legacy_aaudio_policy(AudioMMapPolicy aidl) {
+    switch (aidl) {
+        case AudioMMapPolicy::NEVER:
+            return AAUDIO_POLICY_NEVER;
+        case AudioMMapPolicy::AUTO:
+            return AAUDIO_POLICY_AUTO;
+        case AudioMMapPolicy::ALWAYS:
+            return AAUDIO_POLICY_ALWAYS;
+        case AudioMMapPolicy::UNSPECIFIED:
+        default:
+            return AAUDIO_UNSPECIFIED;
+    }
+}
+
+} // namespace
+
+aaudio_policy_t AAudio_getAAudioPolicy(const std::vector<AudioMMapPolicyInfo>& policyInfos,
+                                       AudioMMapPolicy defaultPolicy) {
+    AudioMMapPolicy policy = defaultPolicy;
+    for (const auto& policyInfo : policyInfos) {
+        if (policyInfo.mmapPolicy == AudioMMapPolicy::NEVER) {
+            policy = policyInfo.mmapPolicy;
+        } else if (policyInfo.mmapPolicy == AudioMMapPolicy::AUTO ||
+                   policyInfo.mmapPolicy == AudioMMapPolicy::ALWAYS) {
+            return AAUDIO_POLICY_AUTO;
+        }
+    }
+    return aidl2legacy_aaudio_policy(policy);
 }

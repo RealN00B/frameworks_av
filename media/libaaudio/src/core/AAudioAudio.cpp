@@ -87,6 +87,30 @@ AAUDIO_API void AAudioStreamBuilder_setDeviceId(AAudioStreamBuilder* builder,
     streamBuilder->setDeviceId(deviceId);
 }
 
+AAUDIO_API void AAudioStreamBuilder_setPackageName(AAudioStreamBuilder* builder,
+                                                   const char* packageName)
+{
+    AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
+    std::optional<std::string> optionalPackageName;
+    if (packageName != nullptr) {
+      optionalPackageName = std::string(packageName);
+    }
+    // Only system apps can read the op package name. For regular apps the
+    // regular package name is a sufficient replacement
+    streamBuilder->setOpPackageName(optionalPackageName);
+}
+
+AAUDIO_API void AAudioStreamBuilder_setAttributionTag(AAudioStreamBuilder* builder,
+                                                      const char* attributionTag)
+{
+    AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
+    std::optional<std::string> optionalAttrTag;
+    if (attributionTag != nullptr) {
+      optionalAttrTag = std::string(attributionTag);
+    }
+    streamBuilder->setAttributionTag(optionalAttrTag);
+}
+
 AAUDIO_API void AAudioStreamBuilder_setSampleRate(AAudioStreamBuilder* builder,
                                               int32_t sampleRate)
 {
@@ -104,7 +128,8 @@ AAUDIO_API void AAudioStreamBuilder_setSamplesPerFrame(AAudioStreamBuilder* buil
                                                        int32_t samplesPerFrame)
 {
     AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
-    streamBuilder->setSamplesPerFrame(samplesPerFrame);
+    const aaudio_channel_mask_t channelMask = AAudioConvert_channelCountToMask(samplesPerFrame);
+    streamBuilder->setChannelMask(channelMask);
 }
 
 AAUDIO_API void AAudioStreamBuilder_setDirection(AAudioStreamBuilder* builder,
@@ -140,6 +165,18 @@ AAUDIO_API void AAudioStreamBuilder_setContentType(AAudioStreamBuilder* builder,
                                                    aaudio_content_type_t contentType) {
     AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
     streamBuilder->setContentType(contentType);
+}
+
+AAUDIO_API void AAudioStreamBuilder_setSpatializationBehavior(AAudioStreamBuilder* builder,
+        aaudio_spatialization_behavior_t spatializationBehavior) {
+    AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
+    streamBuilder->setSpatializationBehavior(spatializationBehavior);
+}
+
+AAUDIO_API void AAudioStreamBuilder_setIsContentSpatialized(AAudioStreamBuilder* builder,
+                                                            bool isSpatialized) {
+    AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
+    streamBuilder->setIsContentSpatialized(isSpatialized);
 }
 
 AAUDIO_API void AAudioStreamBuilder_setInputPreset(AAudioStreamBuilder* builder,
@@ -199,6 +236,13 @@ AAUDIO_API void AAudioStreamBuilder_setFramesPerDataCallback(AAudioStreamBuilder
     streamBuilder->setFramesPerDataCallback(frames);
 }
 
+AAUDIO_API void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder* builder,
+                                                   aaudio_channel_mask_t channelMask)
+{
+    AudioStreamBuilder *streamBuilder = convertAAudioBuilderToStreamBuilder(builder);
+    streamBuilder->setChannelMask(channelMask);
+}
+
 AAUDIO_API aaudio_result_t  AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
                                                      AAudioStream** streamPtr)
 {
@@ -209,7 +253,6 @@ AAUDIO_API aaudio_result_t  AAudioStreamBuilder_openStream(AAudioStreamBuilder* 
     AudioStreamBuilder *streamBuilder = COMMON_GET_FROM_BUILDER_OR_RETURN(streamPtr);
     aaudio_result_t result = streamBuilder->build(&audioStream);
     if (result == AAUDIO_OK) {
-        audioStream->registerPlayerBase();
         *streamPtr = (AAudioStream*) audioStream;
         id = audioStream->getId();
     } else {
@@ -309,7 +352,8 @@ AAUDIO_API aaudio_result_t AAudioStream_waitForStateChange(AAudioStream* stream,
 {
 
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
-    return audioStream->waitForStateChange(inputState, nextState, timeoutNanoseconds);
+    android::sp<AudioStream> spAudioStream(audioStream);
+    return spAudioStream->waitForStateChange(inputState, nextState, timeoutNanoseconds);
 }
 
 // ============================================================
@@ -348,7 +392,8 @@ AAUDIO_API aaudio_result_t AAudioStream_write(AAudioStream* stream,
 
     // Don't allow writes when playing with a callback.
     if (audioStream->isDataCallbackActive()) {
-        ALOGD("Cannot write to a callback stream when running.");
+        // A developer requested this warning because it would have saved lots of debugging.
+        ALOGW("%s() - Cannot write to a callback stream when running.", __func__);
         return AAUDIO_ERROR_INVALID_STATE;
     }
 
@@ -373,10 +418,22 @@ AAUDIO_API int32_t AAudioStream_getSampleRate(AAudioStream* stream)
     return audioStream->getSampleRate();
 }
 
+AAUDIO_API int32_t AAudioStream_getHardwareSampleRate(AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    return audioStream->getHardwareSampleRate();
+}
+
 AAUDIO_API int32_t AAudioStream_getChannelCount(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
     return audioStream->getSamplesPerFrame();
+}
+
+AAUDIO_API int32_t AAudioStream_getHardwareChannelCount(AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    return audioStream->getHardwareSamplesPerFrame();
 }
 
 AAUDIO_API int32_t AAudioStream_getSamplesPerFrame(AAudioStream* stream)
@@ -387,7 +444,7 @@ AAUDIO_API int32_t AAudioStream_getSamplesPerFrame(AAudioStream* stream)
 AAUDIO_API aaudio_stream_state_t AAudioStream_getState(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
-    return audioStream->getState();
+    return audioStream->getStateExternal();
 }
 
 AAUDIO_API aaudio_format_t AAudioStream_getFormat(AAudioStream* stream)
@@ -396,6 +453,14 @@ AAUDIO_API aaudio_format_t AAudioStream_getFormat(AAudioStream* stream)
     // Use audio_format_t internally.
     audio_format_t internalFormat = audioStream->getFormat();
     return AAudioConvert_androidToAAudioDataFormat(internalFormat);
+}
+
+AAUDIO_API aaudio_format_t AAudioStream_getHardwareFormat(AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    // Use audio_format_t internally.
+    audio_format_t internalFormat = audioStream->getHardwareFormat();
+    return AAudioConvert_androidToNearestAAudioDataFormat(internalFormat);
 }
 
 AAUDIO_API aaudio_result_t AAudioStream_setBufferSizeInFrames(AAudioStream* stream,
@@ -471,6 +536,19 @@ AAUDIO_API aaudio_content_type_t AAudioStream_getContentType(AAudioStream* strea
     return audioStream->getContentType();
 }
 
+AAUDIO_API aaudio_spatialization_behavior_t AAudioStream_getSpatializationBehavior(
+        AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    return audioStream->getSpatializationBehavior();
+}
+
+AAUDIO_API bool AAudioStream_isContentSpatialized(AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    return audioStream->isContentSpatialized();
+}
+
 AAUDIO_API aaudio_input_preset_t AAudioStream_getInputPreset(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
@@ -493,13 +571,15 @@ AAUDIO_API int32_t AAudioStream_getSessionId(AAudioStream* stream)
 AAUDIO_API int64_t AAudioStream_getFramesWritten(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
-    return audioStream->getFramesWritten();
+    return audioStream->getFramesWritten() * audioStream->getSampleRate() /
+            audioStream->getDeviceSampleRate();
 }
 
 AAUDIO_API int64_t AAudioStream_getFramesRead(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
-    return audioStream->getFramesRead();
+    return audioStream->getFramesRead() * audioStream->getSampleRate() /
+            audioStream->getDeviceSampleRate();
 }
 
 AAUDIO_API aaudio_result_t AAudioStream_getTimestamp(AAudioStream* stream,
@@ -508,9 +588,7 @@ AAUDIO_API aaudio_result_t AAudioStream_getTimestamp(AAudioStream* stream,
                                       int64_t *timeNanoseconds)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
-    if (framePosition == nullptr) {
-        return AAUDIO_ERROR_NULL;
-    } else if (timeNanoseconds == nullptr) {
+    if (framePosition == nullptr || timeNanoseconds == nullptr) {
         return AAUDIO_ERROR_NULL;
     } else if (clockid != CLOCK_MONOTONIC && clockid != CLOCK_BOOTTIME) {
         return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
@@ -524,6 +602,7 @@ AAUDIO_API aaudio_policy_t AAudio_getMMapPolicy() {
 }
 
 AAUDIO_API aaudio_result_t AAudio_setMMapPolicy(aaudio_policy_t policy) {
+    ALOGD("%s(%d)", __func__, policy);
     return AudioGlobal_setMMapPolicy(policy);
 }
 
@@ -537,4 +616,12 @@ AAUDIO_API bool AAudioStream_isPrivacySensitive(AAudioStream* stream)
 {
     AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
     return audioStream->isPrivacySensitive();
+}
+
+AAUDIO_API aaudio_channel_mask_t AAudioStream_getChannelMask(AAudioStream* stream)
+{
+    AudioStream *audioStream = convertAAudioStreamToAudioStream(stream);
+    const aaudio_channel_mask_t channelMask = audioStream->getChannelMask();
+    // Do not return channel index masks as they are not public.
+    return AAudio_isChannelIndexMask(channelMask) ? AAUDIO_UNSPECIFIED : channelMask;
 }

@@ -19,6 +19,7 @@
 
 #include <atomic>
 
+#include <android-base/thread_annotations.h>
 #include <android-base/unique_fd.h>
 #include <media/audiohal/StreamHalInterface.h>
 #include <media/MmapStreamCallback.h>
@@ -34,9 +35,7 @@
 #include "TimestampScheduler.h"
 #include "utility/MonotonicCounter.h"
 
-
 namespace aaudio {
-
 
 /**
  * These corresponds to an EXCLUSIVE mode MMAP client stream.
@@ -48,9 +47,10 @@ class AAudioServiceStreamMMAP : public AAudioServiceStreamBase {
 public:
     AAudioServiceStreamMMAP(android::AAudioService &aAudioService,
                             bool inService);
-    virtual ~AAudioServiceStreamMMAP() = default;
+    ~AAudioServiceStreamMMAP() override = default;
 
-    aaudio_result_t open(const aaudio::AAudioStreamRequest &request) override;
+    aaudio_result_t open(const aaudio::AAudioStreamRequest &request) override
+            EXCLUDES(mUpMessageQueueLock);
 
     aaudio_result_t startClient(const android::AudioClient& client,
                                 const audio_attributes_t *attr,
@@ -68,21 +68,41 @@ protected:
      * This is not guaranteed to be synchronous but it currently is.
      * An AAUDIO_SERVICE_EVENT_PAUSED will be sent to the client when complete.
     */
-    aaudio_result_t pause_l() override;
+    aaudio_result_t pause_l() REQUIRES(mLock) override;
 
-    aaudio_result_t stop_l() override;
+    aaudio_result_t stop_l() REQUIRES(mLock) override;
 
-    aaudio_result_t getAudioDataDescription(AudioEndpointParcelable &parcelable) override;
+    aaudio_result_t standby_l() REQUIRES(mLock) override;
+    bool isStandbyImplemented() override {
+        return true;
+    }
 
-    aaudio_result_t getFreeRunningPosition(int64_t *positionFrames, int64_t *timeNanos) override;
+    aaudio_result_t exitStandby_l(AudioEndpointParcelable* parcelable) REQUIRES(mLock) override;
 
-    aaudio_result_t getHardwareTimestamp(int64_t *positionFrames, int64_t *timeNanos) override;
+    aaudio_result_t getAudioDataDescription_l(
+            AudioEndpointParcelable* parcelable) REQUIRES(mLock) override;
+
+    aaudio_result_t getFreeRunningPosition_l(int64_t *positionFrames,
+            int64_t *timeNanos) REQUIRES(mLock) override;
+
+    aaudio_result_t getHardwareTimestamp_l(
+            int64_t *positionFrames, int64_t *timeNanos) REQUIRES(mLock) override;
+
+    int64_t nextDataReportTime_l() REQUIRES(mLock) override;
+
+    void reportData_l() REQUIRES(mLock) override;
 
     /**
      * Device specific startup.
      * @return AAUDIO_OK or negative error.
      */
-    aaudio_result_t startDevice() override;
+    aaudio_result_t startDevice_l() REQUIRES(mLock) override;
+
+    aaudio_result_t startClient_l(const android::AudioClient& client,
+                                  const audio_attributes_t *attr,
+                                  audio_port_handle_t *clientHandle) REQUIRES(mLock) override;
+
+    aaudio_result_t stopClient_l(audio_port_handle_t clientHandle) REQUIRES(mLock) override;
 
 private:
 

@@ -25,8 +25,8 @@
 #include <aidl/android/media/BnResourceManagerService.h>
 
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/ProcessInfoInterface.h>
 #include <mediadrm/DrmSessionManager.h>
+#include <mediautils/ProcessInfoInterface.h>
 
 #include <algorithm>
 #include <iostream>
@@ -61,8 +61,20 @@ struct FakeProcessInfo : public ProcessInfoInterface {
         return true;
     }
 
-    virtual bool isValidPid(int /* pid */) {
+    virtual bool isPidTrusted(int /* pid */) {
         return true;
+    }
+
+    virtual bool isPidUidTrusted(int /* pid */, int /* uid */) {
+        return true;
+    }
+
+    virtual bool overrideProcessInfo(
+            int /* pid */, int /* procState */, int /* oomScore */) {
+        return true;
+    }
+
+    virtual void removeProcessInfoOverride(int /* pid */) {
     }
 
 private:
@@ -136,8 +148,8 @@ static const std::vector<uint8_t> kTestSessionId3{9, 0};
 class DrmSessionManagerTest : public ::testing::Test {
 public:
     DrmSessionManagerTest()
-        : mService(::ndk::SharedRefBase::make<ResourceManagerService>
-            (new FakeProcessInfo(), new FakeSystemCallback())),
+        : mService(ResourceManagerService::Create(
+                  new FakeProcessInfo(), new FakeSystemCallback())),
           mDrmSessionManager(new DrmSessionManager(mService)),
           mTestDrm1(::ndk::SharedRefBase::make<FakeDrm>(
                   kTestSessionId1, mDrmSessionManager)),

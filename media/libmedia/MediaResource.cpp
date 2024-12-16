@@ -43,11 +43,11 @@ MediaResource::MediaResource(Type type, const std::vector<uint8_t> &id, int64_t 
 }
 
 //static
-MediaResource MediaResource::CodecResource(bool secure, bool video) {
+MediaResource MediaResource::CodecResource(bool secure, SubType subType, int64_t instanceCount) {
     return MediaResource(
             secure ? Type::kSecureCodec : Type::kNonSecureCodec,
-            video ? SubType::kVideoCodec : SubType::kAudioCodec,
-            1);
+            subType,
+            instanceCount);
 }
 
 //static
@@ -61,8 +61,9 @@ MediaResource MediaResource::CpuBoostResource() {
 }
 
 //static
-MediaResource MediaResource::VideoBatteryResource() {
-    return MediaResource(Type::kBattery, SubType::kVideoCodec, 1);
+MediaResource MediaResource::VideoBatteryResource(bool isHardware) {
+    SubType subType = isHardware ? SubType::kHwVideoCodec : SubType::kSwVideoCodec;
+    return MediaResource(Type::kBattery, subType, 1);
 }
 
 //static

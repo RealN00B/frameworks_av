@@ -26,10 +26,13 @@ cc_library {
         "libmediautils",
         "libnblog",
         "libutils",
+        "packagemanager_aidl-cpp",
     ],
 
+    export_include_dirs: ["."],
+
     cflags: [
-        "-Werror",
         "-Wall",
+        "-Werror",
     ],
 }

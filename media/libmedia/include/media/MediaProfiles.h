@@ -39,8 +39,9 @@ enum camcorder_quality {
     CAMCORDER_QUALITY_VGA = 9,
     CAMCORDER_QUALITY_4KDCI = 10,
     CAMCORDER_QUALITY_QHD = 11,
-    CAMCORDER_QUALITY_2k = 12,
-    CAMCORDER_QUALITY_LIST_END = 12,
+    CAMCORDER_QUALITY_2K = 12,
+    CAMCORDER_QUALITY_8KUHD = 13,
+    CAMCORDER_QUALITY_LIST_END = 13,
 
     CAMCORDER_QUALITY_TIME_LAPSE_LIST_START = 1000,
     CAMCORDER_QUALITY_TIME_LAPSE_LOW  = 1000,
@@ -55,8 +56,9 @@ enum camcorder_quality {
     CAMCORDER_QUALITY_TIME_LAPSE_VGA = 1009,
     CAMCORDER_QUALITY_TIME_LAPSE_4KDCI = 1010,
     CAMCORDER_QUALITY_TIME_LAPSE_QHD = 1011,
-    CAMCORDER_QUALITY_TIME_LAPSE_2k = 1012,
-    CAMCORDER_QUALITY_TIME_LAPSE_LIST_END = 1012,
+    CAMCORDER_QUALITY_TIME_LAPSE_2K = 1012,
+    CAMCORDER_QUALITY_TIME_LAPSE_8KUHD = 1013,
+    CAMCORDER_QUALITY_TIME_LAPSE_LIST_END = 1013,
 
     CAMCORDER_QUALITY_HIGH_SPEED_LIST_START = 2000,
     CAMCORDER_QUALITY_HIGH_SPEED_LOW  = 2000,
@@ -79,6 +81,19 @@ enum audio_decoder {
     AUDIO_DECODER_WMA,
 };
 
+enum chroma_subsampling {
+    CHROMA_SUBSAMPLING_YUV_420,
+    CHROMA_SUBSAMPLING_YUV_422,
+    CHROMA_SUBSAMPLING_YUV_444,
+};
+
+enum hdr_format {
+    HDR_FORMAT_NONE,
+    HDR_FORMAT_HLG,
+    HDR_FORMAT_HDR10,
+    HDR_FORMAT_HDR10PLUS,
+    HDR_FORMAT_DOLBY_VISION,
+};
 
 class MediaProfiles
 {
@@ -115,13 +130,19 @@ public:
          * @param profile codec profile (for MediaCodec) or -1 for none
          */
         VideoCodec(video_encoder codec, int bitrate, int frameWidth, int frameHeight, int frameRate,
-                   int profile = -1)
+                   int profile = -1,
+                   chroma_subsampling chroma = CHROMA_SUBSAMPLING_YUV_420,
+                   int bitDepth = 8,
+                   hdr_format hdr = HDR_FORMAT_NONE)
             : mCodec(codec),
               mBitRate(bitrate),
               mFrameWidth(frameWidth),
               mFrameHeight(frameHeight),
               mFrameRate(frameRate),
-              mProfile(profile) {
+              mProfile(profile),
+              mChromaSubsampling(chroma),
+              mBitDepth(bitDepth),
+              mHdrFormat(hdr) {
         }
 
         VideoCodec(const VideoCodec&) = default;
@@ -158,6 +179,21 @@ public:
             return mProfile;
         }
 
+        /** Returns the chroma subsampling. */
+        chroma_subsampling getChromaSubsampling() const {
+            return mChromaSubsampling;
+        }
+
+        /** Returns the bit depth. */
+        int getBitDepth() const {
+            return mBitDepth;
+        }
+
+        /** Returns the chroma subsampling. */
+        hdr_format getHdrFormat() const {
+            return mHdrFormat;
+        }
+
     private:
         video_encoder mCodec;
         int mBitRate;
@@ -165,6 +201,9 @@ public:
         int mFrameHeight;
         int mFrameRate;
         int mProfile;
+        chroma_subsampling mChromaSubsampling;
+        int mBitDepth;
+        hdr_format mHdrFormat;
         friend class MediaProfiles;
     };
 
@@ -531,6 +570,39 @@ private:
     static int findTagForName(const NameToTagMap *map, size_t nMappings, const char *name);
 
     /**
+     * Finds the string representation for an integer enum tag.
+     *
+     * This is the reverse for findTagForName
+     *
+     * @param map       the name-to-tag map to search
+     * @param nMappings the number of mappings in |map|
+     * @param tag       the enum value to find
+     * @param def_      the return value if the enum is not found
+     *
+     * @return the string name corresponding to |tag| or |def_| if not found.
+     */
+    static const char *findNameForTag(
+            const NameToTagMap *map, size_t nMappings,
+            int tag, const char *def_ = "(unknown)");
+
+    /**
+     * Updates the chroma subsampling, bit-depth and hdr-format for
+     * advanced codec profiles.
+     *
+     * @param codec    the video codec type
+     * @param profile  the MediaCodec profile
+     * @param chroma   pointer to the chroma subsampling output
+     * @param bitDepth pointer to the bit depth output
+     * @param hdr      pointer to the hdr format output
+     *
+     * @return true, if the profile fully determined chroma, bit-depth and hdr-format, false
+     *         otherwise.
+     */
+    static bool detectAdvancedVideoProfile(
+            video_encoder codec, int profile,
+            chroma_subsampling *chroma, int *bitDepth, hdr_format *hdr);
+
+    /**
      * Check on existing profiles with the following criteria:
      * 1. Low quality profile must have the lowest video
      *    resolution product (width x height)
@@ -547,6 +619,8 @@ private:
 
     // Mappings from name (for instance, codec name) to enum value
     static const NameToTagMap sVideoEncoderNameMap[];
+    static const NameToTagMap sChromaSubsamplingNameMap[];
+    static const NameToTagMap sHdrFormatNameMap[];
     static const NameToTagMap sAudioEncoderNameMap[];
     static const NameToTagMap sFileFormatMap[];
     static const NameToTagMap sVideoDecoderNameMap[];

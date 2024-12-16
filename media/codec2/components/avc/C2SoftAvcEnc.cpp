@@ -152,6 +152,17 @@ public:
                 .build());
 
         addParameter(
+                DefineParam(mBitrateMode, C2_PARAMKEY_BITRATE_MODE)
+                .withDefault(new C2StreamBitrateModeTuning::output(0u, C2Config::BITRATE_VARIABLE))
+                .withFields({C2F(mBitrateMode, value).oneOf({
+                                        C2Config::BITRATE_CONST,
+                                        C2Config::BITRATE_VARIABLE,
+                                        C2Config::BITRATE_IGNORE})
+                        })
+                .withSetter(Setter<decltype(*mBitrateMode)>::StrictValueWithNoDeps)
+                .build());
+
+        addParameter(
                 DefineParam(mBitrate, C2_PARAMKEY_BITRATE)
                 .withDefault(new C2StreamBitrateInfo::output(0u, 64000))
                 .withFields({C2F(mBitrate, value).inRange(4096, 12000000)})
@@ -334,7 +345,10 @@ public:
         // By default needsUpdate = false in case the supplied level does meet
         // the requirements. For Level 1b, we want to update the level anyway,
         // so we set it to true in that case.
-        bool needsUpdate = (me.v.level == LEVEL_AVC_1B);
+        bool needsUpdate = false;
+        if (me.v.level == LEVEL_AVC_1B || !me.F(me.v.level).supportsAtAll(me.v.level)) {
+            needsUpdate = true;
+        }
         for (const LevelLimits &limit : kLimits) {
             if (mbs <= limit.mbs && mbsPerSec <= limit.mbsPerSec &&
                     bitrate.v.value <= limit.bitrate) {
@@ -356,7 +370,7 @@ public:
                 needsUpdate = true;
             }
         }
-        if (!found) {
+        if (!found || me.v.level > LEVEL_AVC_5) {
             // We set to the highest supported level.
             me.set().level = LEVEL_AVC_5;
         }
@@ -392,7 +406,63 @@ public:
     static C2R PictureQuantizationSetter(bool mayBlock,
                                          C2P<C2StreamPictureQuantizationTuning::output> &me) {
         (void)mayBlock;
-        (void)me;
+
+        // these are the ones we're going to set, so want them to default
+        // to the DEFAULT values for the codec
+        int32_t iMin = DEFAULT_I_QP_MIN, pMin = DEFAULT_P_QP_MIN, bMin = DEFAULT_B_QP_MIN;
+        int32_t iMax = DEFAULT_I_QP_MAX, pMax = DEFAULT_P_QP_MAX, bMax = DEFAULT_B_QP_MAX;
+
+        for (size_t i = 0; i < me.v.flexCount(); ++i) {
+            const C2PictureQuantizationStruct &layer = me.v.m.values[i];
+
+            if (layer.type_ == C2Config::picture_type_t(I_FRAME)) {
+                iMax = layer.max;
+                iMin = layer.min;
+                ALOGV("iMin %d iMax %d", iMin, iMax);
+            } else if (layer.type_ == C2Config::picture_type_t(P_FRAME)) {
+                pMax = layer.max;
+                pMin = layer.min;
+                ALOGV("pMin %d pMax %d", pMin, pMax);
+            } else if (layer.type_ == C2Config::picture_type_t(B_FRAME)) {
+                bMax = layer.max;
+                bMin = layer.min;
+                ALOGV("bMin %d bMax %d", bMin, bMax);
+            }
+        }
+
+        ALOGV("PictureQuantizationSetter(entry): i %d-%d p %d-%d b %d-%d",
+              iMin, iMax, pMin, pMax, bMin, bMax);
+
+        // min is clamped to [AVC_QP_MIN, max] to avoid error
+        // cases where layer.min > layer.max
+        iMax = std::clamp(iMax, AVC_QP_MIN, AVC_QP_MAX);
+        iMin = std::clamp(iMin, AVC_QP_MIN, iMax);
+        pMax = std::clamp(pMax, AVC_QP_MIN, AVC_QP_MAX);
+        pMin = std::clamp(pMin, AVC_QP_MIN, pMax);
+        bMax = std::clamp(bMax, AVC_QP_MIN, AVC_QP_MAX);
+        bMin = std::clamp(bMin, AVC_QP_MIN, bMax);
+
+        // put them back into the structure
+        for (size_t i = 0; i < me.v.flexCount(); ++i) {
+            const C2PictureQuantizationStruct &layer = me.v.m.values[i];
+
+            if (layer.type_ == C2Config::picture_type_t(I_FRAME)) {
+                me.set().m.values[i].max = iMax;
+                me.set().m.values[i].min = iMin;
+            }
+            if (layer.type_ == C2Config::picture_type_t(P_FRAME)) {
+                me.set().m.values[i].max = pMax;
+                me.set().m.values[i].min = pMin;
+            }
+            if (layer.type_ == C2Config::picture_type_t(B_FRAME)) {
+                me.set().m.values[i].max = bMax;
+                me.set().m.values[i].min = bMin;
+            }
+        }
+
+        ALOGV("PictureQuantizationSetter(exit): i %d-%d p %d-%d b %d-%d",
+              iMin, iMax, pMin, pMax, bMin, bMax);
+
         return C2R::Ok();
     }
 
@@ -477,6 +547,9 @@ public:
     std::shared_ptr<C2StreamPictureSizeInfo::input> getSize_l() const { return mSize; }
     std::shared_ptr<C2StreamIntraRefreshTuning::output> getIntraRefresh_l() const { return mIntraRefresh; }
     std::shared_ptr<C2StreamFrameRateInfo::output> getFrameRate_l() const { return mFrameRate; }
+    std::shared_ptr<C2StreamBitrateModeTuning::output> getBitrateMode_l() const {
+        return mBitrateMode;
+    }
     std::shared_ptr<C2StreamBitrateInfo::output> getBitrate_l() const { return mBitrate; }
     std::shared_ptr<C2StreamRequestSyncFrameTuning::output> getRequestSync_l() const { return mRequestSync; }
     std::shared_ptr<C2StreamGopTuning::output> getGop_l() const { return mGop; }
@@ -493,6 +566,7 @@ private:
     std::shared_ptr<C2StreamRequestSyncFrameTuning::output> mRequestSync;
     std::shared_ptr<C2StreamIntraRefreshTuning::output> mIntraRefresh;
     std::shared_ptr<C2StreamBitrateInfo::output> mBitrate;
+    std::shared_ptr<C2StreamBitrateModeTuning::output> mBitrateMode;
     std::shared_ptr<C2StreamProfileLevelInfo::output> mProfileLevel;
     std::shared_ptr<C2StreamSyncFrameIntervalTuning::output> mSyncFramePeriod;
     std::shared_ptr<C2StreamGopTuning::output> mGop;
@@ -601,8 +675,7 @@ void  C2SoftAvcEnc::initEncParams() {
     mEntropyMode = DEFAULT_ENTROPY_MODE;
     mBframes = DEFAULT_B_FRAMES;
 
-    gettimeofday(&mTimeStart, nullptr);
-    gettimeofday(&mTimeEnd, nullptr);
+    mTimeStart = mTimeEnd = systemTime();
 }
 
 c2_status_t C2SoftAvcEnc::setDimensions() {
@@ -765,10 +838,12 @@ c2_status_t C2SoftAvcEnc::setQp() {
     s_qp_ip.e_cmd = IVE_CMD_VIDEO_CTL;
     s_qp_ip.e_sub_cmd = IVE_CMD_CTL_SET_QP;
 
-    // these are the ones we're going to set, so want them to default ....
-    // to the DEFAULT values for the codec instea dof CODEC_ bounding
-    int32_t iMin = INT32_MIN, pMin = INT32_MIN, bMin = INT32_MIN;
-    int32_t iMax = INT32_MAX, pMax = INT32_MAX, bMax = INT32_MAX;
+    // we resolved out-of-bound and unspecified values in PictureQuantizationSetter()
+    // so we can start with defaults that are overridden as needed.
+    int32_t iMin = DEFAULT_I_QP_MIN, pMin = DEFAULT_P_QP_MIN, bMin = DEFAULT_B_QP_MIN;
+    int32_t iMax = DEFAULT_I_QP_MAX, pMax = DEFAULT_P_QP_MAX, bMax = DEFAULT_B_QP_MAX;
+
+    IntfImpl::Lock lock = mIntf->lock();
 
     std::shared_ptr<C2StreamPictureQuantizationTuning::output> qp =
                     mIntf->getPictureQuantization_l();
@@ -790,22 +865,6 @@ c2_status_t C2SoftAvcEnc::setQp() {
         }
     }
 
-    // INT32_{MIN,MAX} means unspecified, so use the codec's default
-    if (iMax == INT32_MAX) iMax = DEFAULT_I_QP_MAX;
-    if (iMin == INT32_MIN) iMin = DEFAULT_I_QP_MIN;
-    if (pMax == INT32_MAX) pMax = DEFAULT_P_QP_MAX;
-    if (pMin == INT32_MIN) pMin = DEFAULT_P_QP_MIN;
-    if (bMax == INT32_MAX) bMax = DEFAULT_B_QP_MAX;
-    if (bMin == INT32_MIN) bMin = DEFAULT_B_QP_MIN;
-
-    // ensure we have legal values
-    iMax = std::clamp(iMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    iMin = std::clamp(iMin, CODEC_QP_MIN, CODEC_QP_MAX);
-    pMax = std::clamp(pMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    pMin = std::clamp(pMin, CODEC_QP_MIN, CODEC_QP_MAX);
-    bMax = std::clamp(bMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    bMin = std::clamp(bMin, CODEC_QP_MIN, CODEC_QP_MAX);
-
     s_qp_ip.u4_i_qp_max = iMax;
     s_qp_ip.u4_i_qp_min = iMin;
     s_qp_ip.u4_p_qp_max = pMax;
@@ -818,7 +877,7 @@ c2_status_t C2SoftAvcEnc::setQp() {
     s_qp_ip.u4_p_qp = std::clamp(DEFAULT_P_QP, pMin, pMax);
     s_qp_ip.u4_b_qp = std::clamp(DEFAULT_B_QP, bMin, bMax);
 
-    ALOGV("setting QP: i %d-%d p %d-%d b %d-%d", iMin, iMax, pMin, pMax, bMin, bMax);
+    ALOGV("setQp(): i %d-%d p %d-%d b %d-%d", iMin, iMax, pMin, pMax, bMin, bMax);
 
 
     s_qp_ip.u4_timestamp_high = -1;
@@ -1110,6 +1169,7 @@ c2_status_t C2SoftAvcEnc::initEncoder() {
     {
         IntfImpl::Lock lock = mIntf->lock();
         mSize = mIntf->getSize_l();
+        mBitrateMode = mIntf->getBitrateMode_l();
         mBitrate = mIntf->getBitrate_l();
         mFrameRate = mIntf->getFrameRate_l();
         mIntraRefresh = mIntf->getIntraRefresh_l();
@@ -1282,8 +1342,23 @@ c2_status_t C2SoftAvcEnc::initEncoder() {
         } else {
             ps_init_ip->u4_enable_recon = 0;
         }
+
+        switch (mBitrateMode->value) {
+            case C2Config::BITRATE_IGNORE:
+                ps_init_ip->e_rc_mode = IVE_RC_NONE;
+                break;
+            case C2Config::BITRATE_CONST:
+                ps_init_ip->e_rc_mode = IVE_RC_CBR_NON_LOW_DELAY;
+                break;
+            case C2Config::BITRATE_VARIABLE:
+                ps_init_ip->e_rc_mode = IVE_RC_STORAGE;
+                break;
+            default:
+                ps_init_ip->e_rc_mode = DEFAULT_RC_MODE;
+                break;
+            break;
+        }
         ps_init_ip->e_recon_color_fmt = DEFAULT_RECON_COLOR_FORMAT;
-        ps_init_ip->e_rc_mode = DEFAULT_RC_MODE;
         ps_init_ip->u4_max_framerate = DEFAULT_MAX_FRAMERATE;
         ps_init_ip->u4_max_bitrate = DEFAULT_MAX_BITRATE;
         ps_init_ip->u4_num_bframes = mBframes;
@@ -1475,7 +1550,8 @@ c2_status_t C2SoftAvcEnc::setEncodeArgs(
             vPlane = uPlane + yPlaneSize / 4;
             yStride = width;
             uStride = vStride = yStride / 2;
-            ConvertRGBToPlanarYUV(yPlane, yStride, height, conversionBuffer.size(), *input);
+            ConvertRGBToPlanarYUV(yPlane, yStride, height, conversionBuffer.size(), *input,
+                                  mColorAspects->matrix, mColorAspects->range);
             break;
         }
         case C2PlanarLayout::TYPE_YUV: {
@@ -1610,8 +1686,7 @@ void C2SoftAvcEnc::process(
     work->worklets.front()->output.flags = work->input.flags;
 
     IV_STATUS_T status;
-    WORD32 timeDelay = 0;
-    WORD32 timeTaken = 0;
+    nsecs_t timeDelay = 0;
     uint64_t workIndex = work->input.ordinal.frameIndex.peekull();
 
     // Initialize encoder if not already initialized
@@ -1727,17 +1802,20 @@ void C2SoftAvcEnc::process(
     //         }
     //     }
     // }
-    std::shared_ptr<const C2GraphicView> view;
+    std::shared_ptr<C2GraphicView> view;
     std::shared_ptr<C2Buffer> inputBuffer;
     if (!work->input.buffers.empty()) {
         inputBuffer = work->input.buffers[0];
-        view = std::make_shared<const C2GraphicView>(
+        view = std::make_shared<C2GraphicView>(
                 inputBuffer->data().graphicBlocks().front().map().get());
         if (view->error() != C2_OK) {
             ALOGE("graphic view map err = %d", view->error());
             work->workletsProcessed = 1u;
             return;
         }
+        //(b/232396154)
+        //workaround for incorrect crop size in view when using surface mode
+        view->setCrop_be(C2Rect(mSize->width, mSize->height));
     }
 
     do {
@@ -1777,10 +1855,10 @@ void C2SoftAvcEnc::process(
         //         mInFile, s_encode_ip.s_inp_buf.apv_bufs[0],
         //         (mHeight * mStride * 3 / 2));
 
-        GETTIME(&mTimeStart, nullptr);
         /* Compute time elapsed between end of previous decode()
          * to start of current decode() */
-        TIME_DIFF(mTimeEnd, mTimeStart, timeDelay);
+        mTimeStart = systemTime();
+        timeDelay = mTimeStart - mTimeEnd;
         status = ive_api_function(mCodecCtx, &s_video_encode_ip, &s_video_encode_op);
 
         if (IV_SUCCESS != status) {
@@ -1804,11 +1882,11 @@ void C2SoftAvcEnc::process(
         mBuffers[ps_encode_ip->s_inp_buf.apv_bufs[0]] = inputBuffer;
     }
 
-    GETTIME(&mTimeEnd, nullptr);
     /* Compute time taken for decode() */
-    TIME_DIFF(mTimeStart, mTimeEnd, timeTaken);
+    mTimeEnd = systemTime();
+    nsecs_t timeTaken = mTimeEnd - mTimeStart;
 
-    ALOGV("timeTaken=%6d delay=%6d numBytes=%6d", timeTaken, timeDelay,
+    ALOGV("timeTaken=%" PRId64 "d delay=%" PRId64 " numBytes=%6d", timeTaken, timeDelay,
             ps_encode_op->s_out_buf.u4_bytes);
 
     void *freed = ps_encode_op->s_inp_buf.apv_bufs[0];

@@ -1,5 +1,6 @@
 // Multichannel downmix effect library
 package {
+    default_team: "trendy_team_media_framework_audio",
     default_applicable_licenses: [
         "frameworks_av_media_libeffects_downmix_license",
     ],
@@ -18,11 +19,15 @@ license {
     ],
 }
 
-cc_library_shared {
+cc_library {
     name: "libdownmix",
-
+    host_supported: true,
     vendor: true,
-    srcs: ["EffectDownmix.c"],
+    srcs: ["EffectDownmix.cpp"],
+
+    export_include_dirs: [
+        ".",
+    ],
 
     shared_libs: [
         "libaudioutils",
@@ -33,13 +38,38 @@ cc_library_shared {
     relative_install_path: "soundfx",
 
     cflags: [
-        "-fvisibility=hidden",
         "-Wall",
         "-Werror",
+        "-fvisibility=hidden",
     ],
 
     header_libs: [
         "libaudioeffects",
         "libhardware_headers",
+    ],
+}
+
+cc_library_shared {
+    name: "libdownmixaidl",
+    srcs: [
+        ":effectCommonFile",
+        "aidl/DownmixContext.cpp",
+        "aidl/EffectDownmix.cpp",
+    ],
+    defaults: [
+        "aidlaudioeffectservice_defaults",
+    ],
+    header_libs: [
+        "libaudioeffects",
+        "libhardware_headers",
+    ],
+    shared_libs: [
+        "libaudioutils",
+        "libcutils",
+        "liblog",
+    ],
+    relative_install_path: "soundfx",
+    visibility: [
+        "//hardware/interfaces/audio/aidl/default:__subpackages__",
     ],
 }

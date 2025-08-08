@@ -26,6 +26,7 @@
 #include <android/content/AttributionSourceState.h>
 #include <binder/IServiceManager.h>
 #include <binder/MemoryDealer.h>
+#include <com_android_media_audioserver.h>
 #include <media/AidlConversion.h>
 #include <media/AudioEffect.h>
 #include <media/AudioRecord.h>
@@ -40,6 +41,8 @@
 constexpr int32_t kMinSampleRateHz = 4000;
 constexpr int32_t kMaxSampleRateHz = 192000;
 constexpr int32_t kSampleRateUnspecified = 0;
+
+namespace audioserver_flags = com::android::media::audioserver;
 
 using namespace std;
 using namespace android;
@@ -84,13 +87,15 @@ constexpr audio_port_type_t kPortTypes[] = {
 };
 
 template <typename T, typename X, typename FUNC>
-std::vector<T> getFlags(const xsdc_enum_range<X> &range, const FUNC &func,
-                        const std::string &findString = {}) {
+std::vector<T> getFlags(const xsdc_enum_range<X>& range, const FUNC& func,
+                        const std::string& findString = {},
+                        const std::set<X>& excludedValues = {}) {
     std::vector<T> vec;
     for (const auto &xsdEnumVal : range) {
         T enumVal;
         std::string enumString = toString(xsdEnumVal);
         if (enumString.find(findString) != std::string::npos &&
+            (excludedValues.find(xsdEnumVal) == excludedValues.end()) &&
             func(enumString.c_str(), &enumVal)) {
             vec.push_back(enumVal);
         }
@@ -102,13 +107,29 @@ static const std::vector<audio_stream_type_t> kStreamtypes =
     getFlags<audio_stream_type_t, xsd::AudioStreamType, decltype(audio_stream_type_from_string)>(
         xsdc_enum_range<xsd::AudioStreamType>{}, audio_stream_type_from_string);
 
+/**
+ * AudioFormat - AUDIO_FORMAT_HE_AAC_V1 and AUDIO_FORMAT_HE_AAC_V2
+ * are excluded from kFormats[] in order to avoid the abort triggered
+ * for these two types of AudioFormat in
+ * AidlConversion::legacy2aidl_audio_format_t_AudioFormatDescription()
+ */
 static const std::vector<audio_format_t> kFormats =
-    getFlags<audio_format_t, xsd::AudioFormat, decltype(audio_format_from_string)>(
-        xsdc_enum_range<xsd::AudioFormat>{}, audio_format_from_string);
+        getFlags<audio_format_t, xsd::AudioFormat, decltype(audio_format_from_string)>(
+                xsdc_enum_range<xsd::AudioFormat>{}, audio_format_from_string, {},
+                {xsd::AudioFormat::AUDIO_FORMAT_HE_AAC_V1,
+                 xsd::AudioFormat::AUDIO_FORMAT_HE_AAC_V2});
 
+/**
+ * AudioChannelMask - AUDIO_CHANNEL_IN_6
+ * is excluded from kChannelMasks[] in order to avoid the abort triggered
+ * for this type of AudioChannelMask in
+ * AidlConversion::legacy2aidl_audio_channel_mask_t_AudioChannelLayout()
+ */
 static const std::vector<audio_channel_mask_t> kChannelMasks =
-    getFlags<audio_channel_mask_t, xsd::AudioChannelMask, decltype(audio_channel_mask_from_string)>(
-        xsdc_enum_range<xsd::AudioChannelMask>{}, audio_channel_mask_from_string);
+        getFlags<audio_channel_mask_t, xsd::AudioChannelMask,
+                 decltype(audio_channel_mask_from_string)>(
+                xsdc_enum_range<xsd::AudioChannelMask>{}, audio_channel_mask_from_string, {},
+                {xsd::AudioChannelMask::AUDIO_CHANNEL_IN_6});
 
 static const std::vector<audio_usage_t> kUsages =
     getFlags<audio_usage_t, xsd::AudioUsage, decltype(audio_usage_from_string)>(
@@ -126,9 +147,17 @@ static const std::vector<audio_gain_mode_t> kGainModes =
     getFlags<audio_gain_mode_t, xsd::AudioGainMode, decltype(audio_gain_mode_from_string)>(
         xsdc_enum_range<xsd::AudioGainMode>{}, audio_gain_mode_from_string);
 
+/**
+ * AudioDevice - AUDIO_DEVICE_IN_AMBIENT and AUDIO_DEVICE_IN_COMMUNICATION
+ * are excluded from kDevices[] in order to avoid the abort triggered
+ * for these two types of AudioDevice in
+ * AidlConversion::aidl2legacy_AudioDeviceDescription_audio_devices_t()
+ */
 static const std::vector<audio_devices_t> kDevices =
-    getFlags<audio_devices_t, xsd::AudioDevice, decltype(audio_device_from_string)>(
-        xsdc_enum_range<xsd::AudioDevice>{}, audio_device_from_string);
+        getFlags<audio_devices_t, xsd::AudioDevice, decltype(audio_device_from_string)>(
+                xsdc_enum_range<xsd::AudioDevice>{}, audio_device_from_string, {},
+                {xsd::AudioDevice::AUDIO_DEVICE_IN_AMBIENT,
+                 xsd::AudioDevice::AUDIO_DEVICE_IN_COMMUNICATION});
 
 static const std::vector<audio_input_flags_t> kInputFlags =
     getFlags<audio_input_flags_t, xsd::AudioInOutFlag, decltype(audio_input_flag_from_string)>(
@@ -359,7 +388,7 @@ void AudioFlingerFuzzer::invokeAudioRecord() {
     record->getInputFramesLost();
     record->getFlags();
 
-    std::vector<media::MicrophoneInfo> activeMicrophones;
+    std::vector<media::MicrophoneInfoFw> activeMicrophones;
     record->getActiveMicrophones(&activeMicrophones);
     record->releaseBuffer(&audioBuffer);
 
@@ -367,7 +396,7 @@ void AudioFlingerFuzzer::invokeAudioRecord() {
         static_cast<audio_port_handle_t>(mFdp.ConsumeIntegral<int32_t>());
     record->setInputDevice(deviceId);
     record->getInputDevice();
-    record->getRoutedDeviceId();
+    record->getRoutedDeviceIds();
     record->getPortId();
 }
 
@@ -475,13 +504,19 @@ void AudioFlingerFuzzer::invokeAudioSystem() {
     AudioSystem::getMasterMute(&state);
     AudioSystem::isMicrophoneMuted(&state);
 
-    audio_stream_type_t stream = getValue(&mFdp, kStreamtypes);
-    AudioSystem::setStreamMute(getValue(&mFdp, kStreamtypes), mFdp.ConsumeBool());
+    audio_stream_type_t stream ;
+    if (!audioserver_flags::portid_volume_management()) {
+        stream = getValue(&mFdp, kStreamtypes);
+        AudioSystem::setStreamMute(getValue(&mFdp, kStreamtypes), mFdp.ConsumeBool());
 
-    stream = getValue(&mFdp, kStreamtypes);
-    AudioSystem::setStreamVolume(stream, mFdp.ConsumeFloatingPoint<float>(),
-                                 mFdp.ConsumeIntegral<int32_t>());
-
+        stream = getValue(&mFdp, kStreamtypes);
+        AudioSystem::setStreamVolume(stream, mFdp.ConsumeFloatingPoint<float>(),
+                                     mFdp.ConsumeBool(), mFdp.ConsumeIntegral<int32_t>());
+    } else {
+        std::vector <audio_port_handle_t> portsForVolumeChange{};
+        AudioSystem::setPortsVolume(portsForVolumeChange, mFdp.ConsumeFloatingPoint<float>(),
+                                    mFdp.ConsumeBool(), mFdp.ConsumeIntegral<int32_t>());
+    }
     audio_mode_t mode = getValue(&mFdp, kModes);
     AudioSystem::setMode(mode);
 
@@ -492,12 +527,6 @@ void AudioFlingerFuzzer::invokeAudioSystem() {
     uint32_t latency;
     stream = getValue(&mFdp, kStreamtypes);
     AudioSystem::getOutputLatency(&latency, stream);
-
-    stream = getValue(&mFdp, kStreamtypes);
-    AudioSystem::getStreamVolume(stream, &volume, mFdp.ConsumeIntegral<int32_t>());
-
-    stream = getValue(&mFdp, kStreamtypes);
-    AudioSystem::getStreamMute(stream, &state);
 
     uint32_t samplingRate;
     AudioSystem::getSamplingRate(mFdp.ConsumeIntegral<int32_t>(), &samplingRate);
@@ -541,7 +570,7 @@ void AudioFlingerFuzzer::invokeAudioSystem() {
     AudioSystem::getPrimaryOutputFrameCount();
     AudioSystem::setLowRamDevice(mFdp.ConsumeBool(), mFdp.ConsumeIntegral<int64_t>());
 
-    std::vector<media::MicrophoneInfo> microphones;
+    std::vector<media::MicrophoneInfoFw> microphones;
     AudioSystem::getMicrophones(&microphones);
 
     std::vector<pid_t> pids;
@@ -558,7 +587,12 @@ void AudioFlingerFuzzer::invokeAudioSystem() {
 
     float balance = mFdp.ConsumeFloatingPoint<float>();
     af->getMasterBalance(&balance);
-    af->invalidateStream(static_cast<audio_stream_type_t>(mFdp.ConsumeIntegral<uint32_t>()));
+
+    std::vector<audio_port_handle_t> tracks;
+    for (int i = 0; i < mFdp.ConsumeIntegralInRange<int32_t>(0, MAX_ARRAY_LENGTH); ++i) {
+        tracks.push_back(static_cast<audio_port_handle_t>(mFdp.ConsumeIntegral<int32_t>()));
+    }
+    af->invalidateTracks(tracks);
 }
 
 status_t AudioFlingerFuzzer::invokeAudioInputDevice() {

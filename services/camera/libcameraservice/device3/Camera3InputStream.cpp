@@ -18,16 +18,19 @@
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
 
+#include <camera/StringUtils.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
+
 #include "Camera3InputStream.h"
 
 namespace android {
 
 namespace camera3 {
 
-const String8 Camera3InputStream::FAKE_ID;
+const std::string Camera3InputStream::FAKE_ID;
 
 Camera3InputStream::Camera3InputStream(int id,
         uint32_t width, uint32_t height, int format) :
@@ -104,17 +107,14 @@ status_t Camera3InputStream::getInputBufferLocked(
 
 status_t Camera3InputStream::returnBufferCheckedLocked(
             const camera_stream_buffer &buffer,
-            nsecs_t timestamp,
-            nsecs_t readoutTimestamp,
-            bool output,
+            [[maybe_unused]] nsecs_t timestamp,
+            [[maybe_unused]] nsecs_t readoutTimestamp,
+            [[maybe_unused]] bool output,
             int32_t /*transform*/,
             const std::vector<size_t>&,
             /*out*/
             sp<Fence> *releaseFenceOut) {
 
-    (void)timestamp;
-    (void)readoutTimestamp;
-    (void)output;
     ALOG_ASSERT(!output, "Expected output to be false");
 
     status_t res;
@@ -182,6 +182,21 @@ status_t Camera3InputStream::returnInputBufferLocked(
                                  /*output*/false, /*transform*/ -1);
 }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+status_t Camera3InputStream::getInputSurfaceLocked(sp<Surface> *surface) {
+    ATRACE_CALL();
+
+    if (surface == NULL) {
+        return BAD_VALUE;
+    } else if (mSurface == NULL) {
+        ALOGE("%s: No input stream is configured", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    *surface = mSurface;
+    return OK;
+}
+#else
 status_t Camera3InputStream::getInputBufferProducerLocked(
             sp<IGraphicBufferProducer> *producer) {
     ATRACE_CALL();
@@ -196,6 +211,7 @@ status_t Camera3InputStream::getInputBufferProducerLocked(
     *producer = mProducer;
     return OK;
 }
+#endif
 
 status_t Camera3InputStream::disconnectLocked() {
 
@@ -218,11 +234,10 @@ status_t Camera3InputStream::disconnectLocked() {
     return OK;
 }
 
-void Camera3InputStream::dump(int fd, const Vector<String16> &args) const {
-    (void) args;
-    String8 lines;
-    lines.appendFormat("    Stream[%d]: Input\n", mId);
-    write(fd, lines.string(), lines.size());
+void Camera3InputStream::dump(int fd, [[maybe_unused]] const Vector<String16> &args) {
+    std::string lines;
+    lines += fmt::sprintf("    Stream[%d]: Input\n", mId);
+    write(fd, lines.c_str(), lines.size());
 
     Camera3IOStreamBase::dump(fd, args);
 }
@@ -242,9 +257,15 @@ status_t Camera3InputStream::configureQueueLocked() {
     mLastTimestamp = 0;
 
     if (mConsumer.get() == 0) {
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        sp<BufferItemConsumer> bufferItemConsumer = new BufferItemConsumer(mUsage);
+        sp<IGraphicBufferProducer> producer =
+                bufferItemConsumer->getSurface()->getIGraphicBufferProducer();
+#else
         sp<IGraphicBufferProducer> producer;
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&producer, &consumer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
         int minUndequeuedBuffers = 0;
         res = producer->query(NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &minUndequeuedBuffers);
@@ -274,11 +295,24 @@ status_t Camera3InputStream::configureQueueLocked() {
             camera_stream::max_buffers : minBufs;
         // TODO: somehow set the total buffer count when producer connects?
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mConsumer = bufferItemConsumer;
+        mConsumer->setName(String8::format("Camera3-InputStream-%d", mId));
+        mConsumer->setMaxAcquiredBufferCount(mTotalBufferCount);
+
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+        mSurface = mConsumer->getSurface();
+#else
+        mProducer = mConsumer->getSurface()->getIGraphicBufferProducer();
+#endif // WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+
+#else
         mConsumer = new BufferItemConsumer(consumer, mUsage,
                                            mTotalBufferCount);
         mConsumer->setName(String8::format("Camera3-InputStream-%d", mId));
 
         mProducer = producer;
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
         mConsumer->setBufferFreedListener(this);
     }
@@ -300,7 +334,7 @@ status_t Camera3InputStream::configureQueueLocked() {
     return OK;
 }
 
-status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) const {
+status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) {
     // Per HAL3 spec, input streams have 0 for their initial usage field.
     *usage = 0;
     return OK;

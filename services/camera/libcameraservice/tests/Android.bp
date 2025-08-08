@@ -18,54 +18,50 @@ package {
     ],
 }
 
-cc_test {
-    name: "cameraservice_test",
+cc_defaults {
+    name: "cameraservice_test_hostsupported",
 
-    include_dirs: [
-        "system/media/private/camera/include",
-        "external/dynamic_depth/includes",
-        "external/dynamic_depth/internal",
-    ],
-
-    shared_libs: [
-        "libbase",
-        "libcutils",
-        "libcameraservice",
-        "libhidlbase",
-        "liblog",
-        "libcamera_client",
-        "libcamera_metadata",
-        "libui",
-        "libutils",
-        "libjpeg",
-        "libexif",
-        "android.hardware.camera.common@1.0",
-        "android.hardware.camera.provider@2.4",
-        "android.hardware.camera.provider@2.5",
-        "android.hardware.camera.provider@2.6",
-        "android.hardware.camera.provider@2.7",
-        "android.hardware.camera.provider-V1-ndk",
-        "android.hardware.camera.device@1.0",
-        "android.hardware.camera.device@3.2",
-        "android.hardware.camera.device@3.4",
-        "android.hardware.camera.device@3.7",
-        "android.hidl.token@1.0-utils",
-    ],
-
-    static_libs: [
-        "libgmock",
-    ],
-
+    // All test sources that can run on both host and device
+    // should be listed here
     srcs: [
-        "CameraProviderManagerTest.cpp",
         "ClientManagerTest.cpp",
         "DepthProcessorTest.cpp",
         "DistortionMapperTest.cpp",
         "ExifUtilsTest.cpp",
         "NV12Compressor.cpp",
         "RotateAndCropMapperTest.cpp",
+        "SessionStatsBuilderTest.cpp",
         "ZoomRatioTest.cpp",
     ],
+
+    // All shared libs available on both host and device
+    // should be listed here
+    shared_libs: [
+        "libbase",
+        "libbinder",
+        "libcamera_metadata",
+        "libexif",
+        "libjpeg",
+        "liblog",
+        "libutils",
+    ],
+
+    static_libs: [
+        "libgmock",
+    ],
+
+    target: {
+        android: {
+            shared_libs: [
+                "camera_platform_flags_c_lib",
+            ],
+        },
+        host: {
+            shared_libs: [
+                "camera_platform_flags_c_lib_for_test",
+            ],
+        },
+    },
 
     cflags: [
         "-Wall",
@@ -77,49 +73,84 @@ cc_test {
 
 }
 
+cc_test {
+    name: "cameraservice_test",
+
+    include_dirs: [
+        "system/media/private/camera/include",
+        "external/dynamic_depth/includes",
+        "external/dynamic_depth/internal",
+    ],
+
+    header_libs: [
+        "libmedia_headers",
+    ],
+
+    defaults: [
+        "libcameraservice_deps",
+        "cameraservice_test_hostsupported",
+    ],
+
+    // Only include libs that can't be run host-side here
+    shared_libs: [
+        "libcutils",
+        "libhidlbase",
+        "libcamera_client",
+        "libgui",
+        "libui",
+        "android.companion.virtualdevice.flags-aconfig-cc",
+        "android.hardware.camera.common@1.0",
+        "android.hardware.camera.device@1.0",
+        "android.hardware.camera.device@3.2",
+        "android.hardware.camera.device@3.4",
+        "android.hardware.camera.device@3.7",
+        "android.hidl.token@1.0-utils",
+        "camera_platform_flags_c_lib",
+    ],
+
+    // Only include libs that can't be run host-side here
+    static_libs: [
+        "android.hardware.camera.provider@2.4",
+        "android.hardware.camera.provider@2.5",
+        "android.hardware.camera.provider@2.6",
+        "android.hardware.camera.provider@2.7",
+        "android.hardware.camera.provider-V3-ndk",
+        "libcameraservice",
+        "libflagtest",
+    ],
+
+    // Only include sources that can't be run host-side here
+    srcs: [
+        "Camera3StreamSplitterTest.cpp",
+        "CameraPermissionsTest.cpp",
+        "CameraProviderManagerTest.cpp",
+    ],
+
+}
+
 cc_test_host {
     name: "cameraservice_test_host",
+
+    defaults: [
+        "cameraservice_test_hostsupported",
+    ],
 
     include_dirs: [
         "frameworks/av/camera/include",
         "frameworks/av/camera/include/camera",
-        "frameworks/native/libs/binder/include_activitymanager"
+        "frameworks/native/libs/binder/include_activitymanager",
     ],
 
+    // Only include libs that can't be run device-side here
     shared_libs: [
         "libactivity_manager_procstate_aidl-cpp",
-        "libbase",
-        "libbinder",
-        "libcamera_metadata",
         "libdynamic_depth",
-        "libexif",
-        "libjpeg",
-        "liblog",
-        "libutils",
     ],
 
+    // Only include libs that can't be run device-side here
     static_libs: [
         "libcamera_client_host",
         "libcameraservice_device_independent",
-        "libgmock",
     ],
-
-    srcs: [
-        "ClientManagerTest.cpp",
-        "DepthProcessorTest.cpp",
-        "DistortionMapperTest.cpp",
-        "ExifUtilsTest.cpp",
-        "NV12Compressor.cpp",
-        "RotateAndCropMapperTest.cpp",
-        "ZoomRatioTest.cpp",
-    ],
-
-    cflags: [
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    ],
-
-    test_suites: ["device-tests"],
 
 }

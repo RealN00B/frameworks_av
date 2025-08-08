@@ -29,8 +29,10 @@ cc_library {
         "packagemanager_aidl-cpp",
     ],
 
+    export_include_dirs: ["."],
+
     cflags: [
-        "-Werror",
         "-Wall",
+        "-Werror",
     ],
 }

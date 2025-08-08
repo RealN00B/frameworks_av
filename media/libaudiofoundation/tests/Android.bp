@@ -22,6 +22,7 @@ cc_test {
 
     static_libs: [
         "audioclient-types-aidl-cpp",
+        "libaudio_aidl_conversion_common_cpp",
         "libaudioclient_aidl_conversion",
         "libaudiofoundation",
         "libstagefright_foundation",
@@ -36,8 +37,35 @@ cc_test {
     ],
 
     cflags: [
-        "-Werror",
         "-Wall",
+        "-Werror",
+    ],
+
+    test_suites: ["device-tests"],
+}
+
+cc_test {
+    name: "audiofoundation_containers_test",
+
+    shared_libs: [
+        "liblog",
+    ],
+
+    static_libs: [
+        "libaudiofoundation",
+    ],
+
+    header_libs: [
+        "libaudio_system_headers",
+    ],
+
+    srcs: [
+        "audiofoundation_containers_test.cpp",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
     ],
 
     test_suites: ["device-tests"],

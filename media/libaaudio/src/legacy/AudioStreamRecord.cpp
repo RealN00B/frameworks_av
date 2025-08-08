@@ -112,9 +112,7 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
     mCallbackBufferSize = builder.getFramesPerDataCallback();
 
     // Don't call mAudioRecord->setInputDevice() because it will be overwritten by set()!
-    audio_port_handle_t selectedDeviceId = (getDeviceId() == AAUDIO_UNSPECIFIED)
-                                           ? AUDIO_PORT_HANDLE_NONE
-                                           : getDeviceId();
+    audio_port_handle_t selectedDeviceId = getFirstDeviceId(getDeviceIds());
 
     const audio_content_type_t contentType =
             AAudioConvert_contentTypeToInternal(builder.getContentType());
@@ -198,7 +196,8 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
                  AudioGlobal_convertPerformanceModeToText(builder.getPerformanceMode()))
             .set(AMEDIAMETRICS_PROP_SHARINGMODE,
                  AudioGlobal_convertSharingModeToText(builder.getSharingMode()))
-            .set(AMEDIAMETRICS_PROP_ENCODINGCLIENT, toString(requestedFormat).c_str()).record();
+            .set(AMEDIAMETRICS_PROP_ENCODINGCLIENT,
+                 android::toString(requestedFormat).c_str()).record();
 
     // Get the actual values from the AudioRecord.
     setChannelMask(AAudioConvert_androidToAAudioChannelMask(
@@ -207,6 +206,16 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
     setSampleRate(mAudioRecord->getSampleRate());
     setBufferCapacity(getBufferCapacityFromDevice());
     setFramesPerBurst(getFramesPerBurstFromDevice());
+
+    // Use the same values for device values.
+    setDeviceSamplesPerFrame(getSamplesPerFrame());
+    setDeviceSampleRate(mAudioRecord->getSampleRate());
+    setDeviceBufferCapacity(getBufferCapacityFromDevice());
+    setDeviceFramesPerBurst(getFramesPerBurstFromDevice());
+
+    setHardwareSamplesPerFrame(mAudioRecord->getHalChannelCount());
+    setHardwareSampleRate(mAudioRecord->getHalSampleRate());
+    setHardwareFormat(mAudioRecord->getHalFormat());
 
     // We may need to pass the data through a block size adapter to guarantee constant size.
     if (mCallbackBufferSize != AAUDIO_UNSPECIFIED) {
@@ -265,7 +274,7 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
              perfMode, actualPerformanceMode);
 
     setState(AAUDIO_STREAM_STATE_OPEN);
-    setDeviceId(mAudioRecord->getRoutedDeviceId());
+    setDeviceIds(mAudioRecord->getRoutedDeviceIds());
 
     aaudio_session_id_t actualSessionId =
             (requestedSessionId == AAUDIO_SESSION_ID_NONE)
@@ -364,8 +373,7 @@ aaudio_result_t AudioStreamRecord::requestStop_l() {
     return checkForDisconnectRequest(false);
 }
 
-aaudio_result_t AudioStreamRecord::updateStateMachine()
-{
+aaudio_result_t AudioStreamRecord::processCommands() {
     aaudio_result_t result = AAUDIO_OK;
     aaudio_wrapping_frames_t position;
     status_t err;
@@ -404,7 +412,7 @@ aaudio_result_t AudioStreamRecord::read(void *buffer,
         return result;
     }
 
-    if (getState() == AAUDIO_STREAM_STATE_DISCONNECTED) {
+    if (isDisconnected()) {
         return AAUDIO_ERROR_DISCONNECTED;
     }
 
@@ -447,7 +455,7 @@ aaudio_result_t AudioStreamRecord::read(void *buffer,
         // In this context, a DEAD_OBJECT is more likely to be a disconnect notification due to
         // AudioRecord invalidation.
         if (bytesActuallyRead == DEAD_OBJECT) {
-            setState(AAUDIO_STREAM_STATE_DISCONNECTED);
+            setDisconnected();
             return AAUDIO_ERROR_DISCONNECTED;
         }
         return AAudioConvert_androidToAAudioResult(bytesActuallyRead);

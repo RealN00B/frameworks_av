@@ -22,6 +22,7 @@
 #include <utils/Mutex.h>
 
 #include "android/media/BnPlayer.h"
+#include "media/AudioContainers.h"
 
 namespace android {
 
@@ -44,15 +45,19 @@ public:
             const media::VolumeShaperConfiguration& configuration,
             const media::VolumeShaperOperation& operation) override;
 
-            status_t startWithStatus(audio_port_handle_t deviceId);
+            status_t startWithStatus(const DeviceIdVector& deviceIds);
             status_t pauseWithStatus();
             status_t stopWithStatus();
 
             //FIXME temporary method while some player state is outside of this class
-            void reportEvent(player_state_t event, audio_port_handle_t deviceId);
+            void reportEvent(player_state_t event, const DeviceIdVector& deviceIds);
 
-            void baseUpdateDeviceId(audio_port_handle_t deviceId);
+            void baseUpdateDeviceIds(const DeviceIdVector& deviceIds);
 
+            /**
+             * Updates the mapping in the AudioService between portId and piid
+             */
+            void triggerPortIdUpdate(audio_port_handle_t portId) const;
 protected:
 
             void init(player_type_t playerType, audio_usage_t usage, audio_session_t sessionId);
@@ -74,10 +79,9 @@ protected:
     // player interface ID, uniquely identifies the player in the system
     // effectively const after PlayerBase::init().
     audio_unique_id_t mPIId;
-
 private:
             // report events to AudioService
-            void servicePlayerEvent(player_state_t event, audio_port_handle_t deviceId);
+            void servicePlayerEvent(player_state_t event, const DeviceIdVector& deviceIds);
             void serviceReleasePlayer();
 
     // native interface to AudioService
@@ -88,7 +92,7 @@ private:
     player_state_t mLastReportedEvent;
 
     Mutex mDeviceIdLock;
-    audio_port_handle_t mLastReportedDeviceId;
+    DeviceIdVector mLastReportedDeviceIds GUARDED_BY(mDeviceIdLock);
 };
 
 } // namespace android

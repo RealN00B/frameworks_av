@@ -72,12 +72,13 @@ struct C2SyncVariables {
     /**
      * Notify a buffer is queued. Return whether the upcoming dequeue operation
      * is not blocked. if it's blocked and waitId is non-null, waitId is returned
-     * to be used for waiting.
+     * to be used for waiting. Notify(wake-up) waitors only when 'notify' is
+     * true.
      *
      * \retval false    dequeue operation is blocked now.
      * \retval true     dequeue operation is possible.
      */
-    bool notifyQueuedLocked(uint32_t *waitId = nullptr);
+    bool notifyQueuedLocked(uint32_t *waitId = nullptr, bool notify = true);
 
     /**
      * Notify a buffer is dequeued.
@@ -111,6 +112,21 @@ struct C2SyncVariables {
      */
     c2_status_t waitForChange(uint32_t waitId, c2_nsecs_t timeoutNs);
 
+    /**
+     * Wake up and expire all waitors.
+     */
+    void notifyAll();
+
+    /**
+     * Invalide current sync variables on the death of the other process.
+     */
+    void invalidate();
+
+    /**
+     * If a dead process holds the lock, clear the lock.
+     */
+    void clearLockIfNecessary();
+
     C2SyncVariables() {}
 
 private:
@@ -128,6 +144,11 @@ private:
      * wait for signal or broadcast.
      */
     int wait();
+
+    /**
+     * try lock for the specified duration.
+     */
+    bool tryLockFor(size_t ms);
 
     std::atomic<uint32_t> mLock;
     std::atomic<uint32_t> mCond;

@@ -17,9 +17,9 @@
 #ifndef ANDROID_SERVERS_CAMERA3_STREAM_H
 #define ANDROID_SERVERS_CAMERA3_STREAM_H
 
+#include <gui/Flags.h>
 #include <gui/Surface.h>
 #include <utils/RefBase.h>
-#include <utils/String8.h>
 #include <utils/String16.h>
 #include <utils/List.h>
 
@@ -163,24 +163,25 @@ class Camera3Stream :
     /**
      * Get the stream's dimensions and format
      */
-    uint32_t          getWidth() const;
-    uint32_t          getHeight() const;
-    int               getFormat() const;
-    android_dataspace getDataSpace() const;
-    uint64_t          getUsage() const;
-    void              setUsage(uint64_t usage);
-    void              setFormatOverride(bool formatOverriden);
-    bool              isFormatOverridden() const;
-    int               getOriginalFormat() const;
-    int64_t           getDynamicRangeProfile() const;
-    void              setDataSpaceOverride(bool dataSpaceOverriden);
-    bool              isDataSpaceOverridden() const;
-    android_dataspace getOriginalDataSpace() const;
-    int               getMaxHalBuffers() const;
-    const String8&    physicalCameraId() const;
-    int64_t           getStreamUseCase() const;
-    int               getTimestampBase() const;
-    bool              isDeviceTimeBaseRealtime() const;
+    uint32_t           getWidth() const;
+    uint32_t           getHeight() const;
+    int                getFormat() const;
+    android_dataspace  getDataSpace() const;
+    int32_t            getColorSpace() const;
+    uint64_t           getUsage() const;
+    void               setUsage(uint64_t usage);
+    void               setFormatOverride(bool formatOverridden);
+    bool               isFormatOverridden() const;
+    int                getOriginalFormat() const;
+    int64_t            getDynamicRangeProfile() const;
+    void               setDataSpaceOverride(bool dataSpaceOverridden);
+    bool               isDataSpaceOverridden() const;
+    android_dataspace  getOriginalDataSpace() const;
+    int                getMaxHalBuffers() const;
+    const std::string& physicalCameraId() const;
+    int64_t            getStreamUseCase() const;
+    int                getTimestampBase() const;
+    bool               isDeviceTimeBaseRealtime() const;
 
     void              setOfflineProcessingSupport(bool) override;
     bool              getOfflineProcessingSupport() const override;
@@ -343,12 +344,6 @@ class Camera3Stream :
             const std::vector<size_t>& surface_ids = std::vector<size_t>());
 
     /**
-     * Similar to getBuffer() except this method fills multiple buffers.
-     */
-    status_t         getBuffers(std::vector<OutstandingBuffer>* buffers,
-            nsecs_t waitBufferTimeout);
-
-    /**
      * Return a buffer to the stream after use by the HAL.
      *
      * Multiple surfaces could share the same HAL stream, but a request may
@@ -388,9 +383,13 @@ class Camera3Stream :
      */
     status_t         returnInputBuffer(const camera_stream_buffer &buffer);
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    status_t         getInputSurface(sp<Surface> *producer);
+#else
     // get the buffer producer of the input buffer queue.
     // only apply to input streams.
     status_t         getInputBufferProducer(sp<IGraphicBufferProducer> *producer);
+#endif
 
     /**
      * Whether any of the stream's buffers are currently in use by the HAL,
@@ -414,6 +413,11 @@ class Camera3Stream :
     virtual status_t setStatusTracker(sp<StatusTracker> statusTracker);
 
     /**
+     * Toggle the state of hal buffer manager
+     */
+    virtual void setHalBufferManager(bool /*enabled*/) {/* No-op */ }
+
+    /**
      * Disconnect stream from its non-HAL endpoint. After this,
      * start/finishConfiguration must be called before the stream can be used
      * again. This cannot be called if the stream has outstanding dequeued
@@ -424,7 +428,7 @@ class Camera3Stream :
     /**
      * Debug dump of the stream's state.
      */
-    virtual void     dump(int fd, const Vector<String16> &args) const;
+    virtual void     dump(int fd, const Vector<String16> &args);
 
     /**
      * Add a camera3 buffer listener. Adding the same listener twice has
@@ -486,7 +490,7 @@ class Camera3Stream :
      */
     const int mSetId;
 
-    const String8 mName;
+    const std::string mName;
     // Zero for formats with fixed buffer size for given dimensions.
     const size_t mMaxSize;
 
@@ -506,10 +510,11 @@ class Camera3Stream :
     Camera3Stream(int id, camera_stream_type type,
             uint32_t width, uint32_t height, size_t maxSize, int format,
             android_dataspace dataSpace, camera_stream_rotation_t rotation,
-            const String8& physicalCameraId,
+            const std::string& physicalCameraId,
             const std::unordered_set<int32_t> &sensorPixelModesUsed,
             int setId, bool isMultiResolution, int64_t dynamicRangeProfile,
-            int64_t streamUseCase, bool deviceTimeBaseIsRealtime, int timestampBase);
+            int64_t streamUseCase, bool deviceTimeBaseIsRealtime, int timestampBase,
+            int32_t colorSpace);
 
     wp<Camera3StreamBufferFreedListener> mBufferFreedListener;
 
@@ -529,15 +534,17 @@ class Camera3Stream :
             nsecs_t timestamp, nsecs_t readoutTimestamp, int32_t transform,
             const std::vector<size_t>& surface_ids = std::vector<size_t>());
 
-    virtual status_t getBuffersLocked(std::vector<OutstandingBuffer>*);
-
     virtual status_t getInputBufferLocked(camera_stream_buffer *buffer, Size* size);
 
     virtual status_t returnInputBufferLocked(
             const camera_stream_buffer &buffer);
     virtual bool     hasOutstandingBuffersLocked() const = 0;
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    virtual status_t getInputSurfaceLocked(sp<Surface> *surface);
+#else
     // Get the buffer producer of the input buffer queue. Only apply to input streams.
     virtual status_t getInputBufferProducerLocked(sp<IGraphicBufferProducer> *producer);
+#endif
 
     // Can return -ENOTCONN when we are already disconnected (not an error)
     virtual status_t disconnectLocked() = 0;
@@ -558,9 +565,13 @@ class Camera3Stream :
     // Get handout input buffer count.
     virtual size_t   getHandoutInputBufferCountLocked() = 0;
 
+    // Get cached output buffer count.
+    virtual size_t   getCachedOutputBufferCountLocked() const = 0;
+    virtual size_t   getMaxCachedOutputBuffersLocked() const = 0;
+
     // Get the usage flags for the other endpoint, or return
     // INVALID_OPERATION if they cannot be obtained.
-    virtual status_t getEndpointUsage(uint64_t *usage) const = 0;
+    virtual status_t getEndpointUsage(uint64_t *usage) = 0;
 
     // Return whether the buffer is in the list of outstanding buffers.
     bool isOutstandingBuffer(const camera_stream_buffer& buffer) const;
@@ -576,6 +587,8 @@ class Camera3Stream :
 
     uint64_t mUsage;
 
+    Condition mOutputBufferReturnedSignal;
+
   private:
     // Previously configured stream properties (post HAL override)
     uint64_t mOldUsage;
@@ -583,7 +596,6 @@ class Camera3Stream :
     int mOldFormat;
     android_dataspace mOldDataSpace;
 
-    Condition mOutputBufferReturnedSignal;
     Condition mInputBufferReturnedSignal;
     static const nsecs_t kWaitForBufferDuration = 3000000000LL; // 3000 ms
 
@@ -627,7 +639,7 @@ class Camera3Stream :
     bool mDataSpaceOverridden;
     const android_dataspace mOriginalDataSpace;
 
-    String8 mPhysicalCameraId;
+    std::string mPhysicalCameraId;
     nsecs_t mLastTimestamp;
 
     bool mIsMultiResolution = false;

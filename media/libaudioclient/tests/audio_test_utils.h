@@ -19,22 +19,17 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
-#include <atomic>
-#include <chrono>
-#include <cinttypes>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
+#include <android-base/thread_annotations.h>
 #include <binder/MemoryDealer.h>
-#include <libxml/parser.h>
-#include <libxml/xinclude.h>
 #include <media/AidlConversion.h>
 #include <media/AudioRecord.h>
 #include <media/AudioTrack.h>
-
-#define RECORD_TO_FILE 0
 
 using namespace android;
 
@@ -50,19 +45,16 @@ struct Route {
     std::string sink;
 };
 
-status_t parse_audio_policy_configuration_xml(std::vector<std::string>& attachedDevices,
-                                              std::vector<MixPort>& mixPorts,
-                                              std::vector<Route>& routes);
-void CreateRandomFile(int& fd);
 status_t listAudioPorts(std::vector<audio_port_v7>& portsVec);
 status_t listAudioPatches(std::vector<struct audio_patch>& patchesVec);
 status_t getPortByAttributes(audio_port_role_t role, audio_port_type_t type,
-                             audio_devices_t deviceType, audio_port_v7& port);
+                             audio_devices_t deviceType, const std::string& address,
+                             audio_port_v7& port);
 status_t getPatchForOutputMix(audio_io_handle_t audioIo, audio_patch& patch);
 status_t getPatchForInputMix(audio_io_handle_t audioIo, audio_patch& patch);
-bool patchContainsOutputDevice(audio_port_handle_t deviceId, audio_patch patch);
+bool patchContainsOutputDevices(DeviceIdVector deviceIds, audio_patch patch);
 bool patchContainsInputDevice(audio_port_handle_t deviceId, audio_patch patch);
-bool checkPatchPlayback(audio_io_handle_t audioIo, audio_port_handle_t deviceId);
+bool checkPatchPlayback(audio_io_handle_t audioIo, const DeviceIdVector& deviceIds);
 bool checkPatchCapture(audio_io_handle_t audioIo, audio_port_handle_t deviceId);
 std::string dumpPort(const audio_port_v7& port);
 std::string dumpPortConfig(const audio_port_config& port);
@@ -70,13 +62,15 @@ std::string dumpPatch(const audio_patch& patch);
 
 class OnAudioDeviceUpdateNotifier : public AudioSystem::AudioDeviceCallback {
   public:
-    audio_io_handle_t mAudioIo = AUDIO_IO_HANDLE_NONE;
-    audio_port_handle_t mDeviceId = AUDIO_PORT_HANDLE_NONE;
-    std::mutex mMutex;
-    std::condition_variable mCondition;
+    void onAudioDeviceUpdate(audio_io_handle_t audioIo, const DeviceIdVector& deviceIds) override;
+    status_t waitForAudioDeviceCb(audio_port_handle_t expDeviceId = AUDIO_PORT_HANDLE_NONE);
+    std::pair<audio_io_handle_t, DeviceIdVector> getLastPortAndDevices() const;
 
-    void onAudioDeviceUpdate(audio_io_handle_t audioIo, audio_port_handle_t deviceId);
-    status_t waitForAudioDeviceCb();
+  private:
+    audio_io_handle_t mAudioIo GUARDED_BY(mMutex) = AUDIO_IO_HANDLE_NONE;
+    DeviceIdVector mDeviceIds GUARDED_BY(mMutex);
+    mutable std::mutex mMutex;
+    std::condition_variable mCondition;
 };
 
 // Simple AudioPlayback class.
@@ -93,15 +87,14 @@ class AudioPlayback : public AudioTrack::IAudioTrackCallback {
     status_t create();
     sp<AudioTrack> getAudioTrackHandle();
     status_t start();
-    status_t waitForConsumption(bool testSeek = false);
+    status_t waitForConsumption(bool testSeek = false) EXCLUDES(mMutex);
     status_t fillBuffer();
     status_t onProcess(bool testSeek = false);
-    virtual void onBufferEnd() override;
-    void stop();
+    void onBufferEnd() override EXCLUDES(mMutex);
+    void stop() EXCLUDES(mMutex);
 
-    bool mStopPlaying;
-    std::mutex mMutex;
-    std::condition_variable mCondition;
+    bool mStopPlaying GUARDED_BY(mMutex);
+    mutable std::mutex mMutex;
 
     enum State {
         PLAY_NO_INIT,
@@ -148,32 +141,35 @@ class AudioCapture : public AudioRecord::IAudioRecordCallback {
                  audio_channel_mask_t channelMask,
                  audio_input_flags_t flags = AUDIO_INPUT_FLAG_NONE,
                  audio_session_t sessionId = AUDIO_SESSION_ALLOCATE,
-                 AudioRecord::transfer_type transferType = AudioRecord::TRANSFER_CALLBACK);
+                 AudioRecord::transfer_type transferType = AudioRecord::TRANSFER_CALLBACK,
+                 const audio_attributes_t* attributes = nullptr);
     ~AudioCapture();
-    size_t onMoreData(const AudioRecord::Buffer& buffer) override;
+    size_t onMoreData(const AudioRecord::Buffer& buffer) override EXCLUDES(mMutex);
     void onOverrun() override;
-    void onMarker(uint32_t markerPosition) override;
-    void onNewPos(uint32_t newPos) override;
+    void onMarker(uint32_t markerPosition) override EXCLUDES(mMutex);
+    void onNewPos(uint32_t newPos) override EXCLUDES(mMutex);
     void onNewIAudioRecord() override;
     status_t create();
+    status_t setRecordDuration(float durationInSec);
+    status_t enableRecordDump();
+    std::string getRecordDumpFileName() const { return mFileName; }
     sp<AudioRecord> getAudioRecordHandle();
     status_t start(AudioSystem::sync_event_t event = AudioSystem::SYNC_EVENT_NONE,
                    audio_session_t triggerSession = AUDIO_SESSION_NONE);
-    status_t obtainBufferCb(RawBuffer& buffer);
-    status_t obtainBuffer(RawBuffer& buffer);
-    status_t audioProcess();
-    status_t stop();
+    status_t obtainBufferCb(RawBuffer& buffer) EXCLUDES(mMutex);
+    status_t obtainBuffer(RawBuffer& buffer) EXCLUDES(mMutex);
+    status_t audioProcess() EXCLUDES(mMutex);
+    status_t stop() EXCLUDES(mMutex);
+    uint32_t getMarkerPeriod() const EXCLUDES(mMutex);
+    uint32_t getMarkerPosition() const EXCLUDES(mMutex);
+    void setMarkerPeriod(uint32_t markerPeriod) EXCLUDES(mMutex);
+    void setMarkerPosition(uint32_t markerPosition) EXCLUDES(mMutex);
+    uint32_t waitAndGetReceivedCbMarkerAtPosition() const EXCLUDES(mMutex);
+    uint32_t waitAndGetReceivedCbMarkerCount() const EXCLUDES(mMutex);
 
-    uint32_t mFrameCount;
-    uint32_t mNotificationFrames;
-    int64_t mNumFramesToRecord;
-    int64_t mNumFramesReceived;
-    int64_t mNumFramesLost;
-    uint32_t mMarkerPosition;
-    uint32_t mMarkerPeriod;
-    uint32_t mReceivedCbMarkerAtPosition;
-    uint32_t mReceivedCbMarkerCount;
-    bool mBufferOverrun;
+    uint32_t mFrameCount = 0;
+    uint32_t mNotificationFrames = 0;
+    int64_t mNumFramesToRecord = 0;
 
     enum State {
         REC_NO_INIT,
@@ -190,16 +186,27 @@ class AudioCapture : public AudioRecord::IAudioRecordCallback {
     const audio_input_flags_t mFlags;
     const audio_session_t mSessionId;
     const AudioRecord::transfer_type mTransferType;
+    const audio_attributes_t* mAttributes;
 
     size_t mMaxBytesPerCallback = 2048;
     sp<AudioRecord> mRecord;
-    State mState;
-    bool mStopRecording;
+    State mState = REC_NO_INIT;
+    bool mStopRecording GUARDED_BY(mMutex) = false;
+    std::string mFileName;
     int mOutFileFd = -1;
 
-    std::mutex mMutex;
+    mutable std::mutex mMutex;
     std::condition_variable mCondition;
-    std::deque<RawBuffer> mBuffersReceived;
+    std::deque<RawBuffer> mBuffersReceived GUARDED_BY(mMutex);
+
+    mutable std::condition_variable mMarkerCondition;
+    uint32_t mMarkerPeriod GUARDED_BY(mMutex) = 0;
+    uint32_t mMarkerPosition GUARDED_BY(mMutex) = 0;
+    std::optional<uint32_t> mReceivedCbMarkerCount GUARDED_BY(mMutex);
+    std::optional<uint32_t> mReceivedCbMarkerAtPosition GUARDED_BY(mMutex);
+
+    int64_t mNumFramesReceived GUARDED_BY(mMutex) = 0;
+    int64_t mNumFramesLost GUARDED_BY(mMutex) = 0;
 };
 
 #endif  // AUDIO_TEST_UTILS_H_

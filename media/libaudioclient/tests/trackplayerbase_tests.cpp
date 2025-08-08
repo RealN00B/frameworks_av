@@ -16,9 +16,11 @@
 
 #define LOG_TAG "TrackPlayerBaseTest"
 
+#include <binder/ProcessState.h>
 #include <gtest/gtest.h>
-
 #include <media/TrackPlayerBase.h>
+
+#include "test_execution_tracer.h"
 
 using namespace android;
 using namespace android::media;
@@ -52,7 +54,7 @@ class TrackPlayerBaseTest
         mPlayer = new TrackPlayer();
         mPlayer->init(track.get(), mPlayer, PLAYER_TYPE_AAUDIO, AUDIO_USAGE_MEDIA,
                       AUDIO_SESSION_NONE);
-        sp<AudioTrack> playerTrack = mPlayer->mAudioTrack;
+        sp<AudioTrack> playerTrack = mPlayer->getAudioTrack();
         ASSERT_EQ(playerTrack->initCheck(), NO_ERROR);
 
         mBufferSize = mFrameCount * playerTrack->frameSize();
@@ -72,7 +74,7 @@ class TrackPlayerBaseTest
 
     void playBuffer() {
         bool blocking = true;
-        ssize_t nbytes = mPlayer->mAudioTrack->write(mBuffer.data(), mBufferSize, blocking);
+        ssize_t nbytes = mPlayer->getAudioTrack()->write(mBuffer.data(), mBufferSize, blocking);
         EXPECT_EQ(nbytes, mBufferSize) << "Did not write all data in blocking mode";
     }
 
@@ -159,3 +161,10 @@ TEST_P(PauseTestParam, PauseTest) {
 
 INSTANTIATE_TEST_SUITE_P(TrackPlayerTest, PauseTestParam,
                          ::testing::Values(std::make_tuple(1.0, 75.0, 2, 24000)));
+
+int main(int argc, char** argv) {
+    android::ProcessState::self()->startThreadPool();
+    ::testing::InitGoogleTest(&argc, argv);
+    ::testing::UnitTest::GetInstance()->listeners().Append(new TestExecutionTracer());
+    return RUN_ALL_TESTS();
+}

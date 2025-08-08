@@ -81,9 +81,6 @@ filegroup {
 cc_library_shared {
     name: "libmedia_omx",
     vendor_available: true,
-    vndk: {
-        enabled: true,
-    },
     double_loadable: true,
 
     srcs: [
@@ -107,8 +104,8 @@ cc_library_shared {
     ],
 
     shared_libs: [
-        "android.hidl.token@1.0-utils",
         "android.hardware.media.omx@1.0",
+        "android.hidl.token@1.0-utils",
         "libbinder",
         "libcutils",
         "libhidlbase",
@@ -119,8 +116,8 @@ cc_library_shared {
     ],
 
     export_shared_lib_headers: [
-        "android.hidl.token@1.0-utils",
         "android.hardware.media.omx@1.0",
+        "android.hidl.token@1.0-utils",
         "libstagefright_foundation",
         "libui",
     ],
@@ -141,15 +138,15 @@ cc_library_shared {
     ],
 
     cflags: [
+        "-Wall",
         "-Werror",
         "-Wno-error=deprecated-declarations",
-        "-Wall",
     ],
 
     sanitize: {
         misc_undefined: [
-            "unsigned-integer-overflow",
             "signed-integer-overflow",
+            "unsigned-integer-overflow",
         ],
         cfi: true,
     },
@@ -200,15 +197,15 @@ cc_library_shared {
     ],
 
     cflags: [
+        "-Wall",
         "-Werror",
         "-Wno-error=deprecated-declarations",
-        "-Wall",
     ],
 
     sanitize: {
         misc_undefined: [
-            "unsigned-integer-overflow",
             "signed-integer-overflow",
+            "unsigned-integer-overflow",
         ],
         cfi: true,
     },
@@ -223,7 +220,6 @@ cc_library_static {
         "com.android.media",
     ],
 
-
     srcs: ["MidiIoWrapper.cpp"],
 
     static_libs: [
@@ -236,15 +232,15 @@ cc_library_static {
     ],
 
     cflags: [
+        "-Wall",
         "-Werror",
         "-Wno-error=deprecated-declarations",
-        "-Wall",
     ],
 
     sanitize: {
         misc_undefined: [
-            "unsigned-integer-overflow",
             "signed-integer-overflow",
+            "unsigned-integer-overflow",
         ],
         cfi: true,
     },
@@ -255,6 +251,47 @@ cc_library_static {
         darwin: {
             enabled: false,
         },
+    },
+}
+
+cc_library_shared {
+    name: "libmedia_codeclist_capabilities",
+
+    srcs: [
+        "AudioCapabilities.cpp",
+        "CodecCapabilities.cpp",
+        "EncoderCapabilities.cpp",
+        "VideoCapabilities.cpp",
+        "CodecCapabilitiesUtils.cpp",
+    ],
+
+    local_include_dirs: [
+        "include",
+    ],
+
+    shared_libs: [
+        "libbinder",
+        "liblog",
+        "libstagefright_foundation",
+        "libutils",
+    ],
+
+    export_include_dirs: [
+        "include",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-error=deprecated-declarations",
+    ],
+
+    sanitize: {
+        misc_undefined: [
+            "signed-integer-overflow",
+            "unsigned-integer-overflow",
+        ],
+        cfi: true,
     },
 }
 
@@ -274,12 +311,13 @@ cc_library_shared {
         "android.hardware.media.omx@1.0",
         "libbinder",
         "liblog",
+        "libmedia_codeclist_capabilities",
         "libstagefright_foundation",
         "libutils",
     ],
 
-    include_dirs: [
-        "system/libhidl/transport/token/1.0/utils/include",
+    static_libs: [
+        "android.media.codec-aconfig-cc",
     ],
 
     export_include_dirs: [
@@ -287,15 +325,15 @@ cc_library_shared {
     ],
 
     cflags: [
+        "-Wall",
         "-Werror",
         "-Wno-error=deprecated-declarations",
-        "-Wall",
     ],
 
     sanitize: {
         misc_undefined: [
-            "unsigned-integer-overflow",
             "signed-integer-overflow",
+            "unsigned-integer-overflow",
         ],
         cfi: true,
     },
@@ -310,35 +348,35 @@ cc_library {
 
     srcs: [
         ":mediaextractorservice_aidl",
-        "IDataSource.cpp",
         "BufferingSettings.cpp",
-        "mediaplayer.cpp",
+        "CharacterEncodingDetector.cpp",
+        "IDataSource.cpp",
+        "IMediaDeathNotifier.cpp",
+        "IMediaExtractor.cpp",
         "IMediaHTTPConnection.cpp",
         "IMediaHTTPService.cpp",
-        "IMediaExtractor.cpp",
-        "IMediaPlayerService.cpp",
-        "IMediaPlayerClient.cpp",
-        "IMediaRecorderClient.cpp",
+        "IMediaMetadataRetriever.cpp",
         "IMediaPlayer.cpp",
+        "IMediaPlayerClient.cpp",
+        "IMediaPlayerService.cpp",
         "IMediaRecorder.cpp",
+        "IMediaRecorderClient.cpp",
         "IMediaSource.cpp",
         "IRemoteDisplay.cpp",
         "IRemoteDisplayClient.cpp",
         "IStreamSource.cpp",
-        "Metadata.cpp",
-        "mediarecorder.cpp",
-        "IMediaMetadataRetriever.cpp",
-        "mediametadataretriever.cpp",
-        "MediaScanner.cpp",
-        "MediaScannerClient.cpp",
-        "CharacterEncodingDetector.cpp",
-        "IMediaDeathNotifier.cpp",
         "MediaProfiles.cpp",
         "MediaResource.cpp",
         "MediaResourcePolicy.cpp",
-        "StringArray.cpp",
-        "NdkMediaFormatPriv.cpp",
+        "MediaScanner.cpp",
+        "MediaScannerClient.cpp",
+        "Metadata.cpp",
         "NdkMediaErrorPriv.cpp",
+        "NdkMediaFormatPriv.cpp",
+        "StringArray.cpp",
+        "mediametadataretriever.cpp",
+        "mediaplayer.cpp",
+        "mediarecorder.cpp",
     ],
 
     aidl: {
@@ -347,57 +385,57 @@ cc_library {
     },
 
     header_libs: [
+        "jni_headers",
         "libstagefright_headers",
         "media_ndk_headers",
-        "jni_headers",
     ],
 
     export_header_lib_headers: [
+        "jni_headers",
         "libstagefright_headers",
         "media_ndk_headers",
-        "jni_headers",
     ],
 
     shared_libs: [
         "android.hidl.token@1.0-utils",
         "audioclient-types-aidl-cpp",
         "av-types-aidl-cpp",
-        "liblog",
-        "libcutils",
-        "libprocessgroup",
-        "libutils",
         "libbinder",
         "libbinder_ndk",
         //"libsonivox",
+        "libcutils",
+        "liblog",
+        "libutils",
+        "framework-permission-aidl-cpp",
         "libandroidicu",
-        "libexpat",
-        "libcamera_client",
-        "libstagefright_foundation",
-        "libgui",
-        "libdl",
         "libaudioclient",
+        "libaudiofoundation",
+        "libcamera_client",
+        "libdl",
+        "libexpat",
+        "libgui",
         "libmedia_codeclist",
         "libmedia_omx",
-        "framework-permission-aidl-cpp",
+        "libstagefright_foundation",
     ],
 
     export_shared_lib_headers: [
         "libaudioclient",
+        "libaudiofoundation",
         "libbinder",
-        "libandroidicu",
         //"libsonivox",
-        "libmedia_omx",
         "framework-permission-aidl-cpp",
+        "libmedia_omx",
     ],
 
     static_libs: [
-        "resourcemanager_aidl_interface-ndk",
         "framework-permission-aidl-cpp",
+        "resourcemanager_aidl_interface-ndk",
     ],
 
     export_static_lib_headers: [
-        "resourcemanager_aidl_interface-ndk",
         "framework-permission-aidl-cpp",
+        "resourcemanager_aidl_interface-ndk",
     ],
 
     export_include_dirs: [
@@ -405,17 +443,17 @@ cc_library {
     ],
 
     cflags: [
+        "-Wall",
         "-Werror",
         "-Wno-error=deprecated-declarations",
-        "-Wall",
     ],
 
     version_script: "exports.lds",
 
     sanitize: {
         misc_undefined: [
-            "unsigned-integer-overflow",
             "signed-integer-overflow",
+            "unsigned-integer-overflow",
         ],
         cfi: true,
     },
@@ -427,8 +465,8 @@ cc_library_static {
     host_supported: true,
 
     srcs: [
-        "NdkMediaFormatPriv.cpp",
         "NdkMediaErrorPriv.cpp",
+        "NdkMediaFormatPriv.cpp",
     ],
 
     header_libs: [
@@ -439,8 +477,8 @@ cc_library_static {
 
     cflags: [
         "-DEXPORT=__attribute__((visibility(\"default\")))",
-        "-Werror",
         "-Wall",
+        "-Werror",
     ],
 
     export_include_dirs: ["include"],

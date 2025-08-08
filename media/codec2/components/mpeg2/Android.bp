@@ -16,5 +16,8 @@ cc_library {
 
     srcs: ["C2SoftMpeg2Dec.cpp"],
 
-    static_libs: ["libmpeg2dec"],
+    static_libs: [
+        "libmpeg2dec",
+        "android.media.swcodec.flags-aconfig-cc",
+    ],
 }

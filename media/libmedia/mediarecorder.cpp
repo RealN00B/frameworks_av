@@ -472,7 +472,7 @@ status_t MediaRecorder::setVideoFrameRate(int frames_per_second)
 }
 
 status_t MediaRecorder::setParameters(const String8& params) {
-    ALOGV("setParameters(%s)", params.string());
+    ALOGV("setParameters(%s)", params.c_str());
     if (mMediaRecorder == NULL) {
         ALOGE("media recorder is not initialized yet");
         return INVALID_OPERATION;
@@ -496,7 +496,7 @@ status_t MediaRecorder::setParameters(const String8& params) {
 
     status_t ret = mMediaRecorder->setParameters(params);
     if (OK != ret) {
-        ALOGE("setParameters(%s) failed: %d", params.string(), ret);
+        ALOGE("setParameters(%s) failed: %d", params.c_str(), ret);
         // Do not change our current state to MEDIA_RECORDER_ERROR, failures
         // of the only currently supported parameters, "max-duration" and
         // "max-filesize" are _not_ fatal.
@@ -858,17 +858,17 @@ status_t MediaRecorder::setInputDevice(audio_port_handle_t deviceId)
     return mMediaRecorder->setInputDevice(deviceId);
 }
 
-status_t MediaRecorder::getRoutedDeviceId(audio_port_handle_t* deviceId)
+status_t MediaRecorder::getRoutedDeviceIds(DeviceIdVector& deviceIds)
 {
-    ALOGV("getRoutedDeviceId");
+    ALOGV("getRoutedDeviceIds");
 
     if (mMediaRecorder == NULL) {
         ALOGE("media recorder is not initialized yet");
         return INVALID_OPERATION;
     }
-    status_t status = mMediaRecorder->getRoutedDeviceId(deviceId);
+    status_t status = mMediaRecorder->getRoutedDeviceIds(deviceIds);
     if (status != NO_ERROR) {
-        *deviceId = AUDIO_PORT_HANDLE_NONE;
+        deviceIds.clear();
     }
     return status;
 }
@@ -884,7 +884,8 @@ status_t MediaRecorder::enableAudioDeviceCallback(bool enabled)
     return mMediaRecorder->enableAudioDeviceCallback(enabled);
 }
 
-status_t MediaRecorder::getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones)
+status_t MediaRecorder::getActiveMicrophones(
+        std::vector<media::MicrophoneInfoFw>* activeMicrophones)
 {
     ALOGV("getActiveMicrophones");
 

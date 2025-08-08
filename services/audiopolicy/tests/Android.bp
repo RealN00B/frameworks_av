@@ -1,4 +1,5 @@
 package {
+    default_team: "trendy_team_android_media_audio_framework",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "frameworks_av_license"
@@ -11,6 +12,7 @@ cc_test {
     name: "audiopolicy_tests",
 
     defaults: [
+        "aconfig_lib_cc_shared_link.defaults",
         "latest_android_media_audio_common_types_cpp_static",
     ],
 
@@ -19,23 +21,32 @@ cc_test {
     ],
 
     shared_libs: [
+        "audiopolicy-aidl-cpp",
+        "framework-permission-aidl-cpp",
         "libaudioclient",
         "libaudiofoundation",
         "libaudiopolicy",
         "libaudiopolicymanagerdefault",
         "libbase",
+        "libbinder",
+        "libcutils",
         "libhidlbase",
         "liblog",
         "libmedia_helper",
+        "libstagefright_foundation",
         "libutils",
         "libxml2",
-        "framework-permission-aidl-cpp",
-        "libbinder",
+        "server_configurable_flags",
     ],
 
     static_libs: [
+        "android.media.audiopolicy-aconfig-cc",
         "audioclient-types-aidl-cpp",
+        "com.android.media.audio-aconfig-cc",
+        "com.android.media.audioserver-aconfig-cc",
+        "libaudio_aidl_conversion_common_cpp",
         "libaudiopolicycomponents",
+        "libflagtest",
         "libgmock",
     ],
 
@@ -45,19 +56,24 @@ cc_test {
         "libaudiopolicymanager_interface_headers",
     ],
 
-    srcs: ["audiopolicymanager_tests.cpp"],
-
-    data: [":audiopolicytest_configuration_files",],
-
-    cflags: [
-        "-Werror",
-        "-Wall",
+    srcs: [
+        "audiopolicymanager_tests.cpp",
+        "test_execution_tracer.cpp",
     ],
 
-    test_suites: ["device-tests"],
+    data: [":audiopolicytest_configuration_files"],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+
+    test_suites: [
+        "automotive-tests",
+        "device-tests",
+    ],
 
 }
-
 
 cc_test {
     name: "audio_health_tests",
@@ -69,20 +85,21 @@ cc_test {
     require_root: true,
 
     shared_libs: [
-        "libaudiofoundation",
+        "audioclient-types-aidl-cpp",
         "libaudioclient",
+        "libaudioclient_aidl_conversion",
+        "libaudiofoundation",
+        "libaudiopolicycomponents",
         "libaudiopolicymanagerdefault",
+        "libcutils",
         "liblog",
         "libmedia_helper",
-        "libutils",
-        "libaudioclient_aidl_conversion",
-        "libstagefright_foundation",
         "libshmemcompat",
         "libshmemutil",
-        "audioclient-types-aidl-cpp",
+        "libstagefright_foundation",
+        "libutils",
+        "libxml2",
     ],
-
-    static_libs: ["libaudiopolicycomponents"],
 
     header_libs: [
         "libaudiopolicyengine_interface_headers",
@@ -92,10 +109,47 @@ cc_test {
     srcs: ["audio_health_tests.cpp"],
 
     cflags: [
-        "-Werror",
         "-Wall",
+        "-Werror",
+    ],
+
+    test_suites: ["general-tests"],
+
+}
+
+cc_test {
+    name: "spatializer_tests",
+
+    defaults: [
+        "latest_android_media_audio_common_types_cpp_shared",
+        "libaudiopolicyservice_dependencies",
+    ],
+
+    require_root: true,
+
+    shared_libs: [
+        "libaudioclient",
+        "libaudiofoundation",
+        "libcutils",
+        "liblog",
+    ],
+
+    static_libs: [
+        "libaudiopolicyservice",
+    ],
+
+    header_libs: [
+        "libaudiohal_headers",
+        "libaudiopolicyservice_headers",
+        "libmediametrics_headers",
+    ],
+
+    srcs: ["spatializer_tests.cpp"],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
     ],
 
     test_suites: ["device-tests"],
-
 }

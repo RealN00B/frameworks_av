@@ -21,9 +21,12 @@
 #include <atomic>
 #include <stdint.h>
 
+#include <linux/futex.h>
 #include <media/MediaMetricsItem.h>
+#include <sys/syscall.h>
 
 #include <aaudio/AAudio.h>
+#include <android-base/strings.h>
 
 #include "AudioStreamBuilder.h"
 #include "AudioStream.h"
@@ -59,10 +62,9 @@ AudioStream::~AudioStream() {
     // If the stream is deleted when OPEN or in use then audio resources will leak.
     // This would indicate an internal error. So we want to find this ASAP.
     LOG_ALWAYS_FATAL_IF(!(getState() == AAUDIO_STREAM_STATE_CLOSED
-                          || getState() == AAUDIO_STREAM_STATE_UNINITIALIZED
-                          || getState() == AAUDIO_STREAM_STATE_DISCONNECTED),
-                        "~AudioStream() - still in use, state = %s",
-                        AudioGlobal_convertStreamStateToText(getState()));
+                          || getState() == AAUDIO_STREAM_STATE_UNINITIALIZED),
+                        "~AudioStream() - still in use, state = %s disconnected = %d",
+                        AudioGlobal_convertStreamStateToText(getState()), isDisconnected());
 }
 
 aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
@@ -78,7 +80,7 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     mSamplesPerFrame = builder.getSamplesPerFrame();
     mChannelMask = builder.getChannelMask();
     mSampleRate = builder.getSampleRate();
-    mDeviceId = builder.getDeviceId();
+    mDeviceIds = builder.getDeviceIds();
     mFormat = builder.getFormat();
     mSharingMode = builder.getSharingMode();
     mSharingModeMatchRequired = builder.isSharingModeMatchRequired();
@@ -92,6 +94,7 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     if (mContentType == AAUDIO_UNSPECIFIED) {
         mContentType = AAUDIO_CONTENT_TYPE_MUSIC;
     }
+    mTags = builder.getTags();
     mSpatializationBehavior = builder.getSpatializationBehavior();
     // for consistency with other properties, note UNSPECIFIED is the same as AUTO
     if (mSpatializationBehavior == AAUDIO_UNSPECIFIED) {
@@ -114,6 +117,8 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     mErrorCallbackProc = builder.getErrorCallbackProc();
     mDataCallbackUserData = builder.getDataCallbackUserData();
     mErrorCallbackUserData = builder.getErrorCallbackUserData();
+    setPresentationEndCallbackUserData(builder.getPresentationEndCallbackUserData());
+    setPresentationEndCallbackProc(builder.getPresentationEndCallbackProc());
 
     return AAUDIO_OK;
 }
@@ -123,13 +128,18 @@ void AudioStream::logOpenActual() {
         android::mediametrics::LogItem item(mMetricsId);
         item.set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_OPEN)
             .set(AMEDIAMETRICS_PROP_PERFORMANCEMODEACTUAL,
-                AudioGlobal_convertPerformanceModeToText(getPerformanceMode()))
+                    AudioGlobal_convertPerformanceModeToText(getPerformanceMode()))
             .set(AMEDIAMETRICS_PROP_SHARINGMODEACTUAL,
-                AudioGlobal_convertSharingModeToText(getSharingMode()))
+                    AudioGlobal_convertSharingModeToText(getSharingMode()))
             .set(AMEDIAMETRICS_PROP_BUFFERCAPACITYFRAMES, getBufferCapacity())
             .set(AMEDIAMETRICS_PROP_BURSTFRAMES, getFramesPerBurst())
             .set(AMEDIAMETRICS_PROP_DIRECTION,
-                AudioGlobal_convertDirectionToText(getDirection()));
+                    AudioGlobal_convertDirectionToText(getDirection()))
+            .set(AMEDIAMETRICS_PROP_ENCODINGHARDWARE,
+                    android::toString(getHardwareFormat()).c_str())
+            .set(AMEDIAMETRICS_PROP_CHANNELCOUNTHARDWARE, (int32_t)getHardwareSamplesPerFrame())
+            .set(AMEDIAMETRICS_PROP_SAMPLERATEHARDWARE, (int32_t)getHardwareSampleRate())
+            .set(AMEDIAMETRICS_PROP_SAMPLERATECLIENT, (int32_t)getSampleRate());
 
         if (getDirection() == AAUDIO_DIRECTION_OUTPUT) {
             item.set(AMEDIAMETRICS_PROP_PLAYERIID, mPlayerBase->getPlayerIId());
@@ -156,6 +166,11 @@ aaudio_result_t AudioStream::systemStart() {
 
     std::lock_guard<std::mutex> lock(mStreamLock);
 
+    if (isDisconnected()) {
+        ALOGW("%s() stream is disconnected", __func__);
+        return AAUDIO_ERROR_INVALID_STATE;
+    }
+
     switch (getState()) {
         // Is this a good time to start?
         case AAUDIO_STREAM_STATE_OPEN:
@@ -174,8 +189,13 @@ aaudio_result_t AudioStream::systemStart() {
                   AudioGlobal_convertStreamStateToText(getState()));
             return AAUDIO_ERROR_INVALID_STATE;
 
-        // Don't start when the stream is dead!
         case AAUDIO_STREAM_STATE_DISCONNECTED:
+            // This must not happen after deprecating AAUDIO_STREAM_STATE_DISCONNECTED, trying to
+            // start will finally return ERROR_DISCONNECTED.
+            ALOGE("%s, unexpected state = AAUDIO_STREAM_STATE_DISCONNECTED", __func__);
+            return AAUDIO_ERROR_INTERNAL;
+
+        // Don't start when the stream is dead!
         case AAUDIO_STREAM_STATE_CLOSING:
         case AAUDIO_STREAM_STATE_CLOSED:
         default:
@@ -187,7 +207,7 @@ aaudio_result_t AudioStream::systemStart() {
     aaudio_result_t result = requestStart_l();
     if (result == AAUDIO_OK) {
         // We only call this for logging in "dumpsys audio". So ignore return code.
-        (void) mPlayerBase->startWithStatus(getDeviceId());
+        (void) mPlayerBase->startWithStatus(getDeviceIds());
     }
     return result;
 }
@@ -208,7 +228,11 @@ aaudio_result_t AudioStream::systemPause() {
         // Proceed with pausing.
         case AAUDIO_STREAM_STATE_STARTING:
         case AAUDIO_STREAM_STATE_STARTED:
+            break;
+
         case AAUDIO_STREAM_STATE_DISCONNECTED:
+            // This must not happen after deprecating AAUDIO_STREAM_STATE_DISCONNECTED
+            ALOGE("%s, unexpected state = AAUDIO_STREAM_STATE_DISCONNECTED", __func__);
             break;
 
             // Transition from one inactive state to another.
@@ -264,6 +288,10 @@ aaudio_result_t AudioStream::safeFlush() {
 
 aaudio_result_t AudioStream::systemStopInternal() {
     std::lock_guard<std::mutex> lock(mStreamLock);
+    return systemStopInternal_l();
+}
+
+aaudio_result_t AudioStream::systemStopInternal_l() {
     aaudio_result_t result = safeStop_l();
     if (result == AAUDIO_OK) {
         // We only call this for logging in "dumpsys audio". So ignore return code.
@@ -287,7 +315,10 @@ aaudio_result_t AudioStream::safeStop_l() {
         // Proceed with stopping.
         case AAUDIO_STREAM_STATE_STARTING:
         case AAUDIO_STREAM_STATE_STARTED:
+            break;
         case AAUDIO_STREAM_STATE_DISCONNECTED:
+            // This must not happen after deprecating AAUDIO_STREAM_STATE_DISCONNECTED
+            ALOGE("%s, unexpected state = AAUDIO_STREAM_STATE_DISCONNECTED", __func__);
             break;
 
         // Transition from one inactive state to another.
@@ -362,35 +393,44 @@ void AudioStream::close_l() {
 }
 
 void AudioStream::setState(aaudio_stream_state_t state) {
-    ALOGD("%s(s#%d) from %d to %d", __func__, getId(), mState, state);
-    if (state == mState) {
+    aaudio_stream_state_t oldState = mState.load();
+    ALOGD("%s(s#%d) from %d to %d", __func__, getId(), oldState, state);
+    if (state == oldState) {
         return; // no change
     }
-    // Track transition to DISCONNECTED state.
-    if (state == AAUDIO_STREAM_STATE_DISCONNECTED) {
-        android::mediametrics::LogItem(mMetricsId)
-                .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_DISCONNECT)
-                .set(AMEDIAMETRICS_PROP_STATE, AudioGlobal_convertStreamStateToText(getState()))
-                .record();
-    }
+    LOG_ALWAYS_FATAL_IF(state == AAUDIO_STREAM_STATE_DISCONNECTED,
+                        "Disconnected state must be separated from mState");
     // CLOSED is a final state
-    if (mState == AAUDIO_STREAM_STATE_CLOSED) {
+    if (oldState == AAUDIO_STREAM_STATE_CLOSED) {
         ALOGW("%s(%d) tried to set to %d but already CLOSED", __func__, getId(), state);
 
     // Once CLOSING, we can only move to CLOSED state.
-    } else if (mState == AAUDIO_STREAM_STATE_CLOSING
+    } else if (oldState == AAUDIO_STREAM_STATE_CLOSING
                && state != AAUDIO_STREAM_STATE_CLOSED) {
         ALOGW("%s(%d) tried to set to %d but already CLOSING", __func__, getId(), state);
 
-    // Once DISCONNECTED, we can only move to CLOSING or CLOSED state.
-    } else if (mState == AAUDIO_STREAM_STATE_DISCONNECTED
-               && !(state == AAUDIO_STREAM_STATE_CLOSING
-                   || state == AAUDIO_STREAM_STATE_CLOSED)) {
-        ALOGW("%s(%d) tried to set to %d but already DISCONNECTED", __func__, getId(), state);
-
     } else {
-        mState = state;
+        mState.store(state);
+        // Wake up a wakeForStateChange thread if it exists.
+        syscall(SYS_futex, &mState, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
     }
+}
+
+void AudioStream::setDisconnected() {
+    const bool old = isDisconnected();
+    ALOGD("%s setting disconnected, current disconnected: %d, current state: %d",
+          __func__, old, getState());
+    if (old) {
+        return; // no change, the stream is already disconnected
+    }
+    mDisconnected.store(true);
+    // Wake up a wakeForStateChange thread if it exists.
+    syscall(SYS_futex, &mState, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    // Track transition to DISCONNECTED state.
+    android::mediametrics::LogItem(mMetricsId)
+            .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_DISCONNECT)
+            .set(AMEDIAMETRICS_PROP_STATE, AudioGlobal_convertStreamStateToText(getState()))
+            .record();
 }
 
 aaudio_result_t AudioStream::waitForStateChange(aaudio_stream_state_t currentState,
@@ -403,20 +443,26 @@ aaudio_result_t AudioStream::waitForStateChange(aaudio_stream_state_t currentSta
     }
 
     int64_t durationNanos = 20 * AAUDIO_NANOS_PER_MILLISECOND; // arbitrary
-    aaudio_stream_state_t state = getState();
+    aaudio_stream_state_t state = getStateExternal();
     while (state == currentState && timeoutNanoseconds > 0) {
         if (durationNanos > timeoutNanoseconds) {
             durationNanos = timeoutNanoseconds;
         }
-        AudioClock::sleepForNanos(durationNanos);
-        timeoutNanoseconds -= durationNanos;
+        struct timespec time;
+        time.tv_sec = durationNanos / AAUDIO_NANOS_PER_SECOND;
+        // Add the fractional nanoseconds.
+        time.tv_nsec = durationNanos - (time.tv_sec * AAUDIO_NANOS_PER_SECOND);
 
+        // Sleep for durationNanos. If mState changes from the callback
+        // thread, this thread will wake up earlier.
+        syscall(SYS_futex, &mState, FUTEX_WAIT_PRIVATE, currentState, &time, NULL, 0);
+        timeoutNanoseconds -= durationNanos;
         aaudio_result_t result = updateStateMachine();
         if (result != AAUDIO_OK) {
             return result;
         }
 
-        state = getState();
+        state = getStateExternal();
     }
     if (nextState != nullptr) {
         *nextState = state;
@@ -605,6 +651,17 @@ void AudioStream::setDuckAndMuteVolume(float duckAndMuteVolume) {
     std::lock_guard<std::mutex> lock(mStreamLock);
     mDuckAndMuteVolume = duckAndMuteVolume;
     doSetVolume(); // apply this change
+}
+
+aaudio_stream_state_t AudioStream::getStateExternal() const {
+    if (isDisconnected()) {
+        return AAUDIO_STREAM_STATE_DISCONNECTED;
+    }
+    return getState();
+}
+
+std::string AudioStream::getTagsAsString() const {
+    return android::base::Join(mTags, AUDIO_ATTRIBUTES_TAGS_SEPARATOR);
 }
 
 void AudioStream::MyPlayerBase::registerWithAudioManager(const android::sp<AudioStream>& parent) {

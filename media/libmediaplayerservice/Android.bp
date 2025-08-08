@@ -17,7 +17,8 @@ license {
     ],
 }
 
-cc_library {
+filegroup {
+    name: "libmediaplayerservice_sources",
 
     srcs: [
         "ActivityManager.cpp",
@@ -30,18 +31,29 @@ cc_library {
         "StagefrightRecorder.cpp",
         "TestPlayerStub.cpp",
     ],
+}
+
+cc_defaults {
+    name: "libmediaplayerservice_defaults",
+
+    srcs: [
+        ":libmediaplayerservice_sources",
+    ],
 
     shared_libs: [
         "android.hardware.media.c2@1.0",
         "android.hardware.media.omx@1.0",
         "av-types-aidl-cpp",
         "framework-permission-aidl-cpp",
-        "libaudioclient_aidl_conversion",
-        "libbase",
+        "libaconfig_storage_read_api_cc",
         "libactivitymanager_aidl",
         "libandroid_net",
         "libaudioclient",
+        "libaudioclient_aidl_conversion",
+        "libaudiofoundation",
+        "libbase",
         "libbinder",
+        "libbinder_ndk",
         "libcamera_client",
         "libcodec2_client",
         "libcrypto",
@@ -66,48 +78,55 @@ cc_library {
         "libstagefright_httplive",
         "libutils",
         "packagemanager_aidl-cpp",
+        "server_configurable_flags",
     ],
 
     header_libs: [
-        "media_plugin_headers",
         "libmediautils_headers",
         "libstagefright_rtsp_headers",
         "libstagefright_webm_headers",
+        "media_plugin_headers",
     ],
 
     static_libs: [
+        "com.android.media.flags.editing-aconfig-cc",
+        "framework-permission-aidl-cpp",
         "libplayerservice_datasource",
         "libstagefright_nuplayer",
         "libstagefright_rtsp",
         "libstagefright_timedtext",
-        "framework-permission-aidl-cpp",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-error=deprecated-declarations",
+    ],
+
+    sanitize: {
+        cfi: true,
+    },
+}
+
+cc_library {
+    name: "libmediaplayerservice",
+
+    defaults: [
+        "libmediaplayerservice_defaults",
     ],
 
     export_shared_lib_headers: [
-        "libmedia",
         "framework-permission-aidl-cpp",
+        "libmedia",
     ],
 
     export_header_lib_headers: [
         "libmediautils_headers",
     ],
 
-    local_include_dirs: ["include"],
-
     export_include_dirs: [
         ".",
     ],
 
-    cflags: [
-        "-Werror",
-        "-Wno-error=deprecated-declarations",
-        "-Wall",
-    ],
-
-    name: "libmediaplayerservice",
-
-    sanitize: {
-        cfi: true,
-    },
-
+    local_include_dirs: ["include"],
 }

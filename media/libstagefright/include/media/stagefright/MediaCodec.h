@@ -28,7 +28,12 @@
 #include <media/MediaMetrics.h>
 #include <media/MediaProfiles.h>
 #include <media/stagefright/foundation/AHandler.h>
+#include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/CodecErrorLog.h>
 #include <media/stagefright/FrameRenderTracker.h>
+#include <media/stagefright/MediaHistogram.h>
+#include <media/stagefright/PlaybackDurationAccumulator.h>
+#include <media/stagefright/VideoRenderQualityTracker.h>
 #include <utils/Vector.h>
 
 class C2Buffer;
@@ -39,6 +44,7 @@ namespace aidl {
 namespace android {
 namespace media {
 class MediaResourceParcel;
+class ClientConfigParcel;
 } // media
 } // android
 } // aidl
@@ -51,16 +57,19 @@ struct AReplyToken;
 struct AString;
 struct BatteryChecker;
 class BufferChannelBase;
+struct AccessUnitInfo;
 struct CodecBase;
+struct CodecCryptoInfo;
 struct CodecParameterDescriptor;
 class IBatteryStats;
 struct ICrypto;
+class CryptoAsync;
 class MediaCodecBuffer;
 class IMemory;
 struct PersistentSurface;
+class RenderedFrameInfo;
 class SoftwareRenderer;
 class Surface;
-class PlaybackDurationAccumulator;
 namespace hardware {
 namespace cas {
 namespace native {
@@ -70,6 +79,10 @@ struct IDescrambler;
 
 using hardware::cas::native::V1_0::IDescrambler;
 using aidl::android::media::MediaResourceParcel;
+using aidl::android::media::ClientConfigParcel;
+
+typedef WrapperObject<std::vector<AccessUnitInfo>> BufferInfosWrapper;
+typedef WrapperObject<std::vector<std::unique_ptr<CodecCryptoInfo>>> CryptoInfosWrapper;
 
 struct MediaCodec : public AHandler {
     enum Domain {
@@ -82,6 +95,8 @@ struct MediaCodec : public AHandler {
     enum ConfigureFlags {
         CONFIGURE_FLAG_ENCODE           = 1,
         CONFIGURE_FLAG_USE_BLOCK_MODEL  = 2,
+        CONFIGURE_FLAG_USE_CRYPTO_ASYNC = 4,
+        CONFIGURE_FLAG_DETACHED_SURFACE = 8,
     };
 
     enum BufferFlags {
@@ -90,6 +105,7 @@ struct MediaCodec : public AHandler {
         BUFFER_FLAG_EOS           = 4,
         BUFFER_FLAG_PARTIAL_FRAME = 8,
         BUFFER_FLAG_MUXER_DATA    = 16,
+        BUFFER_FLAG_DECODE_ONLY   = 32,
     };
 
     enum CVODegree {
@@ -105,6 +121,20 @@ struct MediaCodec : public AHandler {
         CB_ERROR = 3,
         CB_OUTPUT_FORMAT_CHANGED = 4,
         CB_RESOURCE_RECLAIMED = 5,
+        CB_CRYPTO_ERROR = 6,
+        CB_LARGE_FRAME_OUTPUT_AVAILABLE = 7,
+
+        /** Callback ID for when the metrics for this codec have been flushed
+         * due to the start of a new subsession. The associated AMessage will
+         * contain an sp<WrapperObject<std::unique_ptr<mediametrics::Item>>>
+         * Object at the "metrics" key.
+         */
+        CB_METRICS_FLUSHED = 8,
+
+        /** Callback ID to notify the change in resource requirement
+         * for the codec component.
+         */
+        CB_REQUIRED_RESOURCES_CHANGED = 9,
     };
 
     static const pid_t kNoPid = -1;
@@ -124,6 +154,73 @@ struct MediaCodec : public AHandler {
 
     static sp<PersistentSurface> CreatePersistentInputSurface();
 
+    /**
+     * Abstraction for the Global Codec resources.
+     * This encapsulates all the available codec resources on the device.
+     */
+    struct GlobalResourceInfo {
+        /**
+         * Name of the Resource type.
+         */
+        std::string mName;
+        /**
+         * Total count/capacity of resources of this type.
+         */
+        int mCapacity;
+        /**
+         * Available count of this resource type.
+         */
+        int mAvailable;
+
+        GlobalResourceInfo(const std::string& name, int capacity, int available) :
+                mName(name),
+                mCapacity(capacity),
+                mAvailable(available) {}
+
+        GlobalResourceInfo(const GlobalResourceInfo& info) :
+                mName(info.mName),
+                mCapacity(info.mCapacity),
+                mAvailable(info.mAvailable) {}
+    };
+
+    /**
+     * Abstraction for the resources associated with a codec instance.
+     * This encapsulates the required codec resources for a configured codec instance.
+     */
+    struct InstanceResourceInfo {
+        /**
+         * Name of the Resource type.
+         */
+        std::string mName;
+        /**
+         * Required resource count of this type.
+         */
+        int mStaticCount;
+        /**
+         * Per frame resource requirement of this resource type.
+         */
+        int mPerFrameCount;
+
+        InstanceResourceInfo(const std::string& name, int staticCount, int perFrameCount) :
+                mName(name),
+                mStaticCount(staticCount),
+                mPerFrameCount(perFrameCount) {}
+
+        InstanceResourceInfo(const InstanceResourceInfo& info) :
+                mName(info.mName),
+                mStaticCount(info.mStaticCount),
+                mPerFrameCount(info.mPerFrameCount) {}
+    };
+
+    /**
+     * Get a list of Globally available device codec resources.
+     *
+     * It will return INVALID_OPERATION if:
+     *  - HAL does not implement codec availability API
+     *  - codec_availability feature flag isn't defined.
+     */
+    static status_t getGloballyAvailableResources(std::vector<GlobalResourceInfo>& resources);
+
     status_t configure(
             const sp<AMessage> &format,
             const sp<Surface> &nativeWindow,
@@ -136,6 +233,19 @@ struct MediaCodec : public AHandler {
             const sp<ICrypto> &crypto,
             const sp<IDescrambler> &descrambler,
             uint32_t flags);
+
+    /**
+     * Get a list of required codec resources.
+     *
+     * This may only be called after configuring the codec.
+     *
+     * Calling this while the codec wasn't configured, will result in
+     * returning INVALID_OPERATION error code.
+     * It will also return INVALID_OPERATION if:
+     *  - HAL does not implement codec availability API
+     *  - codec_availability feature flag isn't defined.
+     */
+    status_t getRequiredResources(std::vector<InstanceResourceInfo>& resources);
 
     status_t releaseCrypto();
 
@@ -175,6 +285,13 @@ struct MediaCodec : public AHandler {
             uint32_t flags,
             AString *errorDetailMsg = NULL);
 
+    status_t queueInputBuffers(
+            size_t index,
+            size_t offset,
+            size_t size,
+            const sp<BufferInfosWrapper> &accessUnitInfo,
+            AString *errorDetailMsg = NULL);
+
     status_t queueSecureInputBuffer(
             size_t index,
             size_t offset,
@@ -188,11 +305,18 @@ struct MediaCodec : public AHandler {
             uint32_t flags,
             AString *errorDetailMsg = NULL);
 
+    status_t queueSecureInputBuffers(
+            size_t index,
+            size_t offset,
+            size_t size,
+            const sp<BufferInfosWrapper> &accessUnitInfo,
+            const sp<CryptoInfosWrapper> &cryptoInfos,
+            AString *errorDetailMsg = NULL);
+
     status_t queueBuffer(
             size_t index,
             const std::shared_ptr<C2Buffer> &buffer,
-            int64_t presentationTimeUs,
-            uint32_t flags,
+            const sp<BufferInfosWrapper> &bufferInfos,
             const sp<AMessage> &tunings,
             AString *errorDetailMsg = NULL);
 
@@ -200,14 +324,9 @@ struct MediaCodec : public AHandler {
             size_t index,
             const sp<hardware::HidlMemory> &memory,
             size_t offset,
-            const CryptoPlugin::SubSample *subSamples,
-            size_t numSubSamples,
-            const uint8_t key[16],
-            const uint8_t iv[16],
-            CryptoPlugin::Mode mode,
-            const CryptoPlugin::Pattern &pattern,
-            int64_t presentationTimeUs,
-            uint32_t flags,
+            size_t size,
+            const sp<BufferInfosWrapper> &bufferInfos,
+            const sp<CryptoInfosWrapper> &cryptoInfos,
             const sp<AMessage> &tunings,
             AString *errorDetailMsg = NULL);
 
@@ -248,6 +367,8 @@ struct MediaCodec : public AHandler {
 
     status_t setSurface(const sp<Surface> &nativeWindow);
 
+    status_t detachOutputSurface();
+
     status_t requestIDRFrame();
 
     // Notification will be posted once there "is something to do", i.e.
@@ -271,6 +392,8 @@ struct MediaCodec : public AHandler {
     // Create a MediaCodec notification message from a list of rendered or dropped render infos
     // by adding rendered frame information to a base notification message. Returns the number
     // of frames that were rendered.
+    static size_t CreateFramesRenderedMessage(
+            const std::list<RenderedFrameInfo> &done, sp<AMessage> &msg);
     static size_t CreateFramesRenderedMessage(
             const std::list<FrameRenderTracker::Info> &done, sp<AMessage> &msg);
 
@@ -297,6 +420,8 @@ struct MediaCodec : public AHandler {
         T value;
     };
 
+    inline CodecErrorLog &getErrorLog() { return mErrorLog; }
+
 protected:
     virtual ~MediaCodec();
     virtual void onMessageReceived(const sp<AMessage> &msg);
@@ -305,6 +430,12 @@ private:
     // used by ResourceManagerClient
     status_t reclaim(bool force = false);
     friend struct ResourceManagerClient;
+
+    // to create the metrics associated with this codec.
+    // Any error in this function will be captured by the output argument err.
+    mediametrics_handle_t createMediaMetrics(const sp<AMessage>& format,
+                                             uint32_t flags,
+                                             status_t* err);
 
 private:
     enum State {
@@ -321,6 +452,7 @@ private:
         RELEASING,
     };
     std::string stateString(State state);
+    std::string apiStateString();
 
     enum {
         kPortIndexInput         = 0,
@@ -331,6 +463,7 @@ private:
         kWhatInit                           = 'init',
         kWhatConfigure                      = 'conf',
         kWhatSetSurface                     = 'sSur',
+        kWhatDetachSurface                  = 'dSur',
         kWhatCreateInputSurface             = 'cisf',
         kWhatSetInputSurface                = 'sisf',
         kWhatStart                          = 'strt',
@@ -357,6 +490,7 @@ private:
         kWhatSetNotification                = 'setN',
         kWhatDrmReleaseCrypto               = 'rDrm',
         kWhatCheckBatteryStats              = 'chkB',
+        kWhatGetMetrics                     = 'getM',
     };
 
     enum {
@@ -374,6 +508,7 @@ private:
         kFlagIsComponentAllocated       = 2048,
         kFlagPushBlankBuffersOnShutdown = 4096,
         kFlagUseBlockModel              = 8192,
+        kFlagUseCryptoAsync             = 16384,
     };
 
     struct BufferInfo {
@@ -408,6 +543,13 @@ private:
         kBufferRendered,
     };
 
+    enum class DequeueOutputResult {
+        kNoBuffer,
+        kDiscardedBuffer,
+        kRepliedWithError,
+        kSuccess,
+    };
+
     struct ResourceManagerServiceProxy;
 
     State mState;
@@ -425,18 +567,39 @@ private:
     int64_t mPresentationTimeUs = 0;
     status_t mStickyError;
     sp<Surface> mSurface;
+    uint32_t mSurfaceGeneration = 0;
     SoftwareRenderer *mSoftRenderer;
 
+    // Get the detached BufferQueue surface for a video decoder, and create it
+    // if it did not yet exist.
+    sp<Surface> getOrCreateDetachedSurface();
+
+    Mutex mMetricsLock;
     mediametrics_handle_t mMetricsHandle = 0;
+    mediametrics_handle_t mLastMetricsHandle = 0; // only accessed from the looper or destructor
+    bool mMetricsToUpload = false;
     nsecs_t mLifetimeStartNs = 0;
     void initMediametrics();
     void updateMediametrics();
     void flushMediametrics();
+    void resetMetricsFields();
+
+    // Reset the metrics fields for a new subsession.
+    void resetSubsessionMetricsFields();
+
+    // Start a new subsession (for metrics). This includes flushing the current
+    // metrics, notifying the client and resetting the session fields.
+    void handleStartingANewSubsession();
+
     void updateEphemeralMediametrics(mediametrics_handle_t item);
     void updateLowLatency(const sp<AMessage> &msg);
+    void updateCodecImportance(const sp<AMessage>& msg);
+    void onGetMetrics(const sp<AMessage>& msg);
     constexpr const char *asString(TunnelPeekState state, const char *default_string="?");
     void updateTunnelPeek(const sp<AMessage> &msg);
-    void updatePlaybackDuration(const sp<AMessage> &msg);
+    void processRenderedFrames(const sp<AMessage> &msg);
+
+    inline void initClientConfigParcel(ClientConfigParcel& clientConfig);
 
     sp<AMessage> mOutputFormat;
     sp<AMessage> mInputFormat;
@@ -445,7 +608,7 @@ private:
     sp<AMessage> mAsyncReleaseCompleteNotification;
     sp<AMessage> mOnFirstTunnelFrameReadyNotification;
 
-    sp<ResourceManagerServiceProxy> mResourceManagerProxy;
+    std::shared_ptr<ResourceManagerServiceProxy> mResourceManagerProxy;
 
     Domain mDomain;
     AString mLogSessionId;
@@ -454,12 +617,42 @@ private:
     int32_t mRotationDegrees;
     int32_t mAllowFrameDroppingBySurface;
 
-    int32_t mConfigColorTransfer;
-    bool mHDRStaticInfo;
-    bool mHDR10PlusInfo;
-    void updateHDRFormatMetric();
-    hdr_format getHDRFormat(const int32_t profile, const int32_t transfer,
-            const AString &mediaType);
+    enum {
+        kFlagHasHdrStaticInfo   = 1,
+        kFlagHasHdr10PlusInfo   = 2,
+    };
+    uint32_t mHdrInfoFlags;
+    void updateHdrMetrics(bool isConfig);
+    hdr_format getHdrFormat(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    hdr_format getHdrFormatForEncoder(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    hdr_format getHdrFormatForDecoder(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    bool profileSupport10Bits(const AString &mime, const int32_t profile);
+
+    struct ApiUsageMetrics {
+        bool isArrayMode;
+        enum OperationMode {
+            kUnknownMode = 0,
+            kSynchronousMode = 1,
+            kAsynchronousMode = 2,
+            kBlockMode = 3,
+        };
+        OperationMode operationMode;
+        bool isUsingOutputSurface;
+        struct InputBufferSize {
+            int32_t appMax;  // max size configured by the app
+            int32_t usedMax;  // max size actually used
+            int32_t codecMax;  // max size suggested by the codec
+        } inputBufferSize;
+    } mApiUsageMetrics;
+    struct ReliabilityContextMetrics {
+        int32_t flushCount;
+        int32_t setOutputSurfaceCount;
+        int32_t resolutionChangeCount;
+    } mReliabilityContextMetrics;
+    int32_t mSubsessionCount;
 
     // initial create parameters
     AString mInitName;
@@ -472,7 +665,8 @@ private:
     // the (possibly) updated format is returned in place.
     status_t shapeMediaFormat(
             const sp<AMessage> &format,
-            uint32_t flags);
+            uint32_t flags,
+            mediametrics_handle_t handle);
 
     // populate the format shaper library with information for this codec encoding
     // for the indicated media type
@@ -499,6 +693,7 @@ private:
     int32_t mTunneledInputHeight;
     bool mTunneled;
     TunnelPeekState mTunnelPeekState;
+    bool mTunnelPeekEnabled;
 
     sp<IDescrambler> mDescrambler;
 
@@ -511,9 +706,13 @@ private:
     bool mCpuBoostRequested;
 
     std::shared_ptr<BufferChannelBase> mBufferChannel;
+    sp<CryptoAsync> mCryptoAsync;
+    sp<ALooper> mCryptoLooper;
 
-    std::unique_ptr<PlaybackDurationAccumulator> mPlaybackDurationAccumulator;
-    bool mIsSurfaceToScreen;
+    bool mIsSurfaceToDisplay;
+    bool mAreRenderMetricsEnabled;
+    PlaybackDurationAccumulator mPlaybackDurationAccumulator;
+    VideoRenderQualityTracker mVideoRenderQualityTracker;
 
     MediaCodec(
             const sp<ALooper> &looper, pid_t pid, uid_t uid,
@@ -544,14 +743,23 @@ private:
             sp<MediaCodecBuffer> *buffer, sp<AMessage> *format);
 
     bool handleDequeueInputBuffer(const sp<AReplyToken> &replyID, bool newRequest = false);
-    bool handleDequeueOutputBuffer(const sp<AReplyToken> &replyID, bool newRequest = false);
+    DequeueOutputResult handleDequeueOutputBuffer(
+            const sp<AReplyToken> &replyID,
+            bool newRequest = false);
     void cancelPendingDequeueOperations();
 
     void extractCSD(const sp<AMessage> &format);
     status_t queueCSDInputBuffer(size_t bufferIndex);
 
     status_t handleSetSurface(const sp<Surface> &surface);
-    status_t connectToSurface(const sp<Surface> &surface);
+
+    // Common reimplementation of changing the output surface.
+    // Handles setting null surface, which is used during configure and init.
+    // Set |callCodec| to true if the codec needs to be notified (e.g. during executing state).
+    // Setting |onShutdown| to true will avoid extra work, if this is used for detaching on
+    // delayed release.
+    status_t handleSetSurface(const sp<Surface> &surface, bool callCodec, bool onShutdown = false);
+    status_t connectToSurface(const sp<Surface> &surface, uint32_t *generation);
     status_t disconnectFromSurface();
 
     bool hasCryptoOrDescrambler() {
@@ -562,8 +770,10 @@ private:
 
     void onInputBufferAvailable();
     void onOutputBufferAvailable();
+    void onCryptoError(const sp<AMessage> &msg);
     void onError(status_t err, int32_t actionCode, const char *detail = NULL);
     void onOutputFormatChanged();
+    void onRequiredResourcesChanged(const std::vector<InstanceResourceInfo>& resourceInfo);
 
     status_t onSetParameters(const sp<AMessage> &params);
 
@@ -618,8 +828,11 @@ private:
                                                  // when low latency is on
     int64_t mInputBufferCounter;  // number of input buffers queued since last reset/flush
 
+    // A rescheduleable message that periodically polls for rendered buffers
+    sp<AMessage> mMsgPollForRenderedBuffers;
+
     class ReleaseSurface;
-    std::unique_ptr<ReleaseSurface> mReleaseSurface;
+    std::unique_ptr<ReleaseSurface> mDetachedSurface;
 
     std::list<sp<AMessage>> mLeftover;
     status_t handleLeftover(size_t index);
@@ -628,6 +841,7 @@ private:
 
     void statsBufferSent(int64_t presentationUs, const sp<MediaCodecBuffer> &buffer);
     void statsBufferReceived(int64_t presentationUs, const sp<MediaCodecBuffer> &buffer);
+    bool discardDecodeOnlyOutputBuffer(size_t index);
 
     enum {
         // the default shape of our latency histogram buckets
@@ -648,35 +862,19 @@ private:
     int mRecentHead;
     Mutex mRecentLock;
 
-    class Histogram {
-      public:
-        Histogram() : mFloor(0), mWidth(0), mBelow(0), mAbove(0),
-                      mMin(INT64_MAX), mMax(INT64_MIN), mSum(0), mCount(0),
-                      mBucketCount(0), mBuckets(NULL) {};
-        ~Histogram() { clear(); };
-        void clear() { if (mBuckets != NULL) free(mBuckets); mBuckets = NULL; };
-        bool setup(int nbuckets, int64_t width, int64_t floor = 0);
-        void insert(int64_t sample);
-        int64_t getMin() const { return mMin; }
-        int64_t getMax() const { return mMax; }
-        int64_t getCount() const { return mCount; }
-        int64_t getSum() const { return mSum; }
-        int64_t getAvg() const { return mSum / (mCount == 0 ? 1 : mCount); }
-        std::string emit();
-      private:
-        int64_t mFloor, mCeiling, mWidth;
-        int64_t mBelow, mAbove;
-        int64_t mMin, mMax, mSum, mCount;
+    MediaHistogram<int64_t> mLatencyHist;
 
-        int mBucketCount;
-        int64_t *mBuckets;
-    };
-
-    Histogram mLatencyHist;
+    // An unique ID for the codec - Used by the metrics.
+    uint64_t mCodecId = 0;
+    bool     mIsHardware = false;
 
     std::function<sp<CodecBase>(const AString &, const char *)> mGetCodecBase;
     std::function<status_t(const AString &, sp<MediaCodecInfo> *)> mGetCodecInfo;
     friend class MediaTestHelper;
+
+    CodecErrorLog mErrorLog;
+    // Required resource info for this codec.
+    std::vector<InstanceResourceInfo> mRequiredResourceInfo;
 
     DISALLOW_EVIL_CONSTRUCTORS(MediaCodec);
 };

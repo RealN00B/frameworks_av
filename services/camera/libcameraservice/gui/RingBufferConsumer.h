@@ -17,17 +17,16 @@
 #ifndef ANDROID_GUI_RINGBUFFERCONSUMER_H
 #define ANDROID_GUI_RINGBUFFERCONSUMER_H
 
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
-#include <gui/ConsumerBase.h>
 #include <gui/BufferQueue.h>
+#include <gui/ConsumerBase.h>
 
 #include <utils/List.h>
 
 #define ANDROID_GRAPHICS_RINGBUFFERCONSUMER_JNI_ID "mRingBufferConsumer"
 
 namespace android {
-
-class String8;
 
 /**
  * The RingBufferConsumer maintains a ring buffer of BufferItem objects,
@@ -60,14 +59,18 @@ class RingBufferConsumer : public ConsumerBase,
     // the consumer usage flags passed to the graphics allocator. The
     // bufferCount parameter specifies how many buffers can be pinned for user
     // access at the same time.
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    RingBufferConsumer(uint64_t consumerUsage, int bufferCount);
+#else
     RingBufferConsumer(const sp<IGraphicBufferConsumer>& consumer, uint64_t consumerUsage,
             int bufferCount);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     virtual ~RingBufferConsumer();
 
     // set the name of the RingBufferConsumer that will be used to identify it in
     // log messages.
-    void setName(const String8& name);
+    void setName(const std::string& name);
 
     // setDefaultBufferSize is used to set the size of buffers returned by
     // requestBuffers when a with and height of zero is requested.

@@ -46,14 +46,16 @@ public:
     ~DepthCompositeStream() override;
 
     static bool isDepthCompositeStream(const sp<Surface> &surface);
+    static bool isDepthCompositeStreamInfo(const OutputStreamInfo& streamInfo);
 
     // CompositeStream overrides
-    status_t createInternalStreams(const std::vector<sp<Surface>>& consumers,
+    status_t createInternalStreams(const std::vector<SurfaceHolder>& consumers,
             bool hasDeferredConsumer, uint32_t width, uint32_t height, int format,
-            camera_stream_rotation_t rotation, int *id, const String8& physicalCameraId,
+            camera_stream_rotation_t rotation, int *id, const std::string& physicalCameraId,
             const std::unordered_set<int32_t> &sensorPixelModesUsed,
             std::vector<int> *surfaceIds,
-            int streamSetId, bool isShared) override;
+            int streamSetId, bool isShared, int32_t colorSpace,
+            int64_t dynamicProfile, int64_t streamUseCase, bool useReadoutTimestamp) override;
     status_t deleteInternalStreams() override;
     status_t configureStream() override;
     status_t insertGbp(SurfaceMap* /*out*/outSurfaceMap, Vector<int32_t>* /*out*/outputStreamIds,
@@ -67,6 +69,9 @@ public:
     // Return stream information about the internal camera streams
     static status_t getCompositeStreamInfo(const OutputStreamInfo &streamInfo,
             const CameraMetadata& ch, std::vector<OutputStreamInfo>* compositeOutput /*out*/);
+
+    // Get composite stream stats
+    void getStreamStats(hardware::CameraStreamStats*) override {};
 
 protected:
 
@@ -125,12 +130,12 @@ private:
     static const auto kDepthMapDataSpace = HAL_DATASPACE_DEPTH;
     static const auto kJpegDataSpace = HAL_DATASPACE_V0_JFIF;
 
-    int                  mBlobStreamId, mBlobSurfaceId, mDepthStreamId, mDepthSurfaceId;
-    size_t               mBlobWidth, mBlobHeight;
-    sp<CpuConsumer>      mBlobConsumer, mDepthConsumer;
-    bool                 mDepthBufferAcquired, mBlobBufferAcquired;
-    sp<Surface>          mDepthSurface, mBlobSurface, mOutputSurface;
-    sp<ProducerListener> mProducerListener;
+    int                         mBlobStreamId, mBlobSurfaceId, mDepthStreamId, mDepthSurfaceId;
+    size_t                      mBlobWidth, mBlobHeight;
+    sp<CpuConsumer>             mBlobConsumer, mDepthConsumer;
+    bool                        mDepthBufferAcquired, mBlobBufferAcquired;
+    sp<Surface>                 mDepthSurface, mBlobSurface, mOutputSurface;
+    sp<StreamSurfaceListener>   mStreamSurfaceListener;
 
     ssize_t              mMaxJpegBufferSize;
     ssize_t              mUHRMaxJpegBufferSize;

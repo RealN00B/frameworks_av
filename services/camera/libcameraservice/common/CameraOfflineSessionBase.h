@@ -20,7 +20,6 @@
 #include <vector>
 
 #include <utils/RefBase.h>
-#include <utils/String8.h>
 #include <utils/Timers.h>
 
 #include "camera/CaptureResult.h"
@@ -40,9 +39,14 @@ class NotificationListener : public virtual RefBase {
     // Required for API 1 and 2
     virtual void notifyError(int32_t errorCode,
                              const CaptureResultExtras &resultExtras) = 0;
+
+    // Optional for API 1 and 2
+    virtual void notifyPhysicalCameraChange(const std::string &/*physicalId*/) {}
+
     // May return an error since it checks appops
     virtual status_t notifyActive(float maxPreviewFps) = 0;
     virtual void notifyIdle(int64_t requestCount, int64_t resultError, bool deviceError,
+            std::pair<int32_t, int32_t> mostRequestedFpsRange,
             const std::vector<hardware::CameraStreamStats>& streamStats) = 0;
 
     // Required only for API2

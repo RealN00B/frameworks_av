@@ -1,4 +1,5 @@
 package {
+    default_team: "trendy_team_android_media_audio_framework",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "frameworks_av_license"
@@ -7,35 +8,39 @@ package {
     default_applicable_licenses: ["frameworks_av_license"],
 }
 
-cc_library_shared {
-    name: "libaudiopolicyservice",
+cc_defaults {
+    name: "libaudiopolicyservice_dependencies",
 
     defaults: [
         "latest_android_media_audio_common_types_cpp_shared",
     ],
 
-    srcs: [
-        "AudioPolicyClientImpl.cpp",
-        "AudioPolicyEffects.cpp",
-        "AudioPolicyInterfaceImpl.cpp",
-        "AudioPolicyService.cpp",
-        "CaptureStateNotifier.cpp",
-        "Spatializer.cpp",
-        "SpatializerPoseController.cpp",
-    ],
-
     include_dirs: [
-        "frameworks/av/services/audioflinger"
+        "frameworks/av/services/audiopolicy", // include path outside of libaudiopolicyservice
     ],
 
     shared_libs: [
+        "android.media.audio-aconfig-cc",
+        "android.media.audiopolicy-aconfig-cc",
+        "audio-permission-aidl-cpp",
+        "audioclient-types-aidl-cpp",
+        "audioflinger-aidl-cpp",
+        "audiopolicy-aidl-cpp",
+        "audiopolicy-types-aidl-cpp",
+        "capture_state_listener-aidl-cpp",
+        "com.android.media.audio-aconfig-cc",
+        "framework-permission-aidl-cpp",
+        "libPlatformProperties",
         "libactivitymanager_aidl",
         "libaudioclient",
         "libaudioclient_aidl_conversion",
         "libaudiofoundation",
         "libaudiohal",
+        "libaudiopermission",
         "libaudiopolicy",
+        "libaudiopolicycomponents",
         "libaudiopolicymanagerdefault",
+        "libaudiousecasevalidation",
         "libaudioutils",
         "libbinder",
         "libcutils",
@@ -51,24 +56,38 @@ cc_library_shared {
         "libsensor",
         "libsensorprivacy",
         "libshmemcompat",
-        "libutils",
         "libstagefright_foundation",
-        "audioclient-types-aidl-cpp",
-        "audioflinger-aidl-cpp",
-        "audiopolicy-aidl-cpp",
-        "audiopolicy-types-aidl-cpp",
-        "capture_state_listener-aidl-cpp",
-        "framework-permission-aidl-cpp",
+        "libutils",
+        "libxml2",
         "packagemanager_aidl-cpp",
         "spatializer-aidl-cpp",
     ],
+}
 
-    static_libs: [
-        "libaudiopolicycomponents",
-        "framework-permission-aidl-cpp",
+cc_library {
+    name: "libaudiopolicyservice",
+
+    defaults: [
+        "libaudiopolicyservice_dependencies",
+    ],
+
+    srcs: [
+        "AudioPolicyClientImpl.cpp",
+        "AudioPolicyEffects.cpp",
+        "AudioPolicyInterfaceImpl.cpp",
+        "AudioPolicyService.cpp",
+        "AudioRecordClient.cpp",
+        "CaptureStateNotifier.cpp",
+        "Spatializer.cpp",
+        "SpatializerPoseController.cpp",
+    ],
+
+    include_dirs: [
+        "frameworks/av/services/audioflinger",
     ],
 
     header_libs: [
+        "audiopolicyservicelocal_headers",
         "libaudiohal_headers",
         "libaudiopolicycommon",
         "libaudiopolicyengine_interface_headers",
@@ -76,18 +95,29 @@ cc_library_shared {
         "libaudioutils_headers",
     ],
 
-    cflags: [
-        "-fvisibility=hidden",
-        "-Werror",
-        "-Wall",
-        "-Wthread-safety",
-    ],
+    export_include_dirs: ["."],
 
-    export_shared_lib_headers: [
-        "libactivitymanager_aidl",
-        "libheadtracking",
-        "libheadtracking-binding",
-        "libsensorprivacy",
-        "framework-permission-aidl-cpp",
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wthread-safety",
+        "-fvisibility=hidden",
     ],
+}
+
+cc_library_headers {
+    name: "libaudiopolicyservice_headers",
+    host_supported: true,
+    export_include_dirs: [
+        ".",
+        "include",
+    ],
+}
+
+cc_library_headers {
+    name: "audiopolicyservicelocal_headers",
+    host_supported: true,
+    export_include_dirs: ["include"],
+    header_libs: ["libaudiopermission_headers"],
+    export_header_lib_headers: ["libaudiopermission_headers"],
 }

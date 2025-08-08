@@ -25,6 +25,7 @@
 #include <sstream>
 #include <vector>
 
+#include <system/aaudio/AAudio.h>
 #include <utils/Singleton.h>
 
 
@@ -56,7 +57,7 @@ std::string AAudioServiceEndpoint::dump() const NO_THREAD_SAFETY_ANALYSIS {
     result << "    Direction:            " << ((getDirection() == AAUDIO_DIRECTION_OUTPUT)
                                    ? "OUTPUT" : "INPUT") << "\n";
     result << "    Requested Device Id:  " << mRequestedDeviceId << "\n";
-    result << "    Device Id:            " << getDeviceId() << "\n";
+    result << "    Device Ids:           " << android::toString(getDeviceIds()).c_str() << "\n";
     result << "    Sample Rate:          " << getSampleRate() << "\n";
     result << "    Channel Count:        " << getSamplesPerFrame() << "\n";
     result << "    Channel Mask:         0x" << std::hex << getChannelMask() << std::dec << "\n";
@@ -69,6 +70,10 @@ std::string AAudioServiceEndpoint::dump() const NO_THREAD_SAFETY_ANALYSIS {
     result << "    Reference Count:      " << mOpenCount << "\n";
     result << "    Session Id:           " << getSessionId() << "\n";
     result << "    Privacy Sensitive:    " << isPrivacySensitive() << "\n";
+    result << "    Hardware Channel Count:" << getHardwareSamplesPerFrame() << "\n";
+    result << "    Hardware Format:      " << getHardwareFormat() << " ("
+                                           << audio_format_to_string(getHardwareFormat()) << ")\n";
+    result << "    Hardware Sample Rate: " << getHardwareSampleRate() << "\n";
     result << "    Connected:            " << mConnected.load() << "\n";
     result << "    Registered Streams:" << "\n";
     result << AAudioServiceStreamShared::dumpHeader() << "\n";
@@ -84,7 +89,7 @@ std::string AAudioServiceEndpoint::dump() const NO_THREAD_SAFETY_ANALYSIS {
 
 // @return true if stream found
 bool AAudioServiceEndpoint::isStreamRegistered(audio_port_handle_t portHandle) {
-    std::lock_guard<std::mutex> lock(mLockStreams);
+    const std::lock_guard<std::mutex> lock(mLockStreams);
     for (const auto& stream : mRegisteredStreams) {
         if (stream->getPortHandle() == portHandle) {
             return true;
@@ -97,7 +102,7 @@ std::vector<android::sp<AAudioServiceStreamBase>>
         AAudioServiceEndpoint::disconnectRegisteredStreams() {
     std::vector<android::sp<AAudioServiceStreamBase>> streamsDisconnected;
     {
-        std::lock_guard<std::mutex> lock(mLockStreams);
+        const std::lock_guard<std::mutex> lock(mLockStreams);
         mRegisteredStreams.swap(streamsDisconnected);
     }
     mConnected.store(false);
@@ -118,7 +123,7 @@ std::vector<android::sp<AAudioServiceStreamBase>>
 
 void AAudioServiceEndpoint::releaseRegisteredStreams() {
     // List of streams to be closed after we disconnect everything.
-    std::vector<android::sp<AAudioServiceStreamBase>> streamsToClose
+    const std::vector<android::sp<AAudioServiceStreamBase>> streamsToClose
             = disconnectRegisteredStreams();
 
     // Close outside the lock to avoid recursive locks.
@@ -129,14 +134,14 @@ void AAudioServiceEndpoint::releaseRegisteredStreams() {
     }
 }
 
-aaudio_result_t AAudioServiceEndpoint::registerStream(sp<AAudioServiceStreamBase>stream) {
-    std::lock_guard<std::mutex> lock(mLockStreams);
+aaudio_result_t AAudioServiceEndpoint::registerStream(const sp<AAudioServiceStreamBase>& stream) {
+    const std::lock_guard<std::mutex> lock(mLockStreams);
     mRegisteredStreams.push_back(stream);
     return AAUDIO_OK;
 }
 
-aaudio_result_t AAudioServiceEndpoint::unregisterStream(sp<AAudioServiceStreamBase>stream) {
-    std::lock_guard<std::mutex> lock(mLockStreams);
+aaudio_result_t AAudioServiceEndpoint::unregisterStream(const sp<AAudioServiceStreamBase>& stream) {
+    const std::lock_guard<std::mutex> lock(mLockStreams);
     mRegisteredStreams.erase(std::remove(
             mRegisteredStreams.begin(), mRegisteredStreams.end(), stream),
                              mRegisteredStreams.end());
@@ -150,8 +155,8 @@ bool AAudioServiceEndpoint::matches(const AAudioStreamConfiguration& configurati
     if (configuration.getDirection() != getDirection()) {
         return false;
     }
-    if (configuration.getDeviceId() != AAUDIO_UNSPECIFIED &&
-        configuration.getDeviceId() != getDeviceId()) {
+    if (!configuration.getDeviceIds().empty() &&
+        !android::areDeviceIdsEqual(configuration.getDeviceIds(), getDeviceIds())) {
         return false;
     }
     if (configuration.getSessionId() != AAUDIO_SESSION_ID_ALLOCATE &&
@@ -191,20 +196,28 @@ audio_attributes_t AAudioServiceEndpoint::getAudioAttributesFrom(
             ? AAudioConvert_inputPresetToAudioSource(params->getInputPreset())
             : AUDIO_SOURCE_DEFAULT;
     audio_flags_mask_t flags;
+    std::string tags;
     if (direction == AAUDIO_DIRECTION_OUTPUT) {
-        flags = static_cast<audio_flags_mask_t>(AUDIO_FLAG_LOW_LATENCY
-                | AAudioConvert_allowCapturePolicyToAudioFlagsMask(
+        flags = AAudio_computeAudioFlagsMask(
                         params->getAllowedCapturePolicy(),
                         params->getSpatializationBehavior(),
-                        params->isContentSpatialized()));
+                        params->isContentSpatialized(),
+                        AUDIO_OUTPUT_FLAG_FAST);
+        tags = params->getTagsAsString();
     } else {
         flags = static_cast<audio_flags_mask_t>(AUDIO_FLAG_LOW_LATENCY
                 | AAudioConvert_privacySensitiveToAudioFlagsMask(params->isPrivacySensitive()));
     }
-    return {
+    audio_attributes_t nativeAttributes = {
             .content_type = contentType,
             .usage = usage,
             .source = source,
             .flags = flags,
-            .tags = "" };
+            .tags = ""
+    };
+    if (!tags.empty()) {
+        strncpy(nativeAttributes.tags, tags.c_str(), AUDIO_ATTRIBUTES_TAGS_MAX_SIZE);
+        nativeAttributes.tags[AUDIO_ATTRIBUTES_TAGS_MAX_SIZE - 1] = '\0';
+    }
+    return nativeAttributes;
 }

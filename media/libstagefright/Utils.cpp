@@ -44,6 +44,8 @@
 #include <media/AudioParameter.h>
 #include <system/audio.h>
 
+#include <com_android_media_extractor_flags.h>
+
 // TODO : Remove the defines once mainline media is built against NDK >= 31.
 // The mp4 extractor is part of mainline and builds against NDK 29 as of
 // writing. These keys are available only from NDK 31:
@@ -796,6 +798,10 @@ static std::vector<std::pair<const char *, uint32_t>> int32Mappings {
         { "valid-samples", kKeyValidSamples },
         { "dvb-component-tag", kKeyDvbComponentTag},
         { "dvb-audio-description", kKeyDvbAudioDescription},
+        { "dvb-teletext-magazine-number", kKeyDvbTeletextMagazineNumber},
+        { "dvb-teletext-page-number", kKeyDvbTeletextPageNumber},
+        { "profile", kKeyAudioProfile },
+        { "level", kKeyAudioLevel },
     }
 };
 
@@ -1012,6 +1018,16 @@ status_t convertMetaDataToMessage(
     int32_t dvbAudioDescription = 0;
     if (meta->findInt32(kKeyDvbAudioDescription, &dvbAudioDescription)) {
         msg->setInt32("dvb-audio-description", dvbAudioDescription);
+    }
+
+    int32_t dvbTeletextMagazineNumber = 0;
+    if (meta->findInt32(kKeyDvbTeletextMagazineNumber, &dvbTeletextMagazineNumber)) {
+        msg->setInt32("dvb-teletext-magazine-number", dvbTeletextMagazineNumber);
+    }
+
+    int32_t dvbTeletextPageNumber = 0;
+    if (meta->findInt32(kKeyDvbTeletextPageNumber, &dvbTeletextPageNumber)) {
+        msg->setInt32("dvb-teletext-page-number", dvbTeletextPageNumber);
     }
 
     const char *lang;
@@ -1429,6 +1445,17 @@ status_t convertMetaDataToMessage(
         buffer->meta()->setInt64("timeUs", 0);
         msg->setBuffer("csd-0", buffer);
         parseAV1ProfileLevelFromCsd(buffer, msg);
+    } else if (com::android::media::extractor::flags::extractor_mp4_enable_apv() &&
+               meta->findData(kKeyAPVC, &type, &data, &size)) {
+        sp<ABuffer> buffer = new (std::nothrow) ABuffer(size);
+        if (buffer.get() == NULL || buffer->base() == NULL) {
+            return NO_MEMORY;
+        }
+        memcpy(buffer->data(), data, size);
+
+        buffer->meta()->setInt32("csd", true);
+        buffer->meta()->setInt64("timeUs", 0);
+        msg->setBuffer("csd-0", buffer);
     } else if (meta->findData(kKeyESDS, &type, &data, &size)) {
         ESDS esds((const char *)data, size);
         if (esds.InitCheck() != (status_t)OK) {
@@ -1810,6 +1837,16 @@ status_t convertMessageToMetaData(const sp<AMessage> &msg, sp<MetaData> &meta) {
         meta->setInt32(kKeyDvbAudioDescription, dvbAudioDescription);
     }
 
+    int32_t dvbTeletextMagazineNumber = 0;
+    if (msg->findInt32("dvb-teletext-magazine-number", &dvbTeletextMagazineNumber)) {
+        meta->setInt32(kKeyDvbTeletextMagazineNumber, dvbTeletextMagazineNumber);
+    }
+
+    int32_t dvbTeletextPageNumber = 0;
+    if (msg->findInt32("dvb-teletext-page-number", &dvbTeletextPageNumber)) {
+        meta->setInt32(kKeyDvbTeletextPageNumber, dvbTeletextPageNumber);
+    }
+
     AString lang;
     if (msg->findString("language", &lang)) {
         meta->setCString(kKeyMediaLanguage, lang.c_str());
@@ -2028,6 +2065,11 @@ status_t convertMessageToMetaData(const sp<AMessage> &msg, sp<MetaData> &meta) {
         meta->setInt32(kKeyMaxHeight, maxHeight);
     }
 
+    int32_t gainmap;
+    if (msg->findInt32("gainmap", &gainmap)) {
+        meta->setInt32(kKeyGainmap, gainmap);
+    }
+
     int32_t fps;
     float fpsFloat;
     if (msg->findInt32("frame-rate", &fps) && fps > 0) {
@@ -2067,6 +2109,9 @@ status_t convertMessageToMetaData(const sp<AMessage> &msg, sp<MetaData> &meta) {
         } else if (mime == MEDIA_MIMETYPE_VIDEO_AV1 ||
                    mime == MEDIA_MIMETYPE_IMAGE_AVIF) {
             meta->setData(kKeyAV1C, 0, csd0->data(), csd0->size());
+        } else if (com::android::media::extractor::flags::extractor_mp4_enable_apv() &&
+                   mime == MEDIA_MIMETYPE_VIDEO_APV) {
+            meta->setData(kKeyAPVC, 0, csd0->data(), csd0->size());
         } else if (mime == MEDIA_MIMETYPE_VIDEO_DOLBY_VISION) {
             int32_t profile = -1;
             uint8_t blCompatibilityId = -1;
@@ -2382,6 +2427,24 @@ void mapAACProfileToAudioFormat( audio_format_t& format, uint64_t eAacProfile)
     return;
 }
 
+audio_format_t audioFormatFromEncoding(int32_t pcmEncoding) {
+    switch (pcmEncoding) {
+    case kAudioEncodingPcmFloat:
+        return AUDIO_FORMAT_PCM_FLOAT;
+    case kAudioEncodingPcm32bit:
+        return AUDIO_FORMAT_PCM_32_BIT;
+    case kAudioEncodingPcm24bitPacked:
+        return AUDIO_FORMAT_PCM_24_BIT_PACKED;
+    case kAudioEncodingPcm16bit:
+        return AUDIO_FORMAT_PCM_16_BIT;
+    case kAudioEncodingPcm8bit:
+        return AUDIO_FORMAT_PCM_8_BIT; // TODO: do we want to support this?
+    default:
+        ALOGE("%s: Invalid encoding: %d", __func__, pcmEncoding);
+        return AUDIO_FORMAT_INVALID;
+    }
+}
+
 status_t getAudioOffloadInfo(const sp<MetaData>& meta, bool hasVideo,
         bool isStreaming, audio_stream_type_t streamType, audio_offload_info_t *info)
 {
@@ -2399,6 +2462,12 @@ status_t getAudioOffloadInfo(const sp<MetaData>& meta, bool hasVideo,
         return BAD_VALUE;
     } else {
         ALOGV("Mime type \"%s\" mapped to audio_format %d", mime, info->format);
+    }
+
+    int32_t pcmEncoding;
+    if (meta->findInt32(kKeyPcmEncoding, &pcmEncoding)) {
+        info->format = audioFormatFromEncoding(pcmEncoding);
+        ALOGV("audio_format use kKeyPcmEncoding value %d first", info->format);
     }
 
     if (AUDIO_FORMAT_INVALID == info->format) {
@@ -2459,6 +2528,11 @@ bool canOffloadStream(const sp<MetaData>& meta, bool hasVideo,
                       bool isStreaming, audio_stream_type_t streamType)
 {
     audio_offload_info_t info = AUDIO_INFO_INITIALIZER;
+    const char *mime;
+    if (meta != nullptr && meta->findCString(kKeyMIMEType, &mime)
+        && strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_OPUS) == 0) {
+        return false;
+    }
     if (OK != getAudioOffloadInfo(meta, hasVideo, isStreaming, streamType, &info)) {
         return false;
     }

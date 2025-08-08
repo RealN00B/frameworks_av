@@ -14,29 +14,34 @@
  * limitations under the License.
  */
 
+#include <cstdint>
+#include <istream>
+#include <map>
+#include <sstream>
+#include <stdarg.h>
+#include <string>
+#include <vector>
+#include <unordered_map>
+
 #define LOG_TAG "APM::AudioPolicyEngine/Config"
 //#define LOG_NDEBUG 0
 
 #include "EngineConfig.h"
+#include <TypeConverter.h>
+#include <Volume.h>
 #include <cutils/properties.h>
+#include <libxml/parser.h>
+#include <libxml/xinclude.h>
+#include <media/AidlConversion.h>
+#include <media/AidlConversionUtil.h>
 #include <media/TypeConverter.h>
 #include <media/convert.h>
 #include <system/audio_config.h>
 #include <utils/Log.h>
-#include <libxml/parser.h>
-#include <libxml/xinclude.h>
-#include <string>
-#include <vector>
-#include <map>
-#include <sstream>
-#include <istream>
-
-#include <cstdint>
-#include <stdarg.h>
-#include <string>
 
 namespace android {
 
+using media::audio::common::AudioStreamType;
 using utilities::convertTo;
 
 namespace engineConfig {
@@ -44,6 +49,116 @@ namespace engineConfig {
 static constexpr const char *gVersionAttribute = "version";
 static const char *const gReferenceElementName = "reference";
 static const char *const gReferenceAttributeName = "name";
+
+namespace {
+
+static bool gIsConfigurableEngine = false;
+
+ConversionResult<std::string> aidl2legacy_AudioHalProductStrategy_ProductStrategyType(int id) {
+    using AudioProductStrategyType = media::audio::common::AudioProductStrategyType;
+
+#define STRATEGY_ENTRY(name) {static_cast<int>(AudioProductStrategyType::name), "STRATEGY_" #name}
+    static const std::unordered_map<int, std::string> productStrategyMap = {STRATEGY_ENTRY(MEDIA),
+                            STRATEGY_ENTRY(PHONE),
+                            STRATEGY_ENTRY(SONIFICATION),
+                            STRATEGY_ENTRY(SONIFICATION_RESPECTFUL),
+                            STRATEGY_ENTRY(DTMF),
+                            STRATEGY_ENTRY(ENFORCED_AUDIBLE),
+                            STRATEGY_ENTRY(TRANSMITTED_THROUGH_SPEAKER),
+                            STRATEGY_ENTRY(ACCESSIBILITY)};
+#undef STRATEGY_ENTRY
+
+    if (id >= media::audio::common::AudioHalProductStrategy::VENDOR_STRATEGY_ID_START) {
+        return std::to_string(id);
+    }
+    auto it = productStrategyMap.find(id);
+    if (it == productStrategyMap.end()) {
+        return base::unexpected(BAD_VALUE);
+    }
+    return it->second;
+}
+
+ConversionResult<AttributesGroup> aidl2legacy_AudioHalAttributeGroup_AttributesGroup(
+        const media::audio::common::AudioHalAttributesGroup& aidl) {
+    AttributesGroup legacy;
+    // StreamType may only be set to AudioStreamType.INVALID when using the
+    // Configurable Audio Policy (CAP) engine. An AudioHalAttributesGroup with
+    // AudioStreamType.INVALID is used when the volume group and attributes are
+    // not associated to any AudioStreamType.
+    legacy.stream = ((aidl.streamType == AudioStreamType::INVALID) ? AUDIO_STREAM_DEFAULT :
+            VALUE_OR_RETURN(aidl2legacy_AudioStreamType_audio_stream_type_t(aidl.streamType)));
+    legacy.volumeGroup = aidl.volumeGroupName;
+    legacy.attributesVect = VALUE_OR_RETURN(convertContainer<AttributesVector>(
+                    aidl.attributes, aidl2legacy_AudioAttributes_audio_attributes_t));
+    return legacy;
+}
+
+ConversionResult<ProductStrategy> aidl2legacy_AudioHalProductStrategy_ProductStrategy(
+        const media::audio::common::AudioHalProductStrategy& aidl) {
+    ProductStrategy legacy;
+    legacy.name = aidl.name.value_or(VALUE_OR_RETURN(
+                    aidl2legacy_AudioHalProductStrategy_ProductStrategyType(aidl.id)));
+    legacy.id = aidl.id;
+    legacy.attributesGroups = VALUE_OR_RETURN(convertContainer<AttributesGroups>(
+                    aidl.attributesGroups,
+                    aidl2legacy_AudioHalAttributeGroup_AttributesGroup));
+    return legacy;
+}
+
+ConversionResult<std::string> legacy_device_category_to_string(device_category legacy) {
+    std::string s;
+    if (DeviceCategoryConverter::toString(legacy, s)) {
+        return s;
+    }
+    return base::unexpected(BAD_VALUE);
+}
+
+ConversionResult<std::string> aidl2legacy_DeviceCategory(
+        const media::audio::common::AudioHalVolumeCurve::DeviceCategory aidl) {
+    using DeviceCategory = media::audio::common::AudioHalVolumeCurve::DeviceCategory;
+    switch (aidl) {
+        case DeviceCategory::HEADSET:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_HEADSET);
+        case DeviceCategory::SPEAKER:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_SPEAKER);
+        case DeviceCategory::EARPIECE:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_EARPIECE);
+        case DeviceCategory::EXT_MEDIA:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_EXT_MEDIA);
+        case DeviceCategory::HEARING_AID:
+            return legacy_device_category_to_string(DEVICE_CATEGORY_HEARING_AID);
+    }
+    return base::unexpected(BAD_VALUE);
+}
+
+ConversionResult<CurvePoint> aidl2legacy_AudioHalCurvePoint_CurvePoint(
+        const media::audio::common::AudioHalVolumeCurve::CurvePoint& aidl) {
+    CurvePoint legacy;
+    legacy.index = VALUE_OR_RETURN(convertIntegral<int>(aidl.index));
+    legacy.attenuationInMb = aidl.attenuationMb;
+    return legacy;
+}
+
+ConversionResult<VolumeCurve> aidl2legacy_AudioHalVolumeCurve_VolumeCurve(
+        const media::audio::common::AudioHalVolumeCurve& aidl) {
+    VolumeCurve legacy;
+    legacy.deviceCategory = VALUE_OR_RETURN(aidl2legacy_DeviceCategory(aidl.deviceCategory));
+    legacy.curvePoints = VALUE_OR_RETURN(convertContainer<CurvePoints>(
+                    aidl.curvePoints, aidl2legacy_AudioHalCurvePoint_CurvePoint));
+    return legacy;
+}
+
+ConversionResult<VolumeGroup> aidl2legacy_AudioHalVolumeGroup_VolumeGroup(
+        const media::audio::common::AudioHalVolumeGroup& aidl) {
+    VolumeGroup legacy;
+    legacy.name = aidl.name;
+    legacy.indexMin = aidl.minIndex;
+    legacy.indexMax = aidl.maxIndex;
+    legacy.volumeCurves = VALUE_OR_RETURN(convertContainer<VolumeCurves>(
+                    aidl.volumeCurves, aidl2legacy_AudioHalVolumeCurve_VolumeCurve));
+    return legacy;
+}
+}  // namespace
 
 template<typename E, typename C>
 struct BaseSerializerTraits {
@@ -57,7 +172,6 @@ struct AttributesGroupTraits : public BaseSerializerTraits<AttributesGroup, Attr
     static constexpr const char *collectionTag = "AttributesGroups";
 
     struct Attributes {
-        static constexpr const char *name = "name";
         static constexpr const char *streamType = "streamType";
         static constexpr const char *volumeGroup = "volumeGroup";
     };
@@ -70,6 +184,7 @@ struct ProductStrategyTraits : public BaseSerializerTraits<ProductStrategy, Prod
 
     struct Attributes {
         static constexpr const char *name = "name";
+        static constexpr const char *id = "id";
     };
     static android::status_t deserialize(_xmlDoc *doc, const _xmlNode *root, Collection &ps);
 };
@@ -313,12 +428,6 @@ static status_t deserializeAttributesCollection(_xmlDoc *doc, const _xmlNode *cu
 status_t AttributesGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
                                             Collection &attributesGroup)
 {
-    std::string name = getXmlAttribute(child, Attributes::name);
-    if (name.empty()) {
-        ALOGV("AttributesGroupTraits No attribute %s found", Attributes::name);
-    }
-    ALOGV("%s: %s = %s", __FUNCTION__, Attributes::name, name.c_str());
-
     std::string volumeGroup = getXmlAttribute(child, Attributes::volumeGroup);
     if (volumeGroup.empty()) {
         ALOGE("%s: No attribute %s found", __FUNCTION__, Attributes::volumeGroup);
@@ -339,7 +448,7 @@ status_t AttributesGroupTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
     AttributesVector attributesVect;
     deserializeAttributesCollection(doc, child, attributesVect);
 
-    attributesGroup.push_back({name, streamType, volumeGroup, attributesVect});
+    attributesGroup.push_back({streamType, volumeGroup, attributesVect});
     return NO_ERROR;
 }
 
@@ -434,13 +543,28 @@ status_t ProductStrategyTraits::deserialize(_xmlDoc *doc, const _xmlNode *child,
         ALOGE("ProductStrategyTraits No attribute %s found", Attributes::name);
         return BAD_VALUE;
     }
-    ALOGV("%s: %s = %s", __FUNCTION__, Attributes::name, name.c_str());
+    int id = PRODUCT_STRATEGY_NONE;
+    std::string idLiteral = getXmlAttribute(child, Attributes::id);
+    if (!idLiteral.empty()) {
+        if (!convertTo(idLiteral, id)) {
+            return BAD_VALUE;
+        }
+    } else {
+        legacy_strategy legacyId;
+        if (legacy_strategy_from_string(name.c_str(), &legacyId)) {
+            id = legacyId;
+        } else if (!gIsConfigurableEngine) {
+            return BAD_VALUE;
+        }
+        // With a configurable engine it can be a vendor-provided strategy name.
+    }
+    ALOGV("%s: %s, %s = %d", __FUNCTION__, name.c_str(), Attributes::id, id);
 
     size_t skipped = 0;
     AttributesGroups attrGroups;
     deserializeCollection<AttributesGroupTraits>(doc, child, attrGroups, skipped);
 
-    strategies.push_back({name, attrGroups});
+    strategies.push_back({name, id, attrGroups});
     return NO_ERROR;
 }
 
@@ -661,7 +785,7 @@ private:
 
 }  // namespace
 
-ParsingResult parse(const char* path) {
+ParsingResult parse(const char* path, bool isConfigurable) {
     XmlErrorHandler errorHandler;
     auto doc = make_xmlUnique(xmlParseFile(path));
     if (doc == NULL) {
@@ -686,6 +810,7 @@ ParsingResult parse(const char* path) {
         ALOGE("%s: No version found", __func__);
         return {nullptr, 0};
     }
+    gIsConfigurableEngine = isConfigurable;
     size_t nbSkippedElements = 0;
     auto config = std::make_unique<Config>();
     config->version = std::stof(version);
@@ -730,6 +855,26 @@ android::status_t parseLegacyVolumes(VolumeGroups &volumeGroups) {
         return BAD_VALUE;
     }
 }
+
+ParsingResult convert(const ::android::media::audio::common::AudioHalEngineConfig& aidlConfig) {
+    auto config = std::make_unique<engineConfig::Config>();
+    config->version = 1.0f;
+    if (auto conv = convertContainer<engineConfig::ProductStrategies>(
+                    aidlConfig.productStrategies,
+                    aidl2legacy_AudioHalProductStrategy_ProductStrategy); conv.ok()) {
+        config->productStrategies = std::move(conv.value());
+    } else {
+        return ParsingResult{};
+    }
+    if (auto conv = convertContainer<engineConfig::VolumeGroups>(
+                    aidlConfig.volumeGroups,
+                    aidl2legacy_AudioHalVolumeGroup_VolumeGroup); conv.ok()) {
+        config->volumeGroups = std::move(conv.value());
+    } else {
+        return ParsingResult{};
+    }
+    return {.parsedConfig=std::move(config), .nbSkippedElement=0};
+ }
 
 } // namespace engineConfig
 } // namespace android

@@ -25,9 +25,10 @@
 
 #include <binder/MemoryBase.h>
 #include <binder/MemoryHeapBase.h>
+#include <com_android_graphics_libgui_flags.h>
+#include <gui/Surface.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
-#include <gui/Surface.h>
 
 #include "common/CameraDeviceBase.h"
 #include "api1/Camera2Client.h"
@@ -83,7 +84,7 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
     }
 
     // Find out buffer size for JPEG
-    ssize_t maxJpegSize = device->getJpegBufferSize(device->infoPhysical(String8("")),
+    ssize_t maxJpegSize = device->getJpegBufferSize(device->infoPhysical(""),
             params.pictureWidth, params.pictureHeight);
     if (maxJpegSize <= 0) {
         ALOGE("%s: Camera %d: Jpeg buffer size (%zu) is invalid ",
@@ -93,6 +94,12 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
 
     if (mCaptureConsumer == 0) {
         // Create CPU buffer queue endpoint
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mCaptureConsumer = new CpuConsumer(1);
+        mCaptureConsumer->setFrameAvailableListener(this);
+        mCaptureConsumer->setName(String8("Camera2-JpegConsumer"));
+        mCaptureWindow = mCaptureConsumer->getSurface();
+#else
         sp<IGraphicBufferProducer> producer;
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&producer, &consumer);
@@ -100,6 +107,7 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
         mCaptureConsumer->setFrameAvailableListener(this);
         mCaptureConsumer->setName(String8("Camera2-JpegConsumer"));
         mCaptureWindow = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     }
 
     // Since ashmem heaps are rounded up to page size, don't reallocate if
@@ -157,7 +165,7 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
                 params.pictureWidth, params.pictureHeight,
                 HAL_PIXEL_FORMAT_BLOB, HAL_DATASPACE_V0_JFIF,
                 CAMERA_STREAM_ROTATION_0, &mCaptureStreamId,
-                String8(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
+                std::string(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create output stream for capture: "
                     "%s (%d)", __FUNCTION__, mId,

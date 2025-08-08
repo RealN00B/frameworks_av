@@ -20,9 +20,12 @@ namespace android::mediautils {
 
 // Repository for MethodStatistics Objects
 
+// It's important to have the HAL class name defined with suffix "Hidl/Aidl" because
+// TimerThread::isRequestFromHal use this string to match binder call to/from hal.
 std::shared_ptr<std::vector<std::string>>
 getStatisticsClassesForModule(std::string_view moduleName) {
-    static const std::map<std::string, std::shared_ptr<std::vector<std::string>>> m {
+    static const std::map<std::string, std::shared_ptr<std::vector<std::string>>,
+            std::less<> /* transparent comparator */> m {
         {
             METHOD_STATISTICS_MODULE_NAME_AUDIO_HIDL,
             std::shared_ptr<std::vector<std::string>>(
@@ -33,14 +36,24 @@ getStatisticsClassesForModule(std::string_view moduleName) {
                 "StreamOutHalHidl",
               })
         },
+        {
+            METHOD_STATISTICS_MODULE_NAME_AUDIO_AIDL,
+            std::shared_ptr<std::vector<std::string>>(
+                new std::vector<std::string>{
+                "DeviceHalAidl",
+                "EffectHalAidl",
+                "StreamHalAidl",
+              })
+        },
     };
-    auto it = m.find({moduleName.begin(), moduleName.end()});
+    auto it = m.find(moduleName);
     if (it == m.end()) return {};
     return it->second;
 }
 
 static void addClassesToMap(const std::shared_ptr<std::vector<std::string>> &classNames,
-        std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>> &map) {
+        std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>,
+                std::less<> /* transparent comparator */> &map) {
     if (classNames) {
         for (const auto& className : *classNames) {
             map.emplace(className, std::make_shared<MethodStatistics<std::string>>());
@@ -51,17 +64,21 @@ static void addClassesToMap(const std::shared_ptr<std::vector<std::string>> &cla
 // singleton statistics for DeviceHalHidl StreamOutHalHidl StreamInHalHidl
 std::shared_ptr<MethodStatistics<std::string>>
 getStatisticsForClass(std::string_view className) {
-    static const std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>> m =
+    static const std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>,
+            std::less<> /* transparent comparator */> m =
         // copy elided initialization of map m.
         [](){
-            std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>> m;
+            std::map<std::string, std::shared_ptr<MethodStatistics<std::string>>, std::less<>> m;
             addClassesToMap(
                     getStatisticsClassesForModule(METHOD_STATISTICS_MODULE_NAME_AUDIO_HIDL),
+                    m);
+            addClassesToMap(
+                    getStatisticsClassesForModule(METHOD_STATISTICS_MODULE_NAME_AUDIO_AIDL),
                     m);
             return m;
         }();
 
-    auto it = m.find({className.begin(), className.end()});
+    auto it = m.find(className);
     if (it == m.end()) return {};
     return it->second;
 }

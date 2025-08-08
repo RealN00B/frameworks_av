@@ -35,20 +35,18 @@ Mutex MediaMetadataRetriever::sServiceLock;
 sp<IMediaPlayerService> MediaMetadataRetriever::sService;
 sp<MediaMetadataRetriever::DeathNotifier> MediaMetadataRetriever::sDeathNotifier;
 
+Mutex MediaMetadataRetriever::sLock;
+
 const sp<IMediaPlayerService> MediaMetadataRetriever::getService()
 {
     Mutex::Autolock lock(sServiceLock);
     if (sService == 0) {
         sp<IServiceManager> sm = defaultServiceManager();
         sp<IBinder> binder;
-        do {
-            binder = sm->getService(String16("media.player"));
-            if (binder != 0) {
-                break;
-            }
-            ALOGW("MediaPlayerService not published, waiting...");
-            usleep(500000); // 0.5 s
-        } while (true);
+        binder = sm->waitForService(String16("media.player"));
+        if (binder == nullptr) {
+            return nullptr;
+        }
         if (sDeathNotifier == NULL) {
             sDeathNotifier = new DeathNotifier();
         }
@@ -147,6 +145,7 @@ sp<IMemory> MediaMetadataRetriever::getFrameAtTime(
     ALOGV("getFrameAtTime: time(%" PRId64 " us) option(%d) colorFormat(%d) metaOnly(%d)",
             timeUs, option, colorFormat, metaOnly);
     Mutex::Autolock _l(mLock);
+    Mutex::Autolock _gLock(sLock);
     if (mRetriever == 0) {
         ALOGE("retriever is not initialized");
         return NULL;
@@ -159,6 +158,7 @@ sp<IMemory> MediaMetadataRetriever::getImageAtIndex(
     ALOGV("getImageAtIndex: index(%d) colorFormat(%d) metaOnly(%d) thumbnail(%d)",
             index, colorFormat, metaOnly, thumbnail);
     Mutex::Autolock _l(mLock);
+    Mutex::Autolock _gLock(sLock);
     if (mRetriever == 0) {
         ALOGE("retriever is not initialized");
         return NULL;
@@ -171,6 +171,7 @@ sp<IMemory> MediaMetadataRetriever::getImageRectAtIndex(
     ALOGV("getImageRectAtIndex: index(%d) colorFormat(%d) rect {%d, %d, %d, %d}",
             index, colorFormat, left, top, right, bottom);
     Mutex::Autolock _l(mLock);
+    Mutex::Autolock _gLock(sLock);
     if (mRetriever == 0) {
         ALOGE("retriever is not initialized");
         return NULL;
@@ -184,6 +185,7 @@ sp<IMemory>  MediaMetadataRetriever::getFrameAtIndex(
     ALOGV("getFrameAtIndex: index(%d), colorFormat(%d) metaOnly(%d)",
             index, colorFormat, metaOnly);
     Mutex::Autolock _l(mLock);
+    Mutex::Autolock _gLock(sLock);
     if (mRetriever == 0) {
         ALOGE("retriever is not initialized");
         return NULL;

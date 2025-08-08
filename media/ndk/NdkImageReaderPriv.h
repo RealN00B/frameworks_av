@@ -20,11 +20,13 @@
 #include <inttypes.h>
 
 #include <media/NdkImageReader.h>
+#include <media-vndk/VndkImageReader.h>
 
 #include <utils/List.h>
 #include <utils/Mutex.h>
 #include <utils/StrongPointer.h>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
 #include <gui/BufferItemConsumer.h>
 #include <gui/Surface.h>
@@ -56,15 +58,18 @@ struct AImageReader : public RefBase {
                  int32_t height,
                  int32_t format,
                  uint64_t usage,
-                 int32_t maxImages);
+                 int32_t maxImages,
+                 uint32_t hardwareBufferFormat,
+                 android_dataspace dataSpace);
     ~AImageReader();
 
-    // Inintialize AImageReader, uninitialized or failed to initialize AImageReader
+    // Initialize AImageReader, uninitialized or failed to initialize AImageReader
     // should never be passed to application
     media_status_t init();
 
     media_status_t setImageListener(AImageReader_ImageListener* listener);
     media_status_t setBufferRemovedListener(AImageReader_BufferRemovedListener* listener);
+    media_status_t setUsage(uint64_t usage);
 
     media_status_t acquireNextImage(/*out*/AImage** image, /*out*/int* fenceFd);
     media_status_t acquireLatestImage(/*out*/AImage** image, /*out*/int* fenceFd);
@@ -79,7 +84,6 @@ struct AImageReader : public RefBase {
     void           close();
 
   private:
-
     friend struct AImage; // for grabing reader lock
 
     BufferItem* getBufferItemLocked();
@@ -118,12 +122,15 @@ struct AImageReader : public RefBase {
 
     const int32_t mWidth;
     const int32_t mHeight;
-    const int32_t mFormat;
-    const uint64_t mUsage;  // AHARDWAREBUFFER_USAGE_* flags.
+    int32_t mFormat;
+    uint64_t mUsage;  // AHARDWAREBUFFER_USAGE_* flags.
     const int32_t mMaxImages;
 
     // TODO(jwcai) Seems completely unused in AImageReader class.
     const int32_t mNumPlanes;
+
+    uint32_t mHalFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    android_dataspace mHalDataSpace = HAL_DATASPACE_UNKNOWN;
 
     struct FrameListener : public ConsumerBase::FrameAvailableListener {
       public:
@@ -155,11 +162,11 @@ struct AImageReader : public RefBase {
     };
     sp<BufferRemovedListener> mBufferRemovedListener;
 
-    int mHalFormat;
-    android_dataspace mHalDataSpace;
     uint64_t mHalUsage;
 
+#if !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     sp<IGraphicBufferProducer> mProducer;
+#endif  // !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     sp<Surface>                mSurface;
     sp<BufferItemConsumer>     mBufferItemConsumer;
     sp<ANativeWindow>          mWindow;

@@ -33,8 +33,10 @@ cc_defaults {
         "liblog",
     ],
     shared_libs: [
+        "camera_platform_flags_c_lib",
         "framework-permission-aidl-cpp",
         "libbinder",
+        "libbinder_ndk",
         "libcutils",
         "libmedia",
         "libstagefright",
@@ -43,9 +45,17 @@ cc_defaults {
     ],
     fuzz_config: {
         cc: [
-            "android-media-fuzzing-reports@google.com",
+            "android-media-playback+bugs@google.com",
         ],
         componentid: 155276,
+        hotlists: [
+            "4593311",
+        ],
+        description: "The fuzzer targets the APIs of libmediaplayerservice",
+        vector: "remote",
+        service_privilege: "privileged",
+        users: "multi_user",
+        fuzzed_code_usage: "shipped",
     },
 }
 
@@ -55,20 +65,52 @@ cc_fuzz {
         "mediarecorder_fuzzer.cpp",
     ],
     defaults: [
+        "libaudioflinger_dependencies",
         "libmediaplayerserviceFuzzer_defaults",
     ],
     static_libs: [
         "libstagefright_rtsp",
         "libbase",
+        "libstagefright_nuplayer",
+        "libplayerservice_datasource",
+        "libstagefright_timedtext",
+        "libaudioprocessing_base",
     ],
     shared_libs: [
-        "av-types-aidl-cpp",
+        "android.hardware.media.omx@1.0",
         "media_permission-aidl-cpp",
-        "libaudioclient_aidl_conversion",
+        "libactivitymanager_aidl",
         "libandroid_net",
+        "libaudioflinger",
+        "libaudiofoundation",
         "libcamera_client",
+        "libcodec2_client",
+        "libcrypto",
+        "libdatasource",
+        "libdrmframework",
         "libgui",
-        "libmediametrics",
+        "libhidlbase",
+        "libmedia_codeclist",
+        "libmedia_omx",
+        "libmediadrm",
+        "libnetd_client",
+        "libstagefright_httplive",
+        "packagemanager_aidl-cpp",
+        "libfakeservicemanager",
+        "libresourcemanagerservice",
+        "libmediametricsservice",
+        "mediametricsservice-aidl-cpp",
+        "libcameraservice",
+        "android.hardware.camera.common@1.0",
+        "android.hardware.camera.provider@2.4",
+        "android.hardware.camera.provider@2.5",
+        "android.hardware.camera.provider@2.6",
+        "android.hardware.camera.provider@2.7",
+        "android.hardware.camera.provider-V3-ndk",
+        "android.hardware.camera.device@1.0",
+        "android.hardware.camera.device@3.2",
+        "android.hardware.camera.device@3.4",
+        "libaudiohal@7.0",
     ],
 }
 
@@ -79,6 +121,7 @@ cc_fuzz {
     ],
     defaults: [
         "libmediaplayerserviceFuzzer_defaults",
+        "libmediaplayerservice_defaults",
     ],
     static_libs: [
         "libplayerservice_datasource",
@@ -86,7 +129,10 @@ cc_fuzz {
     shared_libs: [
         "libdatasource",
         "libdrmframework",
+        "libstagefright_httplive",
+        "libmediaextractorservice",
     ],
+    include_dirs: ["frameworks/av/services/mediaextractor"],
 }
 
 cc_fuzz {
@@ -98,10 +144,13 @@ cc_fuzz {
         "libmediaplayerserviceFuzzer_defaults",
     ],
     static_libs: [
+        "libgmock",
+        "libgtest_ndk_c++",
         "libplayerservice_datasource",
         "libstagefright_nuplayer",
         "libstagefright_rtsp",
         "libstagefright_timedtext",
+        "libbinder_random_parcel",
     ],
     shared_libs: [
         "android.hardware.media.c2@1.0",
@@ -112,6 +161,7 @@ cc_fuzz {
         "libactivitymanager_aidl",
         "libandroid_net",
         "libaudioclient",
+        "libaudiofoundation",
         "libcamera_client",
         "libcodec2_client",
         "libcrypto",
@@ -129,5 +179,32 @@ cc_fuzz {
         "libnetd_client",
         "libpowermanager",
         "libstagefright_httplive",
+        "libaudiohal@7.0",
+        "libmediaextractorservice",
     ],
+    corpus: ["corpus/*"],
+    include_dirs: ["frameworks/av/services/mediaextractor"],
+}
+
+cc_fuzz {
+    name: "media_player_service_fuzzer",
+    defaults: [
+        "service_fuzzer_defaults",
+        "libmediaplayerservice_defaults",
+        "fuzzer_disable_leaks",
+    ],
+    srcs: [
+        "media_player_service_fuzzer.cpp",
+    ],
+    fuzz_config: {
+        cc: [
+            "kyslov@google.com",
+            "ibaker@google.com",
+        ],
+        triage_assignee: "waghpawan@google.com",
+    },
+    cflags: [
+        "-DFUZZ_MODE_MEDIA_PLAYER_SERVICE",
+    ],
+    include_dirs: ["frameworks/av/media/libmediaplayerservice/"],
 }

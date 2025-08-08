@@ -41,7 +41,7 @@ class MediaRecorderClient : public BnMediaRecorder
         virtual ~AudioDeviceUpdatedNotifier();
         virtual void onAudioDeviceUpdate(
                 audio_io_handle_t audioIo,
-                audio_port_handle_t deviceId);
+                const DeviceIdVector& deviceIds);
     private:
         wp<IMediaRecorderClient> mListener;
     };
@@ -80,10 +80,10 @@ public:
     virtual     status_t   setInputSurface(const sp<PersistentSurface>& surface);
     virtual     sp<IGraphicBufferProducer> querySurfaceMediaSource();
     virtual     status_t   setInputDevice(audio_port_handle_t deviceId);
-    virtual     status_t   getRoutedDeviceId(audio_port_handle_t* deviceId);
+    virtual     status_t   getRoutedDeviceIds(DeviceIdVector& deviceIds);
     virtual     status_t   enableAudioDeviceCallback(bool enabled);
     virtual     status_t   getActiveMicrophones(
-                              std::vector<media::MicrophoneInfo>* activeMicrophones);
+                              std::vector<media::MicrophoneInfoFw>* activeMicrophones);
     virtual     status_t   setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
     virtual     status_t   setPreferredMicrophoneFieldDimension(float zoom);
                 status_t   getPortId(audio_port_handle_t *portId) override;

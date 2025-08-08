@@ -22,6 +22,7 @@
 #include "MediaPlayerService.h"
 #include "StagefrightRecorder.h"
 
+#include <android/binder_auto_utils.h>
 #include <android/hardware/media/omx/1.0/IOmx.h>
 #include <android/hardware/media/c2/1.0/IComponentStore.h>
 #include <binder/IPCThreadState.h>
@@ -245,7 +246,7 @@ status_t MediaRecorderClient::setVideoFrameRate(int frames_per_second)
 }
 
 status_t MediaRecorderClient::setParameters(const String8& params) {
-    ALOGV("setParameters(%s)", params.string());
+    ALOGV("setParameters(%s)", params.c_str());
     Mutex::Autolock lock(mLock);
     if (mRecorder == NULL) {
         ALOGE("recorder is not initialized");
@@ -408,10 +409,13 @@ MediaRecorderClient::AudioDeviceUpdatedNotifier::~AudioDeviceUpdatedNotifier() {
 
 void MediaRecorderClient::AudioDeviceUpdatedNotifier::onAudioDeviceUpdate(
         audio_io_handle_t audioIo,
-        audio_port_handle_t deviceId) {
+        const DeviceIdVector& deviceIds) {
+    ALOGD("onAudioDeviceUpdate deviceIds: %s", toString(deviceIds).c_str());
     sp<IMediaRecorderClient> listener = mListener.promote();
     if (listener != NULL) {
-        listener->notify(MEDIA_RECORDER_AUDIO_ROUTING_CHANGED, audioIo, deviceId);
+        // Java should query the new device ids once it gets the event.
+        // TODO(b/378505346): Pass the deviceIds to Java to avoid race conditions.
+        listener->notify(MEDIA_RECORDER_AUDIO_ROUTING_CHANGED, audioIo, 0 /*ext2*/);
     } else {
         ALOGW("listener for process %d death is gone", MEDIA_RECORDER_AUDIO_ROUTING_CHANGED);
     }
@@ -490,9 +494,9 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
         {
             for (std::shared_ptr<Codec2Client> const& client :
                     Codec2Client::CreateFromAllServices()) {
-                sp<IBase> base = client->getBase();
-                mDeathNotifiers.emplace_back(
-                        base, [l = wp<IMediaRecorderClient>(listener),
+                sp<IBase> hidlBase = client->getHidlBase();
+                ::ndk::SpAIBinder aidlBase = client->getAidlBase();
+                auto onBinderDied = [l = wp<IMediaRecorderClient>(listener),
                                name = std::string(client->getServiceName())]() {
                     sp<IMediaRecorderClient> listener = l.promote();
                     if (listener) {
@@ -507,7 +511,12 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
                               "without a death handler",
                               name.c_str());
                     }
-                });
+                };
+                if (hidlBase) {
+                    mDeathNotifiers.emplace_back(hidlBase, onBinderDied);
+                } else if (aidlBase.get() != nullptr) {
+                    mDeathNotifiers.emplace_back(aidlBase, onBinderDied);
+                }
             }
         }
     }
@@ -519,7 +528,7 @@ status_t MediaRecorderClient::setListener(const sp<IMediaRecorderClient>& listen
 }
 
 status_t MediaRecorderClient::setClientName(const String16& clientName) {
-    ALOGV("setClientName(%s)", String8(clientName).string());
+    ALOGV("setClientName(%s)", String8(clientName).c_str());
     Mutex::Autolock lock(mLock);
     if (mRecorder == NULL) {
         ALOGE("recorder is not initialized");
@@ -544,11 +553,11 @@ status_t MediaRecorderClient::setInputDevice(audio_port_handle_t deviceId) {
     return NO_INIT;
 }
 
-status_t MediaRecorderClient::getRoutedDeviceId(audio_port_handle_t* deviceId) {
-    ALOGV("getRoutedDeviceId");
+status_t MediaRecorderClient::getRoutedDeviceIds(DeviceIdVector& deviceIds) {
+    ALOGV("getRoutedDeviceIds");
     Mutex::Autolock lock(mLock);
     if (mRecorder != NULL) {
-        return mRecorder->getRoutedDeviceId(deviceId);
+        return mRecorder->getRoutedDeviceIds(deviceIds);
     }
     return NO_INIT;
 }
@@ -563,7 +572,7 @@ status_t MediaRecorderClient::enableAudioDeviceCallback(bool enabled) {
 }
 
 status_t MediaRecorderClient::getActiveMicrophones(
-        std::vector<media::MicrophoneInfo>* activeMicrophones) {
+        std::vector<media::MicrophoneInfoFw>* activeMicrophones) {
     ALOGV("getActiveMicrophones");
     Mutex::Autolock lock(mLock);
     if (mRecorder != NULL) {

@@ -33,9 +33,6 @@ cc_library_headers {
 cc_defaults {
     name: "libstagefright_foundation_defaults",
     vendor_available: true,
-    vndk: {
-        enabled: true,
-    },
     host_supported: true,
     double_loadable: true,
 
@@ -109,6 +106,11 @@ cc_defaults {
             cflags: [
                 "-DNO_IMEMORY",
             ],
+        },
+        host: {
+            sanitize: {
+                cfi: false,
+            },
         },
         apex: {
             exclude_shared_libs: [

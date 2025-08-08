@@ -17,8 +17,9 @@
 #include "AudioTypes.h"
 #include "MediaMetricsConstants.h"
 #include "StringUtils.h"
+#include <audio_utils/StringUtils.h>
 #include <media/TypeConverter.h> // requires libmedia_helper to get the Audio code.
-#include <statslog.h>            // statsd
+#include <stats_media_metrics.h>            // statsd
 
 namespace android::mediametrics::types {
 
@@ -184,41 +185,41 @@ const std::unordered_map<std::string, int32_t>& getAudioDeviceOutCompactMap() {
 const std::unordered_map<std::string, int32_t>& getAudioDeviceInfoTypeMap() {
     // DO NOT MODIFY VALUES (OK to add new ones).
     static std::unordered_map<std::string, int32_t> map{
-        {"unknown", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_UNKNOWN},
-        {"earpiece", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_EARPIECE},
-        {"speaker", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_SPEAKER},
-        {"headset", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_WIRED_HEADSET},
-        {"headphone", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_WIRED_HEADPHONES}, // sic
-        {"bt_sco", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
-        {"bt_sco_hs", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
-        {"bt_sco_carkit", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
-        {"bt_a2dp", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
-        {"bt_a2dp_hp", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
-        {"bt_a2dp_spk", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
-        {"aux_digital", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI},
-        {"hdmi", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI},
-        {"analog_dock", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_DOCK},
-        {"digital_dock", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_DOCK},
-        {"usb_accessory", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_ACCESSORY},
-        {"usb_device", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_DEVICE},
-        {"usb_headset", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_HEADSET},
-        {"remote_submix", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_REMOTE_SUBMIX},
-        {"telephony_tx", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_TELEPHONY},
-        {"line", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_LINE_ANALOG},
-        {"hdmi_arc", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI_ARC},
-        {"hdmi_earc", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI_EARC},
-        {"spdif", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_LINE_DIGITAL},
-        {"fm_transmitter", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_FM},
-        {"aux_line", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_AUX_LINE},
-        {"speaker_safe", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_SPEAKER_SAFE},
-        {"ip", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_IP},
-        {"bus", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUS},
-        {"proxy", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_UNKNOWN /* AUDIO_DEVICE_INFO_TYPE_PROXY */},
-        {"hearing_aid_out", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HEARING_AID},
-        {"echo_canceller", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_ECHO_REFERENCE}, // sic
-        {"ble_headset", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_HEADSET},
-        {"ble_speaker", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_SPEAKER},
-        {"ble_broadcast", util::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_BROADCAST},
+        {"unknown", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_UNKNOWN},
+        {"earpiece", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_EARPIECE},
+        {"speaker", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_SPEAKER},
+        {"headset", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_WIRED_HEADSET},
+        {"headphone", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_WIRED_HEADPHONES}, // sic
+        {"bt_sco", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
+        {"bt_sco_hs", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
+        {"bt_sco_carkit", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_SCO},
+        {"bt_a2dp", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
+        {"bt_a2dp_hp", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
+        {"bt_a2dp_spk", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLUETOOTH_A2DP},
+        {"aux_digital", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI},
+        {"hdmi", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI},
+        {"analog_dock", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_DOCK},
+        {"digital_dock", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_DOCK},
+        {"usb_accessory", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_ACCESSORY},
+        {"usb_device", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_DEVICE},
+        {"usb_headset", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_USB_HEADSET},
+        {"remote_submix", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_REMOTE_SUBMIX},
+        {"telephony_tx", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_TELEPHONY},
+        {"line", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_LINE_ANALOG},
+        {"hdmi_arc", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI_ARC},
+        {"hdmi_earc", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HDMI_EARC},
+        {"spdif", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_LINE_DIGITAL},
+        {"fm_transmitter", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_FM},
+        {"aux_line", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_AUX_LINE},
+        {"speaker_safe", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUILTIN_SPEAKER_SAFE},
+        {"ip", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_IP},
+        {"bus", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BUS},
+        {"proxy", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_UNKNOWN /* AUDIO_DEVICE_INFO_TYPE_PROXY */},
+        {"hearing_aid_out", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_HEARING_AID},
+        {"echo_canceller", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_ECHO_REFERENCE}, // sic
+        {"ble_headset", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_HEADSET},
+        {"ble_speaker", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_SPEAKER},
+        {"ble_broadcast", stats::media_metrics::MEDIAMETRICS_SPATIALIZER_DEVICE_ENABLED_REPORTED__TYPE__AUDIO_DEVICE_INFO_TYPE_BLE_BROADCAST},
     };
     return map;
 }
@@ -324,23 +325,23 @@ const std::unordered_map<std::string, int32_t>& getStatusMap() {
     // DO NOT MODIFY VALUES(OK to add new ones).
     static std::unordered_map<std::string, int32_t> map {
         {"",
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__NO_ERROR},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__NO_ERROR},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_OK,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__NO_ERROR},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__NO_ERROR},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_ARGUMENT,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_ARGUMENT},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_ARGUMENT},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_IO,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_IO},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_IO},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_MEMORY,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_MEMORY},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_MEMORY},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_SECURITY,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_SECURITY},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_SECURITY},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_STATE,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_STATE},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_STATE},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_TIMEOUT,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_TIMEOUT},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_TIMEOUT},
         {AMEDIAMETRICS_PROP_STATUS_VALUE_UNKNOWN,
-            util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_UNKNOWN},
+            stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_UNKNOWN},
     };
     return map;
 }
@@ -349,7 +350,7 @@ const std::unordered_map<std::string, int32_t>& getStatusMap() {
 template <typename Traits>
 int32_t int32FromFlags(const std::string &flags)
 {
-    const auto result = stringutils::split(flags, "|");
+    const auto result = audio_utils::stringutils::split(flags, "|");
     int32_t intFlags = 0;
     for (const auto& flag : result) {
         typename Traits::Type value;
@@ -364,7 +365,7 @@ int32_t int32FromFlags(const std::string &flags)
 template <typename Traits>
 std::string stringFromFlags(const std::string &flags, size_t len)
 {
-    const auto result = stringutils::split(flags, "|");
+    const auto result = audio_utils::stringutils::split(flags, "|");
     std::string sFlags;
     for (const auto& flag : result) {
         typename Traits::Type value;
@@ -383,7 +384,7 @@ std::string validateStringFromMap(const std::string &str, const M& map)
 {
     if (str.empty()) return {};
 
-    const auto result = stringutils::split(str, "|");
+    const auto result = audio_utils::stringutils::split(str, "|");
     std::stringstream ss;
     for (const auto &s : result) {
         if (map.count(s) > 0) {
@@ -399,7 +400,7 @@ typename M::mapped_type flagsFromMap(const std::string &str, const M& map)
 {
     if (str.empty()) return {};
 
-    const auto result = stringutils::split(str, "|");
+    const auto result = audio_utils::stringutils::split(str, "|");
     typename M::mapped_type value{};
     for (const auto &s : result) {
         auto it = map.find(s);
@@ -416,7 +417,7 @@ std::vector<int32_t> vectorFromMap(
 
     if (str.empty()) return v;
 
-    const auto result = stringutils::split(str, "|");
+    const auto result = audio_utils::stringutils::split(str, "|");
     for (const auto &s : result) {
         auto it = map.find(s);
         if (it == map.end()) continue;
@@ -429,7 +430,7 @@ std::vector<int64_t> channelMaskVectorFromString(const std::string &s)
 {
     std::vector<int64_t> v;
 
-    const auto result = stringutils::split(s, "|");
+    const auto result = audio_utils::stringutils::split(s, "|");
     for (const auto &mask : result) {
         // 0 if undetected or if actually 0.
         int64_t int64Mask = strtoll(mask.c_str(), nullptr, 0);
@@ -664,7 +665,7 @@ int32_t lookup<STATUS>(const std::string &status)
     auto& map = getStatusMap();
     auto it = map.find(status);
     if (it == map.end()) {
-        return util::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_UNKNOWN;
+        return stats::media_metrics::MEDIAMETRICS_AUDIO_TRACK_STATUS_REPORTED__STATUS__ERROR_UNKNOWN;
     }
     return it->second;
 }

@@ -16,9 +16,15 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "Codec2InfoBuilder"
+
+#include <cstdlib>
+
 #include <log/log.h>
 
 #include <strings.h>
+
+#include <com_android_media_codec_flags.h>
+#include <android_media_codec.h>
 
 #include <C2Component.h>
 #include <C2Config.h>
@@ -505,6 +511,10 @@ status_t Codec2InfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
                 && !hasPrefix(v.first, "domain-")
                 && !hasPrefix(v.first, "variant-")) {
             writer->addGlobalSetting(v.first.c_str(), v.second.c_str());
+            if (v.first == "max-concurrent-instances") {
+                MediaCodecInfoWriter::SetMaxSupportedInstances(
+                        (int32_t)strtol(v.second.c_str(), NULL, 10));
+            }
         }
     }
 
@@ -684,6 +694,11 @@ status_t Codec2InfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
                 const MediaCodecsXmlParser::AttributeMap &attrMap = typeIt->second;
                 std::unique_ptr<MediaCodecInfo::CapabilitiesWriter> caps =
                     codecInfo->addMediaType(mediaType.c_str());
+
+                // we could detect tunneled playback via the playback interface, but we never did
+                // that for the advertised feature, so for now use only the advertised feature.
+                bool canDoTunneledPlayback = false;
+
                 for (const auto &v : attrMap) {
                     std::string key = v.first;
                     std::string value = v.second;
@@ -704,6 +719,11 @@ status_t Codec2InfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
                         // Ignore trailing bad characters and default to 0.
                         (void)sscanf(value.c_str(), "%d", &intValue);
                         caps->addDetail(key.c_str(), intValue);
+
+                        if (key.compare(
+                                MediaCodecInfo::Capabilities::FEATURE_TUNNELED_PLAYBACK) == 0) {
+                            canDoTunneledPlayback = true;
+                        }
                     } else {
                         caps->addDetail(key.c_str(), value.c_str());
                     }
@@ -727,6 +747,7 @@ status_t Codec2InfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
                     pixelFormatMap[HAL_PIXEL_FORMAT_YCBCR_P010]    = COLOR_FormatYUVP010;
                     pixelFormatMap[HAL_PIXEL_FORMAT_RGBA_1010102]  = COLOR_Format32bitABGR2101010;
                     pixelFormatMap[HAL_PIXEL_FORMAT_RGBA_FP16]     = COLOR_Format64bitABGRFloat;
+                    pixelFormatMap[AHARDWAREBUFFER_FORMAT_YCbCr_P210]    = COLOR_FormatYUVP210;
 
                     std::shared_ptr<C2StoreFlexiblePixelFormatDescriptorsInfo> pixelFormatInfo;
                     std::vector<std::unique_ptr<C2Param>> heapParams;
@@ -752,7 +773,38 @@ status_t Codec2InfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
                 }
                 addSupportedColorFormats(
                         intf, caps.get(), trait, mediaType, it->second);
+
+                if (com::android::media::codec::flags::provider_->large_audio_frame()
+                        && android::media::codec::provider_->large_audio_frame_finish()) {
+                    // Adding feature-multiple-frames when C2LargeFrame param is present
+                    if (trait.domain == C2Component::DOMAIN_AUDIO) {
+                        std::vector<std::shared_ptr<C2ParamDescriptor>> params;
+                        c2_status_t err = intf->querySupportedParams(&params);
+                        if (err == C2_OK) {
+                            for (const auto &paramDesc : params) {
+                                if (C2LargeFrame::output::PARAM_TYPE == paramDesc->index()) {
+                                    std::string featureMultipleFrames =
+                                            std::string(KEY_FEATURE_) + FEATURE_MultipleFrames;
+                                    caps->addDetail(featureMultipleFrames.c_str(), 0);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (android::media::codec::provider_->null_output_surface_support() &&
+                        android::media::codec::provider_->null_output_surface()) {
+                    // all non-tunneled video decoders support detached surface mode
+                    if (trait.kind == C2Component::KIND_DECODER &&
+                            trait.domain == C2Component::DOMAIN_VIDEO &&
+                            !canDoTunneledPlayback) {
+                        caps->addDetail(
+                                MediaCodecInfo::Capabilities::FEATURE_DETACHED_SURFACE, 0);
+                    }
+                }
             }
+            codecInfo->createCodecCaps();
         }
     }
     return OK;

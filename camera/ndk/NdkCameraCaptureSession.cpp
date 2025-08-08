@@ -29,6 +29,7 @@
 #include "impl/ACameraCaptureSession.h"
 
 #include "impl/ACameraCaptureSession.inc"
+
 #include "NdkCameraCaptureSession.inc"
 
 using namespace android;
@@ -176,6 +177,34 @@ camera_status_t ACameraCaptureSession_abortCaptures(ACameraCaptureSession* sessi
 }
 
 EXPORT
+camera_status_t ACameraCaptureSessionShared_startStreaming(
+    ACameraCaptureSession* /*session*/, ACameraCaptureSession_captureCallbacksV2* /*callbacks*/,
+    int /*numOutputWindows*/, ANativeWindow** /*window*/,
+    int* /*captureSequenceId*/) {
+    ATRACE_CALL();
+    // Todo: need to add implementation
+    return  ACAMERA_OK;
+}
+
+EXPORT
+camera_status_t ACameraCaptureSessionShared_logicalCamera_startStreaming(
+    ACameraCaptureSession* /*session*/,
+    ACameraCaptureSession_logicalCamera_captureCallbacksV2* /*callbacks*/,
+    int /*numOutputWindows*/, ANativeWindow** /*windows*/,
+    int* /*captureSequenceId*/) {
+    ATRACE_CALL();
+    // Todo: need to add implementation
+    return  ACAMERA_OK;
+}
+
+EXPORT
+camera_status_t ACameraCaptureSessionShared_stopStreaming(ACameraCaptureSession* /*session*/) {
+    ATRACE_CALL();
+    // Todo: need to add implementation
+    return  ACAMERA_OK;
+}
+
+EXPORT
 camera_status_t ACameraCaptureSession_updateSharedOutput(ACameraCaptureSession* session,
         ACaptureSessionOutput* output) {
     ATRACE_CALL();
@@ -189,4 +218,39 @@ camera_status_t ACameraCaptureSession_updateSharedOutput(ACameraCaptureSession* 
         return ACAMERA_ERROR_SESSION_CLOSED;
     }
     return session->updateOutputConfiguration(output);
+}
+
+EXPORT
+camera_status_t ACameraCaptureSession_setWindowPreparedCallback(
+        ACameraCaptureSession* session, void *context,
+        ACameraCaptureSession_prepareCallback cb) {
+    ATRACE_CALL();
+    if (session == nullptr || cb == nullptr) {
+        ALOGE("%s: Error: session %p / callback %p is null", __FUNCTION__, session, cb);
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (session->isClosed()) {
+        ALOGE("%s: session %p is already closed", __FUNCTION__, session);
+        return ACAMERA_ERROR_SESSION_CLOSED;
+    }
+    session->setWindowPreparedCallback(context, cb);
+    return ACAMERA_OK;
+}
+
+EXPORT
+camera_status_t ACameraCaptureSession_prepareWindow(
+        ACameraCaptureSession* session,
+        ANativeWindow *window) {
+    ATRACE_CALL();
+    if (session == nullptr || window == nullptr) {
+        ALOGE("%s: Error: session %p / window %p is null", __FUNCTION__, session, window);
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+
+    if (session->isClosed()) {
+        ALOGE("%s: session %p is already closed", __FUNCTION__, session);
+        return ACAMERA_ERROR_SESSION_CLOSED;
+    }
+    return session->prepare(window);
 }

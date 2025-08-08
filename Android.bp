@@ -34,6 +34,24 @@ license {
     ],
 }
 
+aidl_interface_defaults {
+    name: "audio-aidl-defaults",
+    unstable: true,
+    host_supported: true,
+    backend: {
+        cpp: {
+            enabled: true,
+        },
+        java: {
+            enabled: true,
+        },
+        rust: {
+            enabled: true,
+        },
+    },
+
+}
+
 aidl_interface {
     name: "av-types-aidl",
     unstable: true,
@@ -44,13 +62,16 @@ aidl_interface {
     srcs: [
         "aidl/android/media/InterpolatorConfig.aidl",
         "aidl/android/media/InterpolatorType.aidl",
-        "aidl/android/media/MicrophoneInfoData.aidl",
+        "aidl/android/media/MicrophoneInfoFw.aidl",
         "aidl/android/media/VolumeShaperConfiguration.aidl",
         "aidl/android/media/VolumeShaperConfigurationOptionFlag.aidl",
         "aidl/android/media/VolumeShaperConfigurationType.aidl",
         "aidl/android/media/VolumeShaperOperation.aidl",
         "aidl/android/media/VolumeShaperOperationFlag.aidl",
         "aidl/android/media/VolumeShaperState.aidl",
+    ],
+    defaults: [
+        "latest_android_media_audio_common_types_import_interface",
     ],
     backend: {
         cpp: {
@@ -62,7 +83,22 @@ aidl_interface {
                 "com.android.media.swcodec",
             ],
         },
+        java: {
+            sdk_version: "module_current",
+        },
     },
+}
+
+aidl_interface {
+    name: "audio-permission-aidl",
+    // TODO remove
+    vendor_available: true,
+    double_loadable: true,
+    defaults: ["audio-aidl-defaults"],
+    local_include_dir: "aidl",
+    srcs: [
+        "aidl/com/android/media/permission/*",
+    ],
 }
 
 cc_library_headers {
@@ -75,10 +111,10 @@ cc_library_headers {
         "av-types-aidl-cpp",
     ],
     header_libs: [
-        "libaudioclient_aidl_conversion_util",
+        "libaudio_aidl_conversion_common_util_cpp",
     ],
     export_header_lib_headers: [
-        "libaudioclient_aidl_conversion_util",
+        "libaudio_aidl_conversion_common_util_cpp",
     ],
     host_supported: true,
     vendor_available: true,
@@ -93,6 +129,30 @@ cc_library_headers {
     target: {
         darwin: {
             enabled: false,
+        },
+    },
+}
+
+aidl_interface {
+    name: "av-audio-types-aidl",
+    unstable: true,
+    host_supported: true,
+    vendor_available: true,
+    double_loadable: true,
+    local_include_dir: "aidl",
+    srcs: [
+        "aidl/android/media/audio/IHalAdapterVendorExtension.aidl",
+    ],
+    defaults: [
+        "latest_android_hardware_audio_core_import_interface",
+    ],
+    backend: {
+        // The C++ backend is disabled transitively due to use of FMQ by the audio core HAL.
+        cpp: {
+            enabled: false,
+        },
+        java: {
+            sdk_version: "module_current",
         },
     },
 }

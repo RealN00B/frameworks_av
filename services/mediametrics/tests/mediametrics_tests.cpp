@@ -17,10 +17,12 @@
 #define LOG_TAG "mediametrics_tests"
 #include <utils/Log.h>
 
-
 #include <stdio.h>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
+#include <audio_utils/StringUtils.h>
 #include <gtest/gtest.h>
 #include <media/MediaMetricsItem.h>
 #include <mediametricsservice/AudioTypes.h>
@@ -30,6 +32,7 @@
 #include <system/audio.h>
 
 using namespace android;
+using android::audio_utils::stringutils::parseVector;
 
 static size_t countNewlines(const char *s) {
     size_t count = 0;
@@ -819,14 +822,14 @@ TEST(mediametrics_tests, audio_analytics_permission) {
 
   // TODO: Verify contents of AudioAnalytics.
   // Currently there is no getter API in AudioAnalytics besides dump.
-  ASSERT_EQ(10, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_EQ(10, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item, true /* isTrusted */));
   // untrusted entities can add to an existing key
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item2, false /* isTrusted */));
 
   // Check that we have some info in the dump.
-  ASSERT_LT(9, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_LT(9, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 }
 
 TEST(mediametrics_tests, audio_analytics_permission2) {
@@ -857,14 +860,14 @@ TEST(mediametrics_tests, audio_analytics_permission2) {
 
   // TODO: Verify contents of AudioAnalytics.
   // Currently there is no getter API in AudioAnalytics besides dump.
-  ASSERT_EQ(10, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_EQ(10, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item, true /* isTrusted */));
   // untrusted entities can add to an existing key
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item2, false /* isTrusted */));
 
   // Check that we have some info in the dump.
-  ASSERT_LT(9, audioAnalytics.dump(1000).second /* lines */);
+  ASSERT_LT(9, audioAnalytics.dump(true /* details */, 1000).second /* lines */);
 }
 
 TEST(mediametrics_tests, audio_analytics_dump) {
@@ -891,47 +894,16 @@ TEST(mediametrics_tests, audio_analytics_dump) {
   ASSERT_EQ(NO_ERROR, audioAnalytics.submit(item3, true /* isTrusted */));
 
   // find out how many lines we have.
-  auto [string, lines] = audioAnalytics.dump(1000);
+  auto [string, lines] = audioAnalytics.dump(true /* details */, 1000);
   ASSERT_EQ(lines, (int32_t) countNewlines(string.c_str()));
 
   printf("AudioAnalytics: %s", string.c_str());
   // ensure that dump operates over those lines.
   for (int32_t ll = 0; ll < lines; ++ll) {
-      auto [s, l] = audioAnalytics.dump(ll);
+      auto [s, l] = audioAnalytics.dump(true /* details */, ll);
       ASSERT_EQ(ll, l);
       ASSERT_EQ(ll, (int32_t) countNewlines(s.c_str()));
   }
-}
-
-TEST(mediametrics_tests, device_parsing) {
-    auto devaddr = android::mediametrics::stringutils::getDeviceAddressPairs("(DEVICE, )");
-    ASSERT_EQ((size_t)1, devaddr.size());
-    ASSERT_EQ("DEVICE", devaddr[0].first);
-    ASSERT_EQ("", devaddr[0].second);
-
-    devaddr = android::mediametrics::stringutils::getDeviceAddressPairs(
-            "(DEVICE1, A)|(D, ADDRB)");
-    ASSERT_EQ((size_t)2, devaddr.size());
-    ASSERT_EQ("DEVICE1", devaddr[0].first);
-    ASSERT_EQ("A", devaddr[0].second);
-    ASSERT_EQ("D", devaddr[1].first);
-    ASSERT_EQ("ADDRB", devaddr[1].second);
-
-    devaddr = android::mediametrics::stringutils::getDeviceAddressPairs(
-            "(A,B)|(C,D)");
-    ASSERT_EQ((size_t)2, devaddr.size());
-    ASSERT_EQ("A", devaddr[0].first);
-    ASSERT_EQ("B", devaddr[0].second);
-    ASSERT_EQ("C", devaddr[1].first);
-    ASSERT_EQ("D", devaddr[1].second);
-
-    devaddr = android::mediametrics::stringutils::getDeviceAddressPairs(
-            "  ( A1 , B )  | ( C , D2 )  ");
-    ASSERT_EQ((size_t)2, devaddr.size());
-    ASSERT_EQ("A1", devaddr[0].first);
-    ASSERT_EQ("B", devaddr[0].second);
-    ASSERT_EQ("C", devaddr[1].first);
-    ASSERT_EQ("D2", devaddr[1].second);
 }
 
 TEST(mediametrics_tests, timed_action) {

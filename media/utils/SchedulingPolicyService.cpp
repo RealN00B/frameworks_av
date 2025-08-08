@@ -17,7 +17,10 @@
 #define LOG_TAG "SchedulingPolicyService"
 //#define LOG_NDEBUG 0
 
+#include <audio_utils/threads.h>
 #include <binder/IServiceManager.h>
+#include <cutils/android_filesystem_config.h>
+#include <cutils/properties.h>
 #include <utils/Mutex.h>
 #include "ISchedulingPolicyService.h"
 #include "mediautils/SchedulingPolicyService.h"
@@ -30,6 +33,15 @@ static Mutex sMutex;
 
 int requestPriority(pid_t pid, pid_t tid, int32_t prio, bool isForApp, bool asynchronous)
 {
+    // audioserver thread priority boosted internally to reduce binder latency and boot time.
+    if (!isForApp && pid == getpid() && getuid() == AID_AUDIOSERVER && prio >= 1 && prio <= 3) {
+        const status_t status = audio_utils::set_thread_priority(
+                tid, audio_utils::rtprio_to_unified_priority(prio));
+        if (status == NO_ERROR) return NO_ERROR;
+        ALOGD("%s: set priority %d, status:%d needs to fallback to SchedulingPolicyService",
+                __func__, prio, status);
+    }
+
     // FIXME merge duplicated code related to service lookup, caching, and error recovery
     int ret;
     for (;;) {
@@ -84,6 +96,27 @@ int requestCpusetBoost(bool enable, const sp<IBinder> &client)
     sSchedulingPolicyService.clear();
     sMutex.unlock();
     return ret;
+}
+
+int requestSpatializerPriority(pid_t pid, pid_t tid) {
+    if (pid == -1 || tid == -1) return BAD_VALUE;
+
+    // update priority to RT if specified.
+    constexpr int32_t kRTPriorityMin = 1;
+    constexpr int32_t kRTPriorityMax = 3;
+    const int32_t priorityBoost =
+            property_get_int32("audio.spatializer.priority", kRTPriorityMin);
+    if (priorityBoost >= kRTPriorityMin && priorityBoost <= kRTPriorityMax) {
+        const status_t status = requestPriority(
+                pid, tid, priorityBoost, false /* isForApp */, true /*asynchronous*/);
+        if (status != OK) {
+            ALOGW("%s: Cannot request spatializer priority boost %d, status:%d",
+                    __func__, priorityBoost, status);
+            return status < 0 ? status : UNKNOWN_ERROR;
+        }
+        return priorityBoost;
+    }
+    return 0;  // no boost requested
 }
 
 }   // namespace android

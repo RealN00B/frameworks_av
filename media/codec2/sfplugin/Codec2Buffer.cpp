@@ -20,14 +20,14 @@
 #include <utils/Log.h>
 #include <utils/Trace.h>
 
+#include <android_media_codec.h>
+
 #include <aidl/android/hardware/graphics/common/Cta861_3.h>
 #include <aidl/android/hardware/graphics/common/Smpte2086.h>
+#include <android-base/no_destructor.h>
 #include <android-base/properties.h>
 #include <android/hardware/cas/native/1.0/types.h>
 #include <android/hardware/drm/1.0/types.h>
-#include <android/hardware/graphics/common/1.2/types.h>
-#include <android/hardware/graphics/mapper/4.0/IMapper.h>
-#include <gralloctypes/Gralloc4.h>
 #include <hidlmemory/FrameworkUtils.h>
 #include <media/hardware/HardwareAPI.h>
 #include <media/stagefright/CodecBase.h>
@@ -35,8 +35,10 @@
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/AUtils.h>
+#include <media/stagefright/foundation/ColorUtils.h>
 #include <mediadrm/ICrypto.h>
 #include <nativebase/nativebase.h>
+#include <ui/GraphicBufferMapper.h>
 #include <ui/Fence.h>
 
 #include <C2AllocatorGralloc.h>
@@ -44,6 +46,7 @@
 #include <C2Debug.h>
 
 #include "Codec2Buffer.h"
+#include "Codec2BufferUtils.h"
 
 namespace android {
 
@@ -180,10 +183,17 @@ sp<ConstLinearBlockBuffer> ConstLinearBlockBuffer::Allocate(
     if (!buffer
             || buffer->data().type() != C2BufferData::LINEAR
             || buffer->data().linearBlocks().size() != 1u) {
+        if (!buffer) {
+            ALOGD("ConstLinearBlockBuffer::Allocate: null buffer");
+        } else {
+            ALOGW("ConstLinearBlockBuffer::Allocate: type=%d # linear blocks=%zu",
+                  buffer->data().type(), buffer->data().linearBlocks().size());
+        }
         return nullptr;
     }
     C2ReadView readView(buffer->data().linearBlocks()[0].map().get());
     if (readView.error() != C2_OK) {
+        ALOGW("ConstLinearBlockBuffer::Allocate: readView.error()=%d", readView.error());
         return nullptr;
     }
     return new ConstLinearBlockBuffer(format, std::move(readView), buffer);
@@ -208,445 +218,6 @@ std::shared_ptr<C2Buffer> ConstLinearBlockBuffer::asC2Buffer() {
 void ConstLinearBlockBuffer::clearC2BufferRefs() {
     mBufferRef.reset();
 }
-
-// GraphicView2MediaImageConverter
-
-namespace {
-
-class GraphicView2MediaImageConverter {
-public:
-    /**
-     * Creates a C2GraphicView <=> MediaImage converter
-     *
-     * \param view C2GraphicView object
-     * \param format buffer format
-     * \param copy whether the converter is used for copy or not
-     */
-    GraphicView2MediaImageConverter(
-            const C2GraphicView &view, const sp<AMessage> &format, bool copy)
-        : mInitCheck(NO_INIT),
-          mView(view),
-          mWidth(view.width()),
-          mHeight(view.height()),
-          mAllocatedDepth(0),
-          mBackBufferSize(0),
-          mMediaImage(new ABuffer(sizeof(MediaImage2))) {
-        ATRACE_CALL();
-        if (!format->findInt32(KEY_COLOR_FORMAT, &mClientColorFormat)) {
-            mClientColorFormat = COLOR_FormatYUV420Flexible;
-        }
-        if (!format->findInt32("android._color-format", &mComponentColorFormat)) {
-            mComponentColorFormat = COLOR_FormatYUV420Flexible;
-        }
-        if (view.error() != C2_OK) {
-            ALOGD("Converter: view.error() = %d", view.error());
-            mInitCheck = BAD_VALUE;
-            return;
-        }
-        MediaImage2 *mediaImage = (MediaImage2 *)mMediaImage->base();
-        const C2PlanarLayout &layout = view.layout();
-        if (layout.numPlanes == 0) {
-            ALOGD("Converter: 0 planes");
-            mInitCheck = BAD_VALUE;
-            return;
-        }
-        memset(mediaImage, 0, sizeof(*mediaImage));
-        mAllocatedDepth = layout.planes[0].allocatedDepth;
-        uint32_t bitDepth = layout.planes[0].bitDepth;
-
-        // align width and height to support subsampling cleanly
-        uint32_t stride = align(view.crop().width, 2) * divUp(layout.planes[0].allocatedDepth, 8u);
-        uint32_t vStride = align(view.crop().height, 2);
-
-        bool tryWrapping = !copy;
-
-        switch (layout.type) {
-            case C2PlanarLayout::TYPE_YUV: {
-                mediaImage->mType = MediaImage2::MEDIA_IMAGE_TYPE_YUV;
-                if (layout.numPlanes != 3) {
-                    ALOGD("Converter: %d planes for YUV layout", layout.numPlanes);
-                    mInitCheck = BAD_VALUE;
-                    return;
-                }
-                std::optional<int> clientBitDepth = {};
-                switch (mClientColorFormat) {
-                    case COLOR_FormatYUVP010:
-                        clientBitDepth = 10;
-                        break;
-                    case COLOR_FormatYUV411PackedPlanar:
-                    case COLOR_FormatYUV411Planar:
-                    case COLOR_FormatYUV420Flexible:
-                    case COLOR_FormatYUV420PackedPlanar:
-                    case COLOR_FormatYUV420PackedSemiPlanar:
-                    case COLOR_FormatYUV420Planar:
-                    case COLOR_FormatYUV420SemiPlanar:
-                    case COLOR_FormatYUV422Flexible:
-                    case COLOR_FormatYUV422PackedPlanar:
-                    case COLOR_FormatYUV422PackedSemiPlanar:
-                    case COLOR_FormatYUV422Planar:
-                    case COLOR_FormatYUV422SemiPlanar:
-                    case COLOR_FormatYUV444Flexible:
-                    case COLOR_FormatYUV444Interleaved:
-                        clientBitDepth = 8;
-                        break;
-                    default:
-                        // no-op; used with optional
-                        break;
-
-                }
-                // conversion fails if client bit-depth and the component bit-depth differs
-                if ((clientBitDepth) && (bitDepth != clientBitDepth.value())) {
-                    ALOGD("Bit depth of client: %d and component: %d differs",
-                        *clientBitDepth, bitDepth);
-                    mInitCheck = BAD_VALUE;
-                    return;
-                }
-                C2PlaneInfo yPlane = layout.planes[C2PlanarLayout::PLANE_Y];
-                C2PlaneInfo uPlane = layout.planes[C2PlanarLayout::PLANE_U];
-                C2PlaneInfo vPlane = layout.planes[C2PlanarLayout::PLANE_V];
-                if (yPlane.channel != C2PlaneInfo::CHANNEL_Y
-                        || uPlane.channel != C2PlaneInfo::CHANNEL_CB
-                        || vPlane.channel != C2PlaneInfo::CHANNEL_CR) {
-                    ALOGD("Converter: not YUV layout");
-                    mInitCheck = BAD_VALUE;
-                    return;
-                }
-                bool yuv420888 = yPlane.rowSampling == 1 && yPlane.colSampling == 1
-                        && uPlane.rowSampling == 2 && uPlane.colSampling == 2
-                        && vPlane.rowSampling == 2 && vPlane.colSampling == 2;
-                if (yuv420888) {
-                    for (uint32_t i = 0; i < 3; ++i) {
-                        const C2PlaneInfo &plane = layout.planes[i];
-                        if (plane.allocatedDepth != 8 || plane.bitDepth != 8) {
-                            yuv420888 = false;
-                            break;
-                        }
-                    }
-                    yuv420888 = yuv420888 && yPlane.colInc == 1 && uPlane.rowInc == vPlane.rowInc;
-                }
-                int32_t copyFormat = mClientColorFormat;
-                if (yuv420888 && mClientColorFormat == COLOR_FormatYUV420Flexible) {
-                    if (uPlane.colInc == 2 && vPlane.colInc == 2
-                            && yPlane.rowInc == uPlane.rowInc) {
-                        copyFormat = COLOR_FormatYUV420PackedSemiPlanar;
-                    } else if (uPlane.colInc == 1 && vPlane.colInc == 1
-                            && yPlane.rowInc == uPlane.rowInc * 2) {
-                        copyFormat = COLOR_FormatYUV420PackedPlanar;
-                    }
-                }
-                ALOGV("client_fmt=0x%x y:{colInc=%d rowInc=%d} u:{colInc=%d rowInc=%d} "
-                        "v:{colInc=%d rowInc=%d}",
-                        mClientColorFormat,
-                        yPlane.colInc, yPlane.rowInc,
-                        uPlane.colInc, uPlane.rowInc,
-                        vPlane.colInc, vPlane.rowInc);
-                switch (copyFormat) {
-                    case COLOR_FormatYUV420Flexible:
-                    case COLOR_FormatYUV420Planar:
-                    case COLOR_FormatYUV420PackedPlanar:
-                        mediaImage->mPlane[mediaImage->Y].mOffset = 0;
-                        mediaImage->mPlane[mediaImage->Y].mColInc = 1;
-                        mediaImage->mPlane[mediaImage->Y].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->Y].mHorizSubsampling = 1;
-                        mediaImage->mPlane[mediaImage->Y].mVertSubsampling = 1;
-
-                        mediaImage->mPlane[mediaImage->U].mOffset = stride * vStride;
-                        mediaImage->mPlane[mediaImage->U].mColInc = 1;
-                        mediaImage->mPlane[mediaImage->U].mRowInc = stride / 2;
-                        mediaImage->mPlane[mediaImage->U].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->U].mVertSubsampling = 2;
-
-                        mediaImage->mPlane[mediaImage->V].mOffset = stride * vStride * 5 / 4;
-                        mediaImage->mPlane[mediaImage->V].mColInc = 1;
-                        mediaImage->mPlane[mediaImage->V].mRowInc = stride / 2;
-                        mediaImage->mPlane[mediaImage->V].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->V].mVertSubsampling = 2;
-
-                        if (tryWrapping && mClientColorFormat != COLOR_FormatYUV420Flexible) {
-                            tryWrapping = yuv420888 && uPlane.colInc == 1 && vPlane.colInc == 1
-                                    && yPlane.rowInc == uPlane.rowInc * 2
-                                    && view.data()[0] < view.data()[1]
-                                    && view.data()[1] < view.data()[2];
-                        }
-                        break;
-
-                    case COLOR_FormatYUV420SemiPlanar:
-                    case COLOR_FormatYUV420PackedSemiPlanar:
-                        mediaImage->mPlane[mediaImage->Y].mOffset = 0;
-                        mediaImage->mPlane[mediaImage->Y].mColInc = 1;
-                        mediaImage->mPlane[mediaImage->Y].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->Y].mHorizSubsampling = 1;
-                        mediaImage->mPlane[mediaImage->Y].mVertSubsampling = 1;
-
-                        mediaImage->mPlane[mediaImage->U].mOffset = stride * vStride;
-                        mediaImage->mPlane[mediaImage->U].mColInc = 2;
-                        mediaImage->mPlane[mediaImage->U].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->U].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->U].mVertSubsampling = 2;
-
-                        mediaImage->mPlane[mediaImage->V].mOffset = stride * vStride + 1;
-                        mediaImage->mPlane[mediaImage->V].mColInc = 2;
-                        mediaImage->mPlane[mediaImage->V].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->V].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->V].mVertSubsampling = 2;
-
-                        if (tryWrapping && mClientColorFormat != COLOR_FormatYUV420Flexible) {
-                            tryWrapping = yuv420888 && uPlane.colInc == 2 && vPlane.colInc == 2
-                                    && yPlane.rowInc == uPlane.rowInc
-                                    && view.data()[0] < view.data()[1]
-                                    && view.data()[1] < view.data()[2];
-                        }
-                        break;
-
-                    case COLOR_FormatYUVP010:
-                        // stride is in bytes
-                        mediaImage->mPlane[mediaImage->Y].mOffset = 0;
-                        mediaImage->mPlane[mediaImage->Y].mColInc = 2;
-                        mediaImage->mPlane[mediaImage->Y].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->Y].mHorizSubsampling = 1;
-                        mediaImage->mPlane[mediaImage->Y].mVertSubsampling = 1;
-
-                        mediaImage->mPlane[mediaImage->U].mOffset = stride * vStride;
-                        mediaImage->mPlane[mediaImage->U].mColInc = 4;
-                        mediaImage->mPlane[mediaImage->U].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->U].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->U].mVertSubsampling = 2;
-
-                        mediaImage->mPlane[mediaImage->V].mOffset = stride * vStride + 2;
-                        mediaImage->mPlane[mediaImage->V].mColInc = 4;
-                        mediaImage->mPlane[mediaImage->V].mRowInc = stride;
-                        mediaImage->mPlane[mediaImage->V].mHorizSubsampling = 2;
-                        mediaImage->mPlane[mediaImage->V].mVertSubsampling = 2;
-                        if (tryWrapping) {
-                            tryWrapping = yPlane.allocatedDepth == 16
-                                    && uPlane.allocatedDepth == 16
-                                    && vPlane.allocatedDepth == 16
-                                    && yPlane.bitDepth == 10
-                                    && uPlane.bitDepth == 10
-                                    && vPlane.bitDepth == 10
-                                    && yPlane.rightShift == 6
-                                    && uPlane.rightShift == 6
-                                    && vPlane.rightShift == 6
-                                    && yPlane.rowSampling == 1 && yPlane.colSampling == 1
-                                    && uPlane.rowSampling == 2 && uPlane.colSampling == 2
-                                    && vPlane.rowSampling == 2 && vPlane.colSampling == 2
-                                    && yPlane.colInc == 2
-                                    && uPlane.colInc == 4
-                                    && vPlane.colInc == 4
-                                    && yPlane.rowInc == uPlane.rowInc
-                                    && yPlane.rowInc == vPlane.rowInc;
-                        }
-                        break;
-
-                    default: {
-                        // default to fully planar format --- this will be overridden if wrapping
-                        // TODO: keep interleaved format
-                        int32_t colInc = divUp(mAllocatedDepth, 8u);
-                        int32_t rowInc = stride * colInc / yPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->Y].mOffset = 0;
-                        mediaImage->mPlane[mediaImage->Y].mColInc = colInc;
-                        mediaImage->mPlane[mediaImage->Y].mRowInc = rowInc;
-                        mediaImage->mPlane[mediaImage->Y].mHorizSubsampling = yPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->Y].mVertSubsampling = yPlane.rowSampling;
-                        int32_t offset = rowInc * vStride / yPlane.rowSampling;
-
-                        rowInc = stride * colInc / uPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->U].mOffset = offset;
-                        mediaImage->mPlane[mediaImage->U].mColInc = colInc;
-                        mediaImage->mPlane[mediaImage->U].mRowInc = rowInc;
-                        mediaImage->mPlane[mediaImage->U].mHorizSubsampling = uPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->U].mVertSubsampling = uPlane.rowSampling;
-                        offset += rowInc * vStride / uPlane.rowSampling;
-
-                        rowInc = stride * colInc / vPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->V].mOffset = offset;
-                        mediaImage->mPlane[mediaImage->V].mColInc = colInc;
-                        mediaImage->mPlane[mediaImage->V].mRowInc = rowInc;
-                        mediaImage->mPlane[mediaImage->V].mHorizSubsampling = vPlane.colSampling;
-                        mediaImage->mPlane[mediaImage->V].mVertSubsampling = vPlane.rowSampling;
-                        break;
-                    }
-                }
-                break;
-            }
-
-            case C2PlanarLayout::TYPE_YUVA:
-                ALOGD("Converter: unrecognized color format "
-                        "(client %d component %d) for YUVA layout",
-                        mClientColorFormat, mComponentColorFormat);
-                mInitCheck = NO_INIT;
-                return;
-            case C2PlanarLayout::TYPE_RGB:
-                ALOGD("Converter: unrecognized color format "
-                        "(client %d component %d) for RGB layout",
-                        mClientColorFormat, mComponentColorFormat);
-                mInitCheck = NO_INIT;
-                // TODO: support MediaImage layout
-                return;
-            case C2PlanarLayout::TYPE_RGBA:
-                ALOGD("Converter: unrecognized color format "
-                        "(client %d component %d) for RGBA layout",
-                        mClientColorFormat, mComponentColorFormat);
-                mInitCheck = NO_INIT;
-                // TODO: support MediaImage layout
-                return;
-            default:
-                mediaImage->mType = MediaImage2::MEDIA_IMAGE_TYPE_UNKNOWN;
-                if (layout.numPlanes == 1) {
-                    const C2PlaneInfo &plane = layout.planes[0];
-                    if (plane.colInc < 0 || plane.rowInc < 0) {
-                        // Copy-only if we have negative colInc/rowInc
-                        tryWrapping = false;
-                    }
-                    mediaImage->mPlane[0].mOffset = 0;
-                    mediaImage->mPlane[0].mColInc = std::abs(plane.colInc);
-                    mediaImage->mPlane[0].mRowInc = std::abs(plane.rowInc);
-                    mediaImage->mPlane[0].mHorizSubsampling = plane.colSampling;
-                    mediaImage->mPlane[0].mVertSubsampling = plane.rowSampling;
-                } else {
-                    ALOGD("Converter: unrecognized layout: color format (client %d component %d)",
-                            mClientColorFormat, mComponentColorFormat);
-                    mInitCheck = NO_INIT;
-                    return;
-                }
-                break;
-        }
-        if (tryWrapping) {
-            // try to map directly. check if the planes are near one another
-            const uint8_t *minPtr = mView.data()[0];
-            const uint8_t *maxPtr = mView.data()[0];
-            int32_t planeSize = 0;
-            for (uint32_t i = 0; i < layout.numPlanes; ++i) {
-                const C2PlaneInfo &plane = layout.planes[i];
-                int64_t planeStride = std::abs(plane.rowInc / plane.colInc);
-                ssize_t minOffset = plane.minOffset(
-                        mWidth / plane.colSampling, mHeight / plane.rowSampling);
-                ssize_t maxOffset = plane.maxOffset(
-                        mWidth / plane.colSampling, mHeight / plane.rowSampling);
-                if (minPtr > mView.data()[i] + minOffset) {
-                    minPtr = mView.data()[i] + minOffset;
-                }
-                if (maxPtr < mView.data()[i] + maxOffset) {
-                    maxPtr = mView.data()[i] + maxOffset;
-                }
-                planeSize += planeStride * divUp(mAllocatedDepth, 8u)
-                        * align(mHeight, 64) / plane.rowSampling;
-            }
-
-            if (minPtr == mView.data()[0] && (maxPtr - minPtr) <= planeSize) {
-                // FIXME: this is risky as reading/writing data out of bound results
-                //        in an undefined behavior, but gralloc does assume a
-                //        contiguous mapping
-                for (uint32_t i = 0; i < layout.numPlanes; ++i) {
-                    const C2PlaneInfo &plane = layout.planes[i];
-                    mediaImage->mPlane[i].mOffset = mView.data()[i] - minPtr;
-                    mediaImage->mPlane[i].mColInc = plane.colInc;
-                    mediaImage->mPlane[i].mRowInc = plane.rowInc;
-                    mediaImage->mPlane[i].mHorizSubsampling = plane.colSampling;
-                    mediaImage->mPlane[i].mVertSubsampling = plane.rowSampling;
-                }
-                mWrapped = new ABuffer(const_cast<uint8_t *>(minPtr), maxPtr - minPtr);
-                ALOGV("Converter: wrapped (capacity=%zu)", mWrapped->capacity());
-            }
-        }
-        mediaImage->mNumPlanes = layout.numPlanes;
-        mediaImage->mWidth = view.crop().width;
-        mediaImage->mHeight = view.crop().height;
-        mediaImage->mBitDepth = bitDepth;
-        mediaImage->mBitDepthAllocated = mAllocatedDepth;
-
-        uint32_t bufferSize = 0;
-        for (uint32_t i = 0; i < layout.numPlanes; ++i) {
-            const C2PlaneInfo &plane = layout.planes[i];
-            if (plane.allocatedDepth < plane.bitDepth
-                    || plane.rightShift != plane.allocatedDepth - plane.bitDepth) {
-                ALOGD("rightShift value of %u unsupported", plane.rightShift);
-                mInitCheck = BAD_VALUE;
-                return;
-            }
-            if (plane.allocatedDepth > 8 && plane.endianness != C2PlaneInfo::NATIVE) {
-                ALOGD("endianness value of %u unsupported", plane.endianness);
-                mInitCheck = BAD_VALUE;
-                return;
-            }
-            if (plane.allocatedDepth != mAllocatedDepth || plane.bitDepth != bitDepth) {
-                ALOGD("different allocatedDepth/bitDepth per plane unsupported");
-                mInitCheck = BAD_VALUE;
-                return;
-            }
-            // stride is in bytes
-            bufferSize += stride * vStride / plane.rowSampling / plane.colSampling;
-        }
-
-        mBackBufferSize = bufferSize;
-        mInitCheck = OK;
-    }
-
-    status_t initCheck() const { return mInitCheck; }
-
-    uint32_t backBufferSize() const { return mBackBufferSize; }
-
-    /**
-     * Wrap C2GraphicView using a MediaImage2. Note that if not wrapped, the content is not mapped
-     * in this function --- the caller should use CopyGraphicView2MediaImage() function to copy the
-     * data into a backing buffer explicitly.
-     *
-     * \return media buffer. This is null if wrapping failed.
-     */
-    sp<ABuffer> wrap() const {
-        if (mBackBuffer == nullptr) {
-            return mWrapped;
-        }
-        return nullptr;
-    }
-
-    bool setBackBuffer(const sp<ABuffer> &backBuffer) {
-        if (backBuffer == nullptr) {
-            return false;
-        }
-        if (backBuffer->capacity() < mBackBufferSize) {
-            return false;
-        }
-        backBuffer->setRange(0, mBackBufferSize);
-        mBackBuffer = backBuffer;
-        return true;
-    }
-
-    /**
-     * Copy C2GraphicView to MediaImage2.
-     */
-    status_t copyToMediaImage() {
-        ATRACE_CALL();
-        if (mInitCheck != OK) {
-            return mInitCheck;
-        }
-        return ImageCopy(mBackBuffer->base(), getMediaImage(), mView);
-    }
-
-    const sp<ABuffer> &imageData() const { return mMediaImage; }
-
-private:
-    status_t mInitCheck;
-
-    const C2GraphicView mView;
-    uint32_t mWidth;
-    uint32_t mHeight;
-    int32_t mClientColorFormat;  ///< SDK color format for MediaImage
-    int32_t mComponentColorFormat;  ///< SDK color format from component
-    sp<ABuffer> mWrapped;  ///< wrapped buffer (if we can map C2Buffer to an ABuffer)
-    uint32_t mAllocatedDepth;
-    uint32_t mBackBufferSize;
-    sp<ABuffer> mMediaImage;
-    std::function<sp<ABuffer>(size_t)> mAlloc;
-
-    sp<ABuffer> mBackBuffer;    ///< backing buffer if we have to copy C2Buffer <=> ABuffer
-
-    MediaImage2 *getMediaImage() {
-        return (MediaImage2 *)mMediaImage->base();
-    }
-};
-
-}  // namespace
 
 // GraphicBlockBuffer
 
@@ -1000,49 +571,63 @@ native_handle_t *EncryptedLinearBlockBuffer::handle() const {
     return const_cast<native_handle_t *>(mBlock->handle());
 }
 
+void EncryptedLinearBlockBuffer::getMappedBlock(
+        std::unique_ptr<MappedBlock> * const mappedBlock) const {
+    if (mappedBlock) {
+        mappedBlock->reset(new EncryptedLinearBlockBuffer::MappedBlock(mBlock));
+    }
+    return;
+}
+
+EncryptedLinearBlockBuffer::MappedBlock::MappedBlock(
+        const std::shared_ptr<C2LinearBlock> &block) : mView(block->map().get()) {
+}
+
+bool EncryptedLinearBlockBuffer::MappedBlock::copyDecryptedContent(
+        const sp<IMemory> &decrypted, size_t length) {
+    if (mView.error() != C2_OK) {
+        return false;
+    }
+    if (mView.size() < length) {
+        ALOGE("View size(%d) less than decrypted length(%zu)",
+                mView.size(), length);
+        return false;
+    }
+    memcpy(mView.data(), decrypted->unsecurePointer(), length);
+    mView.setOffset(mView.offset() + length);
+    return true;
+}
+
+EncryptedLinearBlockBuffer::MappedBlock::~MappedBlock() {
+    mView.setOffset(0);
+}
+
 using ::aidl::android::hardware::graphics::common::Cta861_3;
-using ::aidl::android::hardware::graphics::common::Dataspace;
 using ::aidl::android::hardware::graphics::common::Smpte2086;
-
-using ::android::gralloc4::MetadataType_Cta861_3;
-using ::android::gralloc4::MetadataType_Dataspace;
-using ::android::gralloc4::MetadataType_Smpte2086;
-using ::android::gralloc4::MetadataType_Smpte2094_40;
-
-using ::android::hardware::Return;
-using ::android::hardware::hidl_vec;
-
-using Error4 = ::android::hardware::graphics::mapper::V4_0::Error;
-using IMapper4 = ::android::hardware::graphics::mapper::V4_0::IMapper;
 
 namespace {
 
-sp<IMapper4> GetMapper4() {
-    static sp<IMapper4> sMapper = IMapper4::getService();
-    return sMapper;
-}
-
-class Gralloc4Buffer {
+class GrallocBuffer {
 public:
-    Gralloc4Buffer(const C2Handle *const handle) : mBuffer(nullptr) {
-        sp<IMapper4> mapper = GetMapper4();
-        if (!mapper) {
-            return;
-        }
+    GrallocBuffer(const C2Handle *const handle) : mBuffer(nullptr) {
+        GraphicBufferMapper& mapper = GraphicBufferMapper::get();
+
         // Unwrap raw buffer handle from the C2Handle
         native_handle_t *nh = UnwrapNativeCodec2GrallocHandle(handle);
         if (!nh) {
+            ALOGE("handle is not compatible to any gralloc C2Handle types");
             return;
         }
         // Import the raw handle so IMapper can use the buffer. The imported
         // handle must be freed when the client is done with the buffer.
-        mapper->importBuffer(
-                hardware::hidl_handle(nh),
-                [&](const Error4 &error, void *buffer) {
-                    if (error == Error4::NONE) {
-                        mBuffer = buffer;
-                    }
-                });
+        status_t status = mapper.importBufferNoValidate(
+                nh,
+                &mBuffer);
+
+        if (status != OK) {
+            ALOGE("Failed to import buffer. Status: %d.", status);
+            return;
+        }
 
         // TRICKY: UnwrapNativeCodec2GrallocHandle creates a new handle but
         //         does not clone the fds. Thus we need to delete the handle
@@ -1050,19 +635,19 @@ public:
         native_handle_delete(nh);
     }
 
-    ~Gralloc4Buffer() {
-        sp<IMapper4> mapper = GetMapper4();
-        if (mapper && mBuffer) {
+    ~GrallocBuffer() {
+        GraphicBufferMapper& mapper = GraphicBufferMapper::get();
+        if (mBuffer) {
             // Free the imported buffer handle. This does not release the
             // underlying buffer itself.
-            mapper->freeBuffer(mBuffer);
+            mapper.freeBuffer(mBuffer);
         }
     }
 
-    void *get() const { return mBuffer; }
+    buffer_handle_t get() const { return mBuffer; }
     operator bool() const { return (mBuffer != nullptr); }
 private:
-    void *mBuffer;
+    buffer_handle_t mBuffer;
 };
 
 }  // namspace
@@ -1072,89 +657,69 @@ c2_status_t GetHdrMetadataFromGralloc4Handle(
         std::shared_ptr<C2StreamHdrStaticMetadataInfo::input> *staticInfo,
         std::shared_ptr<C2StreamHdrDynamicMetadataInfo::input> *dynamicInfo) {
     c2_status_t err = C2_OK;
-    sp<IMapper4> mapper = GetMapper4();
-    Gralloc4Buffer buffer(handle);
-    if (!mapper || !buffer) {
+    GraphicBufferMapper& mapper = GraphicBufferMapper::get();
+    GrallocBuffer buffer(handle);
+    if (!buffer) {
         // Gralloc4 not supported; nothing to do
         return err;
     }
-    Error4 mapperErr = Error4::NONE;
     if (staticInfo) {
-        ALOGV("Grabbing static HDR info from gralloc4 metadata");
+        ALOGV("Grabbing static HDR info from gralloc metadata");
         staticInfo->reset(new C2StreamHdrStaticMetadataInfo::input(0u));
         memset(&(*staticInfo)->mastering, 0, sizeof((*staticInfo)->mastering));
         (*staticInfo)->maxCll = 0;
         (*staticInfo)->maxFall = 0;
-        IMapper4::get_cb cb = [&mapperErr, staticInfo](Error4 err, const hidl_vec<uint8_t> &vec) {
-            mapperErr = err;
-            if (err != Error4::NONE) {
-                return;
-            }
 
-            std::optional<Smpte2086> smpte2086;
-            gralloc4::decodeSmpte2086(vec, &smpte2086);
+        std::optional<Smpte2086> smpte2086;
+        status_t status = mapper.getSmpte2086(buffer.get(), &smpte2086);
+        if (status != OK || !smpte2086) {
+            err = C2_CORRUPTED;
+        } else {
             if (smpte2086) {
-                (*staticInfo)->mastering.red.x    = smpte2086->primaryRed.x;
-                (*staticInfo)->mastering.red.y    = smpte2086->primaryRed.y;
-                (*staticInfo)->mastering.green.x  = smpte2086->primaryGreen.x;
-                (*staticInfo)->mastering.green.y  = smpte2086->primaryGreen.y;
-                (*staticInfo)->mastering.blue.x   = smpte2086->primaryBlue.x;
-                (*staticInfo)->mastering.blue.y   = smpte2086->primaryBlue.y;
-                (*staticInfo)->mastering.white.x  = smpte2086->whitePoint.x;
-                (*staticInfo)->mastering.white.y  = smpte2086->whitePoint.y;
+                  (*staticInfo)->mastering.red.x    = smpte2086->primaryRed.x;
+                  (*staticInfo)->mastering.red.y    = smpte2086->primaryRed.y;
+                  (*staticInfo)->mastering.green.x  = smpte2086->primaryGreen.x;
+                  (*staticInfo)->mastering.green.y  = smpte2086->primaryGreen.y;
+                  (*staticInfo)->mastering.blue.x   = smpte2086->primaryBlue.x;
+                  (*staticInfo)->mastering.blue.y   = smpte2086->primaryBlue.y;
+                  (*staticInfo)->mastering.white.x  = smpte2086->whitePoint.x;
+                  (*staticInfo)->mastering.white.y  = smpte2086->whitePoint.y;
 
-                (*staticInfo)->mastering.maxLuminance = smpte2086->maxLuminance;
-                (*staticInfo)->mastering.minLuminance = smpte2086->minLuminance;
-            } else {
-                mapperErr = Error4::BAD_VALUE;
+                  (*staticInfo)->mastering.maxLuminance = smpte2086->maxLuminance;
+                  (*staticInfo)->mastering.minLuminance = smpte2086->minLuminance;
             }
-        };
-        Return<void> ret = mapper->get(buffer.get(), MetadataType_Smpte2086, cb);
-        if (!ret.isOk()) {
-            err = C2_REFUSED;
-        } else if (mapperErr != Error4::NONE) {
-            err = C2_CORRUPTED;
         }
-        cb = [&mapperErr, staticInfo](Error4 err, const hidl_vec<uint8_t> &vec) {
-            mapperErr = err;
-            if (err != Error4::NONE) {
-                return;
-            }
 
-            std::optional<Cta861_3> cta861_3;
-            gralloc4::decodeCta861_3(vec, &cta861_3);
-            if (cta861_3) {
-                (*staticInfo)->maxCll   = cta861_3->maxContentLightLevel;
-                (*staticInfo)->maxFall  = cta861_3->maxFrameAverageLightLevel;
-            } else {
-                mapperErr = Error4::BAD_VALUE;
-            }
-        };
-        ret = mapper->get(buffer.get(), MetadataType_Cta861_3, cb);
-        if (!ret.isOk()) {
-            err = C2_REFUSED;
-        } else if (mapperErr != Error4::NONE) {
+        std::optional<Cta861_3> cta861_3;
+        status = mapper.getCta861_3(buffer.get(), &cta861_3);
+        if (status != OK || !cta861_3) {
             err = C2_CORRUPTED;
+        } else {
+            if (cta861_3) {
+                  (*staticInfo)->maxCll   = cta861_3->maxContentLightLevel;
+                  (*staticInfo)->maxFall  = cta861_3->maxFrameAverageLightLevel;
+            }
         }
     }
+
+    if (err != C2_OK) {
+        staticInfo->reset();
+    }
+
     if (dynamicInfo) {
-        ALOGV("Grabbing dynamic HDR info from gralloc4 metadata");
+        ALOGV("Grabbing dynamic HDR info from gralloc metadata");
         dynamicInfo->reset();
-        IMapper4::get_cb cb = [&mapperErr, dynamicInfo](Error4 err, const hidl_vec<uint8_t> &vec) {
-            mapperErr = err;
-            if (err != Error4::NONE) {
-                return;
-            }
-            if (!dynamicInfo) {
-                return;
-            }
-            *dynamicInfo = C2StreamHdrDynamicMetadataInfo::input::AllocShared(
-                    vec.size(), 0u, C2Config::HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40);
-            memcpy((*dynamicInfo)->m.data, vec.data(), vec.size());
-        };
-        Return<void> ret = mapper->get(buffer.get(), MetadataType_Smpte2094_40, cb);
-        if (!ret.isOk() || mapperErr != Error4::NONE) {
+        std::optional<std::vector<uint8_t>> vec;
+        status_t status = mapper.getSmpte2094_40(buffer.get(), &vec);
+        if (status != OK || !vec) {
             dynamicInfo->reset();
+            err = C2_CORRUPTED;
+        } else {
+            if (vec) {
+                *dynamicInfo = C2StreamHdrDynamicMetadataInfo::input::AllocShared(
+                      vec->size(), 0u, C2Config::HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40);
+                memcpy((*dynamicInfo)->m.data, vec->data(), vec->size());
+            }
         }
     }
 
@@ -1167,25 +732,22 @@ c2_status_t SetMetadataToGralloc4Handle(
         const std::shared_ptr<const C2StreamHdrDynamicMetadataInfo::output> &dynamicInfo,
         const C2Handle *const handle) {
     c2_status_t err = C2_OK;
-    sp<IMapper4> mapper = GetMapper4();
-    Gralloc4Buffer buffer(handle);
-    if (!mapper || !buffer) {
+    GraphicBufferMapper& mapper = GraphicBufferMapper::get();
+    GrallocBuffer buffer(handle);
+    if (!buffer) {
         // Gralloc4 not supported; nothing to do
         return err;
     }
-    {
-        hidl_vec<uint8_t> metadata;
-        if (gralloc4::encodeDataspace(static_cast<Dataspace>(dataSpace), &metadata) == OK) {
-            Return<Error4> ret = mapper->set(buffer.get(), MetadataType_Dataspace, metadata);
-            if (!ret.isOk()) {
-                err = C2_REFUSED;
-            } else if (ret != Error4::NONE) {
-                err = C2_CORRUPTED;
-            }
-        }
+    // Use V0 dataspaces for Gralloc4+
+    if (android::media::codec::provider_->dataspace_v0_partial()) {
+        ColorUtils::convertDataSpaceToV0(dataSpace);
+    }
+    status_t status = mapper.setDataspace(buffer.get(), static_cast<ui::Dataspace>(dataSpace));
+    if (status != OK) {
+       err = C2_CORRUPTED;
     }
     if (staticInfo && *staticInfo) {
-        ALOGV("Setting static HDR info as gralloc4 metadata");
+        ALOGV("Setting static HDR info as gralloc metadata");
         std::optional<Smpte2086> smpte2086 = Smpte2086{
             {staticInfo->mastering.red.x, staticInfo->mastering.red.y},
             {staticInfo->mastering.green.x, staticInfo->mastering.green.y},
@@ -1194,7 +756,6 @@ c2_status_t SetMetadataToGralloc4Handle(
             staticInfo->mastering.maxLuminance,
             staticInfo->mastering.minLuminance,
         };
-        hidl_vec<uint8_t> vec;
         if (0.0 <= smpte2086->primaryRed.x && smpte2086->primaryRed.x <= 1.0
                 && 0.0 <= smpte2086->primaryRed.y && smpte2086->primaryRed.y <= 1.0
                 && 0.0 <= smpte2086->primaryGreen.x && smpte2086->primaryGreen.x <= 1.0
@@ -1203,12 +764,9 @@ c2_status_t SetMetadataToGralloc4Handle(
                 && 0.0 <= smpte2086->primaryBlue.y && smpte2086->primaryBlue.y <= 1.0
                 && 0.0 <= smpte2086->whitePoint.x && smpte2086->whitePoint.x <= 1.0
                 && 0.0 <= smpte2086->whitePoint.y && smpte2086->whitePoint.y <= 1.0
-                && 0.0 <= smpte2086->maxLuminance && 0.0 <= smpte2086->minLuminance
-                && gralloc4::encodeSmpte2086(smpte2086, &vec) == OK) {
-            Return<Error4> ret = mapper->set(buffer.get(), MetadataType_Smpte2086, vec);
-            if (!ret.isOk()) {
-                err = C2_REFUSED;
-            } else if (ret != Error4::NONE) {
+                && 0.0 <= smpte2086->maxLuminance && 0.0 <= smpte2086->minLuminance) {
+            status = mapper.setSmpte2086(buffer.get(), smpte2086);
+            if (status != OK) {
                 err = C2_CORRUPTED;
             }
         }
@@ -1216,41 +774,23 @@ c2_status_t SetMetadataToGralloc4Handle(
             staticInfo->maxCll,
             staticInfo->maxFall,
         };
-        if (0.0 <= cta861_3->maxContentLightLevel && 0.0 <= cta861_3->maxFrameAverageLightLevel
-                && gralloc4::encodeCta861_3(cta861_3, &vec) == OK) {
-            Return<Error4> ret = mapper->set(buffer.get(), MetadataType_Cta861_3, vec);
-            if (!ret.isOk()) {
-                err = C2_REFUSED;
-            } else if (ret != Error4::NONE) {
+        if (0.0 <= cta861_3->maxContentLightLevel && 0.0 <= cta861_3->maxFrameAverageLightLevel) {
+            status = mapper.setCta861_3(buffer.get(), cta861_3);
+            if (status != OK) {
                 err = C2_CORRUPTED;
             }
         }
     }
     if (dynamicInfo && *dynamicInfo && dynamicInfo->flexCount() > 0) {
-        ALOGV("Setting dynamic HDR info as gralloc4 metadata");
-        std::optional<IMapper4::MetadataType> metadataType;
-        switch (dynamicInfo->m.type_) {
-        case C2Config::HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_10:
-            // TODO
-            break;
-        case C2Config::HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40:
-            metadataType = MetadataType_Smpte2094_40;
-            break;
-        }
+        ALOGV("Setting dynamic HDR info as gralloc metadata");
+        if (dynamicInfo->m.type_ == C2Config::HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40) {
+            std::optional<std::vector<uint8_t>> smpte2094_40 = std::vector<uint8_t>();
+            smpte2094_40->resize(dynamicInfo->flexCount());
+            memcpy(smpte2094_40->data(), dynamicInfo->m.data, dynamicInfo->flexCount());
 
-        if (metadataType) {
-            std::vector<uint8_t> smpte2094_40;
-            smpte2094_40.resize(dynamicInfo->flexCount());
-            memcpy(smpte2094_40.data(), dynamicInfo->m.data, dynamicInfo->flexCount());
-
-            hidl_vec<uint8_t> vec;
-            if (gralloc4::encodeSmpte2094_40({ smpte2094_40 }, &vec) == OK) {
-                Return<Error4> ret = mapper->set(buffer.get(), *metadataType, vec);
-                if (!ret.isOk()) {
-                    err = C2_REFUSED;
-                } else if (ret != Error4::NONE) {
-                    err = C2_CORRUPTED;
-                }
+            status = mapper.setSmpte2094_40(buffer.get(), smpte2094_40);
+            if (status != OK) {
+                err = C2_CORRUPTED;
             }
         } else {
             err = C2_BAD_VALUE;

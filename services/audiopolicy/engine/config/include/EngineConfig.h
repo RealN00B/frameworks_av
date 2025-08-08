@@ -16,14 +16,21 @@
 
 #pragma once
 
-#include <system/audio.h>
-
 #include <string>
 #include <vector>
+
+#include <android/media/audio/common/AudioHalEngineConfig.h>
+#include <system/audio.h>
 #include <utils/Errors.h>
 
 struct _xmlNode;
 struct _xmlDoc;
+
+/**
+ * AudioAttributes custom tag to identify internal strategies, whose volumes are exclusively
+ * controlled by AudioPolicyManager
+ */
+#define AUDIO_TAG_APM_RESERVED_INTERNAL "reserved_internal_strategy"
 
 namespace android {
 namespace engineConfig {
@@ -35,7 +42,6 @@ using AttributesVector = std::vector<audio_attributes_t>;
 using StreamVector = std::vector<audio_stream_type_t>;
 
 struct AttributesGroup {
-    std::string name;
     audio_stream_type_t stream;
     std::string volumeGroup;
     AttributesVector attributesVect;
@@ -65,6 +71,7 @@ using VolumeGroups = std::vector<VolumeGroup>;
 
 struct ProductStrategy {
     std::string name;
+    int id;
     AttributesGroups attributesGroups;
 };
 
@@ -109,8 +116,9 @@ struct ParsingResult {
 /** Parses the provided audio policy usage configuration.
  * @return audio policy usage @see Config
  */
-ParsingResult parse(const char* path = DEFAULT_PATH);
+ParsingResult parse(const char* path = DEFAULT_PATH, bool isConfigurable = false);
 android::status_t parseLegacyVolumes(VolumeGroups &volumeGroups);
+ParsingResult convert(const ::android::media::audio::common::AudioHalEngineConfig& aidlConfig);
 // Exposed for testing.
 android::status_t parseLegacyVolumeFile(const char* path, VolumeGroups &volumeGroups);
 

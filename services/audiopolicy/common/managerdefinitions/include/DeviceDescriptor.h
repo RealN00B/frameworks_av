@@ -89,7 +89,11 @@ public:
     void importAudioPortAndPickAudioProfile(const sp<PolicyAudioPort>& policyPort,
                                             bool force = false);
 
+    status_t readFromParcelable(const media::AudioPortFw& parcelable) override;
+
     void setEncapsulationInfoFromHal(AudioPolicyClientInterface *clientInterface);
+
+    void setPreferredConfig(const audio_config_base_t * preferredConfig);
 
     void dump(String8 *dst, int spaces, bool verbose = true) const;
 
@@ -104,7 +108,8 @@ private:
     std::string mTagName; // Unique human readable identifier for a device port found in conf file.
     audio_format_t      mCurrentEncodedFormat;
     bool                mIsDynamic = false;
-    const std::string   mDeclaredAddress; // Original device address
+    std::string         mDeclaredAddress; // Original device address
+    std::optional<audio_config_base_t> mPreferredConfig;
 };
 
 class DeviceVector : public SortedVector<sp<DeviceDescriptor> >
@@ -181,6 +186,10 @@ public:
 
     bool onlyContainsDevicesWithType(audio_devices_t deviceType) const {
         return isSingleDeviceType(mDeviceTypes, deviceType);
+    }
+
+    bool onlyContainsDevice(const sp<DeviceDescriptor>& item) const {
+        return this->size() == 1 && contains(item);
     }
 
     bool contains(const sp<DeviceDescriptor>& item) const { return indexOf(item) >= 0; }
@@ -273,6 +282,11 @@ public:
 
     const AudioProfileVector& getSupportedProfiles() { return mSupportedProfiles; }
 
+    /**
+     * @brief checks if all devices in device vector are attached to the HwModule or not
+     * @return true if all the devices in device vector are attached, otherwise false
+     */
+    bool areAllDevicesAttached() const;
     // Return a string to describe the DeviceVector. The sensitive information will only be
     // added to the string if `includeSensitiveInfo` is true.
     std::string toString(bool includeSensitiveInfo = false) const;

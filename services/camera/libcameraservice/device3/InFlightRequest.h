@@ -21,7 +21,6 @@
 
 #include <camera/CaptureResult.h>
 #include <camera/CameraMetadata.h>
-#include <utils/String8.h>
 #include <utils/Timers.h>
 
 #include "common/CameraDeviceBase.h"
@@ -35,6 +34,8 @@ typedef struct camera_stream_configuration {
     camera_stream_t **streams;
     uint32_t operation_mode;
     bool input_is_multi_resolution;
+    bool use_hal_buf_manager = false;
+    std::set<int32_t> hal_buffer_managed_streams;
 } camera_stream_configuration_t;
 
 typedef struct camera_capture_request {
@@ -65,6 +66,7 @@ typedef struct camera_capture_result {
 typedef struct camera_shutter_msg {
     uint32_t frame_number;
     uint64_t timestamp;
+    bool readout_timestamp_valid;
     uint64_t readout_timestamp;
 } camera_shutter_msg_t;
 
@@ -104,8 +106,6 @@ typedef enum {
 struct InFlightRequest {
     // Set by notify() SHUTTER call.
     nsecs_t shutterTimestamp;
-    // Set by notify() SHUTTER call with readout time.
-    nsecs_t shutterReadoutTimestamp;
     // Set by process_capture_result().
     nsecs_t sensorTimestamp;
     int     requestStatus;
@@ -153,6 +153,9 @@ struct InFlightRequest {
     // For auto-exposure modes, equal to 1/(lower end of target FPS range)
     nsecs_t maxExpectedDuration;
 
+    // Whether the FPS range is fixed, aka, minFps == maxFps
+    bool isFixedFps;
+
     // Whether the result metadata for this request is to be skipped. The
     // result metadata should be skipped in the case of
     // REQUEST/RESULT error.
@@ -166,7 +169,7 @@ struct InFlightRequest {
     // For request on a physical camera stream, the inside set contains one Id
     // For request on a stream group containing physical camera streams, the
     // inside set contains all stream Ids in the group.
-    std::set<std::set<String8>> physicalCameraIds;
+    std::set<std::set<std::string>> physicalCameraIds;
 
     // Map of physicalCameraId <-> Metadata
     std::vector<PhysicalCaptureResultInfo> physicalMetadatas;
@@ -180,6 +183,9 @@ struct InFlightRequest {
     // Indicates that ROTATE_AND_CROP was set to AUTO
     bool rotateAndCropAuto;
 
+    // Indicates that AUTOFRAMING was set to AUTO
+    bool autoframingAuto;
+
     // Requested camera ids (both logical and physical) with zoomRatio != 1.0f
     std::set<std::string> cameraIdsWithZoom;
 
@@ -191,6 +197,9 @@ struct InFlightRequest {
 
     // Current output transformation
     int32_t transform;
+
+    // Whether the app explicitly uses ZOOM_RATIO
+    bool useZoomRatio;
 
     static const nsecs_t kDefaultMinExpectedDuration = 33333333; // 33 ms
     static const nsecs_t kDefaultMaxExpectedDuration = 100000000; // 100 ms
@@ -206,20 +215,24 @@ struct InFlightRequest {
             hasCallback(true),
             minExpectedDuration(kDefaultMinExpectedDuration),
             maxExpectedDuration(kDefaultMaxExpectedDuration),
+            isFixedFps(false),
             skipResultMetadata(false),
             errorBufStrategy(ERROR_BUF_CACHE),
             stillCapture(false),
             zslCapture(false),
             rotateAndCropAuto(false),
+            autoframingAuto(false),
             requestTimeNs(0),
-            transform(-1) {
+            transform(-1),
+            useZoomRatio(false) {
     }
 
     InFlightRequest(int numBuffers, CaptureResultExtras extras, bool hasInput,
-            bool hasAppCallback, nsecs_t minDuration, nsecs_t maxDuration,
-            const std::set<std::set<String8>>& physicalCameraIdSet, bool isStillCapture,
-            bool isZslCapture, bool rotateAndCropAuto, const std::set<std::string>& idsWithZoom,
-            nsecs_t requestNs, const SurfaceMap& outSurfaces = SurfaceMap{}) :
+            bool hasAppCallback, nsecs_t minDuration, nsecs_t maxDuration, bool fixedFps,
+            const std::set<std::set<std::string>>& physicalCameraIdSet, bool isStillCapture,
+            bool isZslCapture, bool rotateAndCropAuto, bool autoframingAuto,
+            const std::set<std::string>& idsWithZoom, nsecs_t requestNs, bool useZoomRatio,
+            const SurfaceMap& outSurfaces = SurfaceMap{}) :
             shutterTimestamp(0),
             sensorTimestamp(0),
             requestStatus(OK),
@@ -230,16 +243,19 @@ struct InFlightRequest {
             hasCallback(hasAppCallback),
             minExpectedDuration(minDuration),
             maxExpectedDuration(maxDuration),
+            isFixedFps(fixedFps),
             skipResultMetadata(false),
             errorBufStrategy(ERROR_BUF_CACHE),
             physicalCameraIds(physicalCameraIdSet),
             stillCapture(isStillCapture),
             zslCapture(isZslCapture),
             rotateAndCropAuto(rotateAndCropAuto),
+            autoframingAuto(autoframingAuto),
             cameraIdsWithZoom(idsWithZoom),
             requestTimeNs(requestNs),
             outputSurfaces(outSurfaces),
-            transform(-1) {
+            transform(-1),
+            useZoomRatio(useZoomRatio) {
     }
 };
 

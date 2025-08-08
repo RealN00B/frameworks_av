@@ -219,7 +219,7 @@ status_t WAVExtractor::init() {
 
             mNumChannels = U16_LE_AT(&formatSpec[2]);
 
-            if (mNumChannels < 1 || mNumChannels > FCC_8) {
+            if (mNumChannels < 1 || mNumChannels > FCC_12) {
                 ALOGE("Unsupported number of channels (%d)", mNumChannels);
                 return AMEDIA_ERROR_UNSUPPORTED;
             }
@@ -459,10 +459,14 @@ media_status_t WAVSource::read(
         mCurrentPos = pos + mOffset;
     }
 
-    MediaBufferHelper *buffer;
+    MediaBufferHelper *buffer = nullptr;
     media_status_t err = mBufferGroup->acquire_buffer(&buffer);
     if (err != OK) {
         return err;
+    }
+    if (buffer == nullptr) {
+        ALOGE("acquire_buffer OK, but no buffer");
+        return AMEDIA_ERROR_UNKNOWN;
     }
 
     // maxBytesToRead may be reduced so that in-place data conversion will fit in buffer size.

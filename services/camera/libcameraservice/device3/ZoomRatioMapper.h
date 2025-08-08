@@ -64,11 +64,15 @@ class ZoomRatioMapper : public CoordinateMapper {
     /**
      * Update capture result to handle both cropRegion and zoomRatio.
      */
-    status_t updateCaptureResult(CameraMetadata *request, bool requestedZoomRatioIs1);
+    status_t updateCaptureResult(CameraMetadata *request,
+                                 bool zoomMethodIsRatio,
+                                 bool zoomRatioIs1);
 
   public: // Visible for testing. Do not use concurently.
     void scaleCoordinates(int32_t* coordPairs, int coordCount,
             float scaleRatio, bool clamp, int32_t arrayWidth, int32_t arrayHeight);
+    void scaleRegion(int32_t* region, float scaleRatio,
+            int32_t arrayWidth, int32_t arrayHeight);
 
     bool isValid() { return mIsValid; }
   private:

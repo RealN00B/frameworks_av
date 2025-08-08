@@ -32,7 +32,10 @@
 #include <media/stagefright/MetaData.h>
 #include <camera/Camera.h>
 #include <camera/CameraParameters.h>
+#include <camera/StringUtils.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/Surface.h>
+#include <gui/Flags.h>
 #include <utils/String8.h>
 #include <cutils/properties.h>
 
@@ -97,7 +100,7 @@ CameraSource *CameraSource::CreateFromCamera(
     pid_t clientPid,
     Size videoSize,
     int32_t frameRate,
-    const sp<IGraphicBufferProducer>& surface) {
+    const sp<SurfaceType>& surface) {
 
     CameraSource *source = new CameraSource(camera, proxy, cameraId,
             clientName, clientUid, clientPid, videoSize, frameRate, surface);
@@ -113,7 +116,7 @@ CameraSource::CameraSource(
     pid_t clientPid,
     Size videoSize,
     int32_t frameRate,
-    const sp<IGraphicBufferProducer>& surface)
+    const sp<SurfaceType>& surface)
     : mCameraFlags(0),
       mNumInputBuffers(0),
       mVideoFrameRate(-1),
@@ -146,11 +149,19 @@ status_t CameraSource::initCheck() const {
 
 status_t CameraSource::isCameraAvailable(
     const sp<hardware::ICamera>& camera, const sp<ICameraRecordingProxy>& proxy,
-    int32_t cameraId, const String16& clientName, uid_t clientUid, pid_t clientPid) {
+    int32_t cameraId, const std::string& clientName, uid_t clientUid, pid_t clientPid) {
 
     if (camera == 0) {
-        mCamera = Camera::connect(cameraId, clientName, clientUid, clientPid,
-                /*targetSdkVersion*/__ANDROID_API_FUTURE__);
+        AttributionSourceState clientAttribution;
+        clientAttribution.pid = clientPid;
+        clientAttribution.uid = clientUid;
+        clientAttribution.deviceId = kDefaultDeviceId;
+        clientAttribution.packageName = clientName;
+        clientAttribution.token = sp<BBinder>::make();
+
+        mCamera = Camera::connect(cameraId, /*targetSdkVersion*/__ANDROID_API_FUTURE__,
+                /*rotationOverride*/hardware::ICameraService::ROTATION_OVERRIDE_NONE,
+                /*forceSlowJpegMode*/false, clientAttribution);
         if (mCamera == 0) return -EBUSY;
         mCameraFlags &= ~FLAGS_HOT_CAMERA;
     } else {
@@ -463,11 +474,13 @@ status_t CameraSource::initBufferQueue(uint32_t width, uint32_t height,
         ALOGE("%s: Buffer queue already exists", __FUNCTION__);
         return ALREADY_EXISTS;
     }
-
+#if !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     // Create a buffer queue.
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
     BufferQueue::createBufferQueue(&producer, &consumer);
+#endif // !COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+
 
     uint32_t usage = GRALLOC_USAGE_SW_READ_OFTEN;
     if (format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
@@ -476,9 +489,27 @@ status_t CameraSource::initBufferQueue(uint32_t width, uint32_t height,
 
     bufferCount += kConsumerBufferCount;
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mVideoBufferConsumer = new BufferItemConsumer(usage, bufferCount);
+    mVideoBufferConsumer->setName(String8::format("StageFright-CameraSource"));
+
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+    mVideoBufferProducer = mVideoBufferConsumer->getSurface();
+#else
+    mVideoBufferProducer = mVideoBufferConsumer->getSurface()->getIGraphicBufferProducer();
+#endif  // WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+
+#else
     mVideoBufferConsumer = new BufferItemConsumer(consumer, usage, bufferCount);
     mVideoBufferConsumer->setName(String8::format("StageFright-CameraSource"));
+
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+    mVideoBufferProducer = new Surface(producer);
+#else
     mVideoBufferProducer = producer;
+#endif  // WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     status_t res = mVideoBufferConsumer->setDefaultBufferSize(width, height);
     if (res != OK) {
@@ -534,7 +565,7 @@ status_t CameraSource::initWithCameraAccess(
     status_t err = OK;
 
     if ((err = isCameraAvailable(camera, proxy, cameraId,
-            clientName, clientUid, clientPid)) != OK) {
+            toStdString(clientName), clientUid, clientPid)) != OK) {
         ALOGE("Camera connection could not be established.");
         return err;
     }

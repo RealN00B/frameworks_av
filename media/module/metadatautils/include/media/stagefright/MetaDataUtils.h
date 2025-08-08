@@ -38,6 +38,11 @@ bool MakeAACCodecSpecificData(AMediaFormat *meta, unsigned profile, unsigned sam
 void parseVorbisComment(
         AMediaFormat *fileMeta, const char *comment, size_t commentLength);
 
+bool MakeVP9CodecSpecificData(AMediaFormat* meta, int32_t csdSize, int32_t profile, int32_t level,
+                              int32_t bitDepth, int32_t chromaSubsampling);
+bool MakeVP9CodecSpecificDataFromFirstFrame(AMediaFormat* meta, const uint8_t* data, size_t size);
+bool MakeVP9CodecPrivateFromVpcC(AMediaFormat* meta, const uint8_t* data, size_t size);
+
 }  // namespace android
 
 #endif  // META_DATA_UTILS_H_

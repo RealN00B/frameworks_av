@@ -26,6 +26,7 @@
 #include "NuPlayer.h"
 #include "NuPlayerSource.h"
 
+#include <audiomanager/AudioManager.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AUtils.h>
@@ -34,6 +35,11 @@
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/Utils.h>
 #include <media/stagefright/FoundationUtils.h>
+
+#define ATRACE_TAG ATRACE_TAG_AUDIO
+#include <utils/Trace.h>
+#include <android-base/stringprintf.h>
+using ::android::base::StringPrintf;
 
 static const int kDumpLockRetries = 50;
 static const int kDumpLockSleepUs = 20000;
@@ -85,6 +91,7 @@ NuPlayerDriver::NuPlayerDriver(pid_t pid)
       mMediaClock(new MediaClock),
       mPlayer(new NuPlayer(pid, mMediaClock)),
       mPlayerFlags(0),
+      mCachedPlayerIId(PLAYER_PIID_INVALID),
       mMetricsItem(NULL),
       mClientUid(-1),
       mAtEOS(false),
@@ -144,9 +151,11 @@ status_t NuPlayerDriver::setDataSource(
         const char *url,
         const KeyedVector<String8, String8> *headers) {
     ALOGV("setDataSource(%p) url(%s)", this, uriDebugString(url, false).c_str());
+    ATRACE_BEGIN(StringPrintf("setDataSource(%p)", this).c_str());
     Mutex::Autolock autoLock(mLock);
 
     if (mState != STATE_IDLE) {
+        ATRACE_END();
         return INVALID_OPERATION;
     }
 
@@ -157,15 +166,18 @@ status_t NuPlayerDriver::setDataSource(
     while (mState == STATE_SET_DATASOURCE_PENDING) {
         mCondition.wait(mLock);
     }
+    ATRACE_END();
 
     return mAsyncResult;
 }
 
 status_t NuPlayerDriver::setDataSource(int fd, int64_t offset, int64_t length) {
     ALOGV("setDataSource(%p) file(%d)", this, fd);
+    ATRACE_BEGIN(StringPrintf("setDataSource(%p) file(%d)", this, fd).c_str());
     Mutex::Autolock autoLock(mLock);
 
     if (mState != STATE_IDLE) {
+        ATRACE_END();
         return INVALID_OPERATION;
     }
 
@@ -176,15 +188,18 @@ status_t NuPlayerDriver::setDataSource(int fd, int64_t offset, int64_t length) {
     while (mState == STATE_SET_DATASOURCE_PENDING) {
         mCondition.wait(mLock);
     }
+    ATRACE_END();
 
     return mAsyncResult;
 }
 
 status_t NuPlayerDriver::setDataSource(const sp<IStreamSource> &source) {
     ALOGV("setDataSource(%p) stream source", this);
+    ATRACE_BEGIN(StringPrintf("setDataSource(%p) stream source", this).c_str());
     Mutex::Autolock autoLock(mLock);
 
     if (mState != STATE_IDLE) {
+        ATRACE_END();
         return INVALID_OPERATION;
     }
 
@@ -195,15 +210,18 @@ status_t NuPlayerDriver::setDataSource(const sp<IStreamSource> &source) {
     while (mState == STATE_SET_DATASOURCE_PENDING) {
         mCondition.wait(mLock);
     }
+    ATRACE_END();
 
     return mAsyncResult;
 }
 
 status_t NuPlayerDriver::setDataSource(const sp<DataSource> &source) {
     ALOGV("setDataSource(%p) callback source", this);
+    ATRACE_BEGIN(StringPrintf("setDataSource(%p) callback source", this).c_str());
     Mutex::Autolock autoLock(mLock);
 
     if (mState != STATE_IDLE) {
+        ATRACE_END();
         return INVALID_OPERATION;
     }
 
@@ -214,15 +232,18 @@ status_t NuPlayerDriver::setDataSource(const sp<DataSource> &source) {
     while (mState == STATE_SET_DATASOURCE_PENDING) {
         mCondition.wait(mLock);
     }
+    ATRACE_END();
 
     return mAsyncResult;
 }
 
 status_t NuPlayerDriver::setDataSource(const String8& rtpParams) {
     ALOGV("setDataSource(%p) rtp source", this);
+    ATRACE_BEGIN(StringPrintf("setDataSource(%p) rtp source", this).c_str());
     Mutex::Autolock autoLock(mLock);
 
     if (mState != STATE_IDLE) {
+        ATRACE_END();
         return INVALID_OPERATION;
     }
 
@@ -233,6 +254,7 @@ status_t NuPlayerDriver::setDataSource(const String8& rtpParams) {
     while (mState == STATE_SET_DATASOURCE_PENDING) {
         mCondition.wait(mLock);
     }
+    ATRACE_END();
 
     return mAsyncResult;
 }
@@ -293,8 +315,11 @@ status_t NuPlayerDriver::setBufferingSettings(const BufferingSettings& buffering
 
 status_t NuPlayerDriver::prepare() {
     ALOGV("prepare(%p)", this);
+    ATRACE_BEGIN(StringPrintf("prepare(%p)", this).c_str());
     Mutex::Autolock autoLock(mLock);
-    return prepare_l();
+    status_t ret = prepare_l();
+    ATRACE_END();
+    return ret;
 }
 
 status_t NuPlayerDriver::prepare_l() {
@@ -352,8 +377,11 @@ status_t NuPlayerDriver::prepareAsync() {
 
 status_t NuPlayerDriver::start() {
     ALOGV("start(%p), state is %d, eos is %d", this, mState, mAtEOS);
+    ATRACE_BEGIN(StringPrintf("start(%p), state is %d, eos is %d", this, mState, mAtEOS).c_str());
     Mutex::Autolock autoLock(mLock);
-    return start_l();
+    status_t ret = start_l();
+    ATRACE_END();
+    return ret;
 }
 
 status_t NuPlayerDriver::start_l() {
@@ -804,6 +832,16 @@ status_t NuPlayerDriver::invoke(const Parcel &request, Parcel *reply) {
             return mPlayer->getSelectedTrack(type, reply);
         }
 
+        case INVOKE_ID_SET_PLAYER_IID:
+        {
+            Mutex::Autolock autoLock(mAudioSinkLock);
+            mCachedPlayerIId = request.readInt32();
+            if (mAudioSink != nullptr) {
+                mAudioSink->setPlayerIId(mCachedPlayerIId);
+            }
+            return OK;
+        }
+
         default:
         {
             return INVALID_OPERATION;
@@ -812,8 +850,12 @@ status_t NuPlayerDriver::invoke(const Parcel &request, Parcel *reply) {
 }
 
 void NuPlayerDriver::setAudioSink(const sp<AudioSink> &audioSink) {
+    Mutex::Autolock autoLock(mAudioSinkLock);
     mPlayer->setAudioSink(audioSink);
     mAudioSink = audioSink;
+    if (mCachedPlayerIId != PLAYER_PIID_INVALID) {
+        mAudioSink->setPlayerIId(mCachedPlayerIId);
+    }
 }
 
 status_t NuPlayerDriver::setParameter(
@@ -953,13 +995,16 @@ status_t NuPlayerDriver::dump(
     }
 
     if (locked) {
-        snprintf(buf, sizeof(buf), "  state(%d), atEOS(%d), looping(%d), autoLoop(%d)\n",
+        snprintf(buf, sizeof(buf), "  state(%d), atEOS(%d), looping(%d), autoLoop(%d), ",
                 mState, mAtEOS, mLooping, mAutoLoop);
+        logString.append(buf);
+        mPlayer->dump(logString);
+        logString.append("\n");
         mLock.unlock();
     } else {
         snprintf(buf, sizeof(buf), "  NPD(%p) lock is taken\n", this);
+        logString.append(buf);
     }
-    logString.append(buf);
 
     for (size_t i = 0; i < trackStats.size(); ++i) {
         const sp<AMessage> &stats = trackStats.itemAt(i);
@@ -1027,6 +1072,7 @@ void NuPlayerDriver::notifyListener_l(
             if (mState != STATE_RESET_IN_PROGRESS) {
                 if (mAutoLoop) {
                     audio_stream_type_t streamType = AUDIO_STREAM_MUSIC;
+                    Mutex::Autolock autoLock(mAudioSinkLock);
                     if (mAudioSink != NULL) {
                         streamType = mAudioSink->getAudioStreamType();
                     }
@@ -1037,6 +1083,7 @@ void NuPlayerDriver::notifyListener_l(
                 }
                 if (mLooping || mAutoLoop) {
                     mPlayer->seekToAsync(0);
+                    Mutex::Autolock autoLock(mAudioSinkLock);
                     if (mAudioSink != NULL) {
                         // The renderer has stopped the sink at the end in order to play out
                         // the last little bit of audio. If we're looping, we need to restart it.

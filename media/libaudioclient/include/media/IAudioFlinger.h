@@ -32,7 +32,6 @@
 #include <system/audio_effect.h>
 #include <system/audio_policy.h>
 #include <utils/String8.h>
-#include <media/MicrophoneInfo.h>
 #include <map>
 #include <string>
 #include <vector>
@@ -55,10 +54,13 @@
 #include "android/media/IAudioTrackCallback.h"
 #include "android/media/IEffect.h"
 #include "android/media/IEffectClient.h"
+#include "android/media/ISoundDose.h"
+#include "android/media/ISoundDoseCallback.h"
 #include "android/media/OpenInputRequest.h"
 #include "android/media/OpenInputResponse.h"
 #include "android/media/OpenOutputRequest.h"
 #include "android/media/OpenOutputResponse.h"
+#include "android/media/TrackInternalMuteInfo.h"
 #include "android/media/TrackSecondaryOutputInfo.h"
 
 namespace android {
@@ -107,7 +109,7 @@ public:
         audio_output_flags_t flags;
         size_t frameCount;
         size_t notificationFrameCount;
-        audio_port_handle_t selectedDeviceId;
+        DeviceIdVector selectedDeviceIds;
         audio_session_t sessionId;
 
         /* output */
@@ -116,6 +118,9 @@ public:
         size_t   afFrameCount;
         uint32_t afSampleRate;
         uint32_t afLatencyMs;
+        audio_channel_mask_t afChannelMask;
+        audio_format_t afFormat;
+        audio_output_flags_t afTrackFlags;
         audio_io_handle_t outputId;
         audio_port_handle_t portId;
         sp<media::IAudioTrack> audioTrack;
@@ -169,11 +174,14 @@ public:
         audio_port_handle_t portId;
         sp<media::IAudioRecord> audioRecord;
         audio_config_base_t serverConfig;
+        audio_config_base_t halConfig;
 
         ConversionResult<media::CreateRecordResponse> toAidl() const;
         static ConversionResult<CreateRecordOutput>
         fromAidl(const media::CreateRecordResponse& aidl);
     };
+
+    virtual sp<media::IAudioFlingerService> getDelegate() const { return {}; }
 
     /* create an audio track and registers it with AudioFlinger.
      * The audioTrack field will be null if the track cannot be created and the status will reflect
@@ -220,12 +228,19 @@ public:
      * the preference panel, mostly.
      */
     virtual     status_t    setStreamVolume(audio_stream_type_t stream, float value,
-                                    audio_io_handle_t output) = 0;
+                                    bool muted, audio_io_handle_t output) = 0;
     virtual     status_t    setStreamMute(audio_stream_type_t stream, bool muted) = 0;
 
-    virtual     float       streamVolume(audio_stream_type_t stream,
-                                    audio_io_handle_t output) const = 0;
-    virtual     bool        streamMute(audio_stream_type_t stream) const = 0;
+    /**
+     * Set volume for given AudioTrack port ids on specified output
+     * @param portIds to consider
+     * @param volume to set
+     * @param muted to set
+     * @param output to consider
+     * @return NO_ERROR if successful
+     */
+    virtual status_t setPortsVolume(const std::vector<audio_port_handle_t>& portIds, float volume,
+            bool muted, audio_io_handle_t output) = 0;
 
     // set audio mode
     virtual     status_t    setMode(audio_mode_t mode) = 0;
@@ -263,8 +278,6 @@ public:
 
     virtual status_t closeInput(audio_io_handle_t input) = 0;
 
-    virtual status_t invalidateStream(audio_stream_type_t stream) = 0;
-
     virtual status_t setVoiceVolume(float volume) = 0;
 
     virtual status_t getRenderPosition(uint32_t *halFrames, uint32_t *dspFrames,
@@ -301,8 +314,8 @@ public:
     // helpers for android.media.AudioManager.getProperty(), see description there for meaning
     // FIXME move these APIs to AudioPolicy to permit a more accurate implementation
     // that looks on primary device for a stream with fast flag, primary flag, or first one.
-    virtual uint32_t getPrimaryOutputSamplingRate() = 0;
-    virtual size_t getPrimaryOutputFrameCount() = 0;
+    virtual uint32_t getPrimaryOutputSamplingRate() const = 0;
+    virtual size_t getPrimaryOutputFrameCount() const = 0;
 
     // Intended for AudioService to inform AudioFlinger of device's low RAM attribute,
     // and should be called at most once.  For a definition of what "low RAM" means, see
@@ -311,7 +324,7 @@ public:
     virtual status_t setLowRamDevice(bool isLowRamDevice, int64_t totalMemory) = 0;
 
     /* Get attributes for a given audio port */
-    virtual status_t getAudioPort(struct audio_port_v7 *port) = 0;
+    virtual status_t getAudioPort(struct audio_port_v7* port) const = 0;
 
     /* Create an audio patch between several source and sink ports */
     virtual status_t createAudioPatch(const struct audio_patch *patch,
@@ -322,7 +335,7 @@ public:
 
     /* List existing audio patches */
     virtual status_t listAudioPatches(unsigned int *num_patches,
-                                      struct audio_patch *patches) = 0;
+                                      struct audio_patch* patches) const = 0;
     /* Set audio port configuration */
     virtual status_t setAudioPortConfig(const struct audio_port_config *config) = 0;
 
@@ -339,7 +352,7 @@ public:
     virtual size_t frameCountHAL(audio_io_handle_t ioHandle) const = 0;
 
     /* List available microphones and their characteristics */
-    virtual status_t getMicrophones(std::vector<media::MicrophoneInfo> *microphones) = 0;
+    virtual status_t getMicrophones(std::vector<media::MicrophoneInfoFw>* microphones) const = 0;
 
     virtual status_t setAudioHalPids(const std::vector<pid_t>& pids) = 0;
 
@@ -355,18 +368,41 @@ public:
             media::audio::common::AudioMMapPolicyType policyType,
             std::vector<media::audio::common::AudioMMapPolicyInfo> *policyInfos) = 0;
 
-    virtual int32_t getAAudioMixerBurstCount() = 0;
+    virtual int32_t getAAudioMixerBurstCount() const = 0;
 
-    virtual int32_t getAAudioHardwareBurstMinUsec() = 0;
+    virtual int32_t getAAudioHardwareBurstMinUsec() const = 0;
 
-    virtual status_t setDeviceConnectedState(const struct audio_port_v7 *port, bool connected) = 0;
+    virtual status_t setDeviceConnectedState(const struct audio_port_v7 *port,
+                                             media::DeviceConnectedState state) = 0;
+
+    virtual status_t setSimulateDeviceConnections(bool enabled) = 0;
 
     virtual status_t setRequestedLatencyMode(
             audio_io_handle_t output, audio_latency_mode_t mode) = 0;
 
     virtual status_t getSupportedLatencyModes(audio_io_handle_t output,
-            std::vector<audio_latency_mode_t>* modes) = 0;
+            std::vector<audio_latency_mode_t>* modes) const = 0;
 
+    virtual status_t getSoundDoseInterface(const sp<media::ISoundDoseCallback>& callback,
+                                           sp<media::ISoundDose>* soundDose) const = 0;
+
+    virtual status_t invalidateTracks(const std::vector<audio_port_handle_t>& portIds) = 0;
+
+    virtual status_t setBluetoothVariableLatencyEnabled(bool enabled) = 0;
+
+    virtual status_t isBluetoothVariableLatencyEnabled(bool* enabled) const = 0;
+
+    virtual status_t supportsBluetoothVariableLatency(bool* support) const = 0;
+
+    virtual status_t getAudioPolicyConfig(media::AudioPolicyConfig* output) = 0;
+
+    virtual status_t getAudioMixPort(const struct audio_port_v7 *devicePort,
+                                     struct audio_port_v7 *mixPort) const = 0;
+
+    virtual status_t setTracksInternalMute(
+            const std::vector<media::TrackInternalMuteInfo>& tracksInternalMute) = 0;
+
+    virtual status_t resetReferencesForTest() = 0;
 };
 
 /**
@@ -379,6 +415,8 @@ public:
 class AudioFlingerClientAdapter : public IAudioFlinger {
 public:
     explicit AudioFlingerClientAdapter(const sp<media::IAudioFlingerService> delegate);
+
+    sp<media::IAudioFlingerService> getDelegate() const final { return mDelegate; }
 
     status_t createTrack(const media::CreateTrackRequest& input,
                          media::CreateTrackResponse& output) override;
@@ -395,11 +433,10 @@ public:
     status_t setMasterBalance(float balance) override;
     status_t getMasterBalance(float* balance) const override;
     status_t setStreamVolume(audio_stream_type_t stream, float value,
-                             audio_io_handle_t output) override;
+                             bool muted, audio_io_handle_t output) override;
     status_t setStreamMute(audio_stream_type_t stream, bool muted) override;
-    float streamVolume(audio_stream_type_t stream,
-                       audio_io_handle_t output) const override;
-    bool streamMute(audio_stream_type_t stream) const override;
+    status_t setPortsVolume(const std::vector<audio_port_handle_t>& portIds, float volume,
+            bool muted, audio_io_handle_t output) override;
     status_t setMode(audio_mode_t mode) override;
     status_t setMicMute(bool state) override;
     bool getMicMute() const override;
@@ -421,7 +458,6 @@ public:
     status_t openInput(const media::OpenInputRequest& request,
                        media::OpenInputResponse* response) override;
     status_t closeInput(audio_io_handle_t input) override;
-    status_t invalidateStream(audio_stream_type_t stream) override;
     status_t setVoiceVolume(float volume) override;
     status_t getRenderPosition(uint32_t* halFrames, uint32_t* dspFrames,
                                audio_io_handle_t output) const override;
@@ -443,22 +479,22 @@ public:
                             audio_session_t sessionId,
                             bool suspended) override;
     audio_module_handle_t loadHwModule(const char* name) override;
-    uint32_t getPrimaryOutputSamplingRate() override;
-    size_t getPrimaryOutputFrameCount() override;
+    uint32_t getPrimaryOutputSamplingRate() const override;
+    size_t getPrimaryOutputFrameCount() const override;
     status_t setLowRamDevice(bool isLowRamDevice, int64_t totalMemory) override;
-    status_t getAudioPort(struct audio_port_v7* port) override;
+    status_t getAudioPort(struct audio_port_v7* port) const override;
     status_t createAudioPatch(const struct audio_patch* patch,
                               audio_patch_handle_t* handle) override;
     status_t releaseAudioPatch(audio_patch_handle_t handle) override;
     status_t listAudioPatches(unsigned int* num_patches,
-                              struct audio_patch* patches) override;
+                              struct audio_patch* patches) const override;
     status_t setAudioPortConfig(const struct audio_port_config* config) override;
     audio_hw_sync_t getAudioHwSyncForSession(audio_session_t sessionId) override;
     status_t systemReady() override;
     status_t audioPolicyReady() override;
 
     size_t frameCountHAL(audio_io_handle_t ioHandle) const override;
-    status_t getMicrophones(std::vector<media::MicrophoneInfo>* microphones) override;
+    status_t getMicrophones(std::vector<media::MicrophoneInfoFw>* microphones) const override;
     status_t setAudioHalPids(const std::vector<pid_t>& pids) override;
     status_t setVibratorInfos(const std::vector<media::AudioVibratorInfo>& vibratorInfos) override;
     status_t updateSecondaryOutputs(
@@ -466,13 +502,27 @@ public:
     status_t getMmapPolicyInfos(
             media::audio::common::AudioMMapPolicyType policyType,
             std::vector<media::audio::common::AudioMMapPolicyInfo> *policyInfos) override;
-    int32_t getAAudioMixerBurstCount() override;
-    int32_t getAAudioHardwareBurstMinUsec() override;
-    status_t setDeviceConnectedState(const struct audio_port_v7 *port, bool connected) override;
+    int32_t getAAudioMixerBurstCount() const override;
+    int32_t getAAudioHardwareBurstMinUsec() const override;
+    status_t setDeviceConnectedState(const struct audio_port_v7 *port,
+                                     media::DeviceConnectedState state) override;
+    status_t setSimulateDeviceConnections(bool enabled) override;
     status_t setRequestedLatencyMode(audio_io_handle_t output,
             audio_latency_mode_t mode) override;
     status_t getSupportedLatencyModes(
-            audio_io_handle_t output, std::vector<audio_latency_mode_t>* modes) override;
+            audio_io_handle_t output, std::vector<audio_latency_mode_t>* modes) const override;
+    status_t setBluetoothVariableLatencyEnabled(bool enabled) override;
+    status_t isBluetoothVariableLatencyEnabled(bool* enabled) const override;
+    status_t supportsBluetoothVariableLatency(bool* support) const override;
+    status_t getSoundDoseInterface(const sp<media::ISoundDoseCallback>& callback,
+                                   sp<media::ISoundDose>* soundDose) const override;
+    status_t invalidateTracks(const std::vector<audio_port_handle_t>& portIds) override;
+    status_t getAudioPolicyConfig(media::AudioPolicyConfig* output) override;
+    status_t getAudioMixPort(const struct audio_port_v7 *devicePort,
+                             struct audio_port_v7 *mixPort) const override;
+    status_t setTracksInternalMute(
+            const std::vector<media::TrackInternalMuteInfo>& tracksInternalMute) override;
+    status_t resetReferencesForTest() override;
 
 private:
     const sp<media::IAudioFlingerService> mDelegate;
@@ -509,8 +559,7 @@ public:
             MASTER_MUTE = media::BnAudioFlingerService::TRANSACTION_masterMute,
             SET_STREAM_VOLUME = media::BnAudioFlingerService::TRANSACTION_setStreamVolume,
             SET_STREAM_MUTE = media::BnAudioFlingerService::TRANSACTION_setStreamMute,
-            STREAM_VOLUME = media::BnAudioFlingerService::TRANSACTION_streamVolume,
-            STREAM_MUTE = media::BnAudioFlingerService::TRANSACTION_streamMute,
+            SET_PORTS_VOLUME = media::BnAudioFlingerService::TRANSACTION_setPortsVolume,
             SET_MODE = media::BnAudioFlingerService::TRANSACTION_setMode,
             SET_MIC_MUTE = media::BnAudioFlingerService::TRANSACTION_setMicMute,
             GET_MIC_MUTE = media::BnAudioFlingerService::TRANSACTION_getMicMute,
@@ -526,7 +575,6 @@ public:
             RESTORE_OUTPUT = media::BnAudioFlingerService::TRANSACTION_restoreOutput,
             OPEN_INPUT = media::BnAudioFlingerService::TRANSACTION_openInput,
             CLOSE_INPUT = media::BnAudioFlingerService::TRANSACTION_closeInput,
-            INVALIDATE_STREAM = media::BnAudioFlingerService::TRANSACTION_invalidateStream,
             SET_VOICE_VOLUME = media::BnAudioFlingerService::TRANSACTION_setVoiceVolume,
             GET_RENDER_POSITION = media::BnAudioFlingerService::TRANSACTION_getRenderPosition,
             GET_INPUT_FRAMES_LOST = media::BnAudioFlingerService::TRANSACTION_getInputFramesLost,
@@ -562,8 +610,23 @@ public:
             GET_AAUDIO_MIXER_BURST_COUNT = media::BnAudioFlingerService::TRANSACTION_getAAudioMixerBurstCount,
             GET_AAUDIO_HARDWARE_BURST_MIN_USEC = media::BnAudioFlingerService::TRANSACTION_getAAudioHardwareBurstMinUsec,
             SET_DEVICE_CONNECTED_STATE = media::BnAudioFlingerService::TRANSACTION_setDeviceConnectedState,
+            SET_SIMULATE_DEVICE_CONNECTIONS = media::BnAudioFlingerService::TRANSACTION_setSimulateDeviceConnections,
             SET_REQUESTED_LATENCY_MODE = media::BnAudioFlingerService::TRANSACTION_setRequestedLatencyMode,
             GET_SUPPORTED_LATENCY_MODES = media::BnAudioFlingerService::TRANSACTION_getSupportedLatencyModes,
+            SET_BLUETOOTH_VARIABLE_LATENCY_ENABLED =
+                    media::BnAudioFlingerService::TRANSACTION_setBluetoothVariableLatencyEnabled,
+            IS_BLUETOOTH_VARIABLE_LATENCY_ENABLED =
+                    media::BnAudioFlingerService::TRANSACTION_isBluetoothVariableLatencyEnabled,
+            SUPPORTS_BLUETOOTH_VARIABLE_LATENCY =
+                    media::BnAudioFlingerService::TRANSACTION_supportsBluetoothVariableLatency,
+            GET_SOUND_DOSE_INTERFACE = media::BnAudioFlingerService::TRANSACTION_getSoundDoseInterface,
+            INVALIDATE_TRACKS = media::BnAudioFlingerService::TRANSACTION_invalidateTracks,
+            GET_AUDIO_POLICY_CONFIG =
+                    media::BnAudioFlingerService::TRANSACTION_getAudioPolicyConfig,
+            GET_AUDIO_MIX_PORT = media::BnAudioFlingerService::TRANSACTION_getAudioMixPort,
+            SET_TRACKS_INTERNAL_MUTE = media::BnAudioFlingerService::TRANSACTION_setTracksInternalMute,
+            RESET_REFERENCES_FOR_TEST =
+                    media::BnAudioFlingerService::TRANSACTION_resetReferencesForTest,
         };
 
     protected:
@@ -617,11 +680,10 @@ public:
     Status setMasterBalance(float balance) override;
     Status getMasterBalance(float* _aidl_return) override;
     Status setStreamVolume(media::audio::common::AudioStreamType stream,
-                           float value, int32_t output) override;
+                           float value, bool muted, int32_t output) override;
     Status setStreamMute(media::audio::common::AudioStreamType stream, bool muted) override;
-    Status streamVolume(media::audio::common::AudioStreamType stream,
-                        int32_t output, float* _aidl_return) override;
-    Status streamMute(media::audio::common::AudioStreamType stream, bool* _aidl_return) override;
+    Status setPortsVolume(const std::vector<int32_t>& portIds, float volume, bool muted,
+                          int32_t output) override;
     Status setMode(media::audio::common::AudioMode mode) override;
     Status setMicMute(bool state) override;
     Status getMicMute(bool* _aidl_return) override;
@@ -643,7 +705,6 @@ public:
     Status openInput(const media::OpenInputRequest& request,
                      media::OpenInputResponse* _aidl_return) override;
     Status closeInput(int32_t input) override;
-    Status invalidateStream(media::audio::common::AudioStreamType stream) override;
     Status setVoiceVolume(float volume) override;
     Status getRenderPosition(int32_t output, media::RenderPosition* _aidl_return) override;
     Status getInputFramesLost(int32_t ioHandle, int32_t* _aidl_return) override;
@@ -664,17 +725,17 @@ public:
     Status getPrimaryOutputSamplingRate(int32_t* _aidl_return) override;
     Status getPrimaryOutputFrameCount(int64_t* _aidl_return) override;
     Status setLowRamDevice(bool isLowRamDevice, int64_t totalMemory) override;
-    Status getAudioPort(const media::AudioPort& port, media::AudioPort* _aidl_return) override;
-    Status createAudioPatch(const media::AudioPatch& patch, int32_t* _aidl_return) override;
+    Status getAudioPort(const media::AudioPortFw& port, media::AudioPortFw* _aidl_return) override;
+    Status createAudioPatch(const media::AudioPatchFw& patch, int32_t* _aidl_return) override;
     Status releaseAudioPatch(int32_t handle) override;
     Status listAudioPatches(int32_t maxCount,
-                            std::vector<media::AudioPatch>* _aidl_return) override;
-    Status setAudioPortConfig(const media::AudioPortConfig& config) override;
+                            std::vector<media::AudioPatchFw>* _aidl_return) override;
+    Status setAudioPortConfig(const media::AudioPortConfigFw& config) override;
     Status getAudioHwSyncForSession(int32_t sessionId, int32_t* _aidl_return) override;
     Status systemReady() override;
     Status audioPolicyReady() override;
     Status frameCountHAL(int32_t ioHandle, int64_t* _aidl_return) override;
-    Status getMicrophones(std::vector<media::MicrophoneInfoData>* _aidl_return) override;
+    Status getMicrophones(std::vector<media::MicrophoneInfoFw>* _aidl_return) override;
     Status setAudioHalPids(const std::vector<int32_t>& pids) override;
     Status setVibratorInfos(const std::vector<media::AudioVibratorInfo>& vibratorInfos) override;
     Status updateSecondaryOutputs(
@@ -684,10 +745,26 @@ public:
             std::vector<media::audio::common::AudioMMapPolicyInfo> *_aidl_return) override;
     Status getAAudioMixerBurstCount(int32_t* _aidl_return) override;
     Status getAAudioHardwareBurstMinUsec(int32_t* _aidl_return) override;
-    Status setDeviceConnectedState(const media::AudioPort& port, bool connected) override;
-    Status setRequestedLatencyMode(int output, media::LatencyMode mode) override;
+    Status setDeviceConnectedState(const media::AudioPortFw& port,
+                                   media::DeviceConnectedState state) override;
+    Status setSimulateDeviceConnections(bool enabled) override;
+    Status setRequestedLatencyMode(
+            int output, media::audio::common::AudioLatencyMode mode) override;
     Status getSupportedLatencyModes(int output,
-            std::vector<media::LatencyMode>* _aidl_return) override;
+            std::vector<media::audio::common::AudioLatencyMode>* _aidl_return) override;
+    Status setBluetoothVariableLatencyEnabled(bool enabled) override;
+    Status isBluetoothVariableLatencyEnabled(bool* enabled) override;
+    Status supportsBluetoothVariableLatency(bool* support) override;
+    Status getSoundDoseInterface(const sp<media::ISoundDoseCallback>& callback,
+                                 sp<media::ISoundDose>* _aidl_return) override;
+    Status invalidateTracks(const std::vector<int32_t>& portIds) override;
+    Status getAudioPolicyConfig(media::AudioPolicyConfig* _aidl_return) override;
+    Status getAudioMixPort(const media::AudioPortFw& devicePort,
+                           const media::AudioPortFw& mixPort,
+                           media::AudioPortFw* _aidl_return) override;
+    Status setTracksInternalMute(
+            const std::vector<media::TrackInternalMuteInfo>& tracksInternalMute) override;
+    Status resetReferencesForTest() override;
 private:
     const sp<AudioFlingerServerAdapter::Delegate> mDelegate;
 };

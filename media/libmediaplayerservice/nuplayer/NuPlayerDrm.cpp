@@ -22,14 +22,13 @@
 #include <mediadrm/DrmUtils.h>
 #include <utils/Log.h>
 
-
 namespace android {
 
 // static helpers - internal
 
 sp<IDrm> NuPlayerDrm::CreateDrm(status_t *pstatus)
 {
-    return DrmUtils::MakeDrm(pstatus);
+    return DrmUtils::MakeDrm(IDRM_NUPLAYER, pstatus);
 }
 
 sp<ICrypto> NuPlayerDrm::createCrypto(status_t *pstatus)
@@ -90,8 +89,8 @@ Vector<DrmUUID> NuPlayerDrm::parsePSSH(const void *pssh, size_t psshsize)
         drmSchemes.add(_uuid);
 
         ALOGV("ParsePSSH[%zu]: %s: %s", numentries,
-                _uuid.toHexString().string(),
-                DrmUUID::arrayToHex(data, datalen).string()
+                _uuid.toHexString().c_str(),
+                DrmUUID::arrayToHex(data, datalen).c_str()
              );
 
         numentries++;
@@ -168,7 +167,7 @@ void NuPlayerDrm::retrieveDrmInfo(const void *pssh, size_t psshsize, Parcel *par
     parcel->writeByteArray(psshsize, (const uint8_t*)pssh);
 
     ALOGV("retrieveDrmInfo: MEDIA_DRM_INFO  PSSH: size: %zu %s", psshsize,
-            DrmUUID::arrayToHex((uint8_t*)pssh, psshsize).string());
+            DrmUUID::arrayToHex((uint8_t*)pssh, psshsize).c_str());
 
     // 2) supportedDRMs
     Vector<DrmUUID> supportedDRMs = getSupportedDrmSchemes(pssh, psshsize);
@@ -178,7 +177,7 @@ void NuPlayerDrm::retrieveDrmInfo(const void *pssh, size_t psshsize, Parcel *par
         parcel->writeByteArray(DrmUUID::UUID_SIZE, uuid.ptr());
 
         ALOGV("retrieveDrmInfo: MEDIA_DRM_INFO  supportedScheme[%zu] %s", i,
-                uuid.toHexString().string());
+                uuid.toHexString().c_str());
     }
 }
 
@@ -191,8 +190,8 @@ NuPlayerDrm::CryptoInfo *NuPlayerDrm::makeCryptoInfo(
         uint8_t key[kBlockSize],
         uint8_t iv[kBlockSize],
         CryptoPlugin::Mode mode,
-        size_t *clearbytes,
-        size_t *encryptedbytes)
+        uint32_t *clearbytes,
+        uint32_t *encryptedbytes)
 {
     // size needed to store all the crypto data
     size_t cryptosize;
@@ -236,7 +235,7 @@ NuPlayerDrm::CryptoInfo *NuPlayerDrm::getSampleCryptoInfo(MetaDataBase &meta)
     if (!meta.findData(kKeyEncryptedSizes, &type, &crypteddata, &cryptedsize)) {
         return NULL;
     }
-    size_t numSubSamples = cryptedsize / sizeof(size_t);
+    size_t numSubSamples = cryptedsize / sizeof(uint32_t);
 
     if (numSubSamples <= 0) {
         ALOGE("getSampleCryptoInfo INVALID numSubSamples: %zu", numSubSamples);
@@ -285,8 +284,8 @@ NuPlayerDrm::CryptoInfo *NuPlayerDrm::getSampleCryptoInfo(MetaDataBase &meta)
             (uint8_t*) key,
             (uint8_t*) iv,
             (CryptoPlugin::Mode)mode,
-            (size_t*) cleardata,
-            (size_t*) crypteddata);
+            (uint32_t*) cleardata,
+            (uint32_t*) crypteddata);
 }
 
 }   // namespace android

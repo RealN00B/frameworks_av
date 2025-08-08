@@ -22,13 +22,21 @@ namespace android {
 class AudioPolicyTestManager : public AudioPolicyManager {
   public:
     explicit AudioPolicyTestManager(AudioPolicyClientInterface *clientInterface)
-            : AudioPolicyManager(clientInterface, true /*forTesting*/) { }
+            : AudioPolicyTestManager(AudioPolicyConfig::createDefault(), clientInterface) {}
+    AudioPolicyTestManager(const sp<const AudioPolicyConfig>& config,
+            AudioPolicyClientInterface *clientInterface,
+            std::string engineConfig = "")
+            : AudioPolicyManager(config,
+                    loadApmEngineLibraryAndCreateEngine(config->getEngineLibraryNameSuffix(),
+                                                        engineConfig),
+                    clientInterface) {}
     using AudioPolicyManager::getConfig;
-    using AudioPolicyManager::loadConfig;
     using AudioPolicyManager::initialize;
     using AudioPolicyManager::getOutputs;
+    using AudioPolicyManager::getInputs;
     using AudioPolicyManager::getAvailableOutputDevices;
     using AudioPolicyManager::getAvailableInputDevices;
+    using AudioPolicyManager::checkInputsForDevice;
     using AudioPolicyManager::setSurroundFormatEnabled;
     using AudioPolicyManager::releaseMsdOutputPatches;
     using AudioPolicyManager::setMsdOutputPatches;
@@ -38,7 +46,9 @@ class AudioPolicyTestManager : public AudioPolicyManager {
     using AudioPolicyManager::setDeviceConnectionState;
     using AudioPolicyManager::deviceToAudioPort;
     using AudioPolicyManager::handleDeviceConfigChange;
+    using AudioPolicyManager::getInputProfile;
     uint32_t getAudioPortGeneration() const { return mAudioPortGeneration; }
+    HwModuleCollection getHwModules() const { return mHwModules; }
 };
 
 }  // namespace android

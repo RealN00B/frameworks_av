@@ -25,6 +25,7 @@ const char *MEDIA_MIMETYPE_IMAGE_AVIF = "image/avif";
 const char *MEDIA_MIMETYPE_VIDEO_VP8 = "video/x-vnd.on2.vp8";
 const char *MEDIA_MIMETYPE_VIDEO_VP9 = "video/x-vnd.on2.vp9";
 const char *MEDIA_MIMETYPE_VIDEO_AV1 = "video/av01";
+const char *MEDIA_MIMETYPE_VIDEO_APV = "video/apv";
 const char *MEDIA_MIMETYPE_VIDEO_AVC = "video/avc";
 const char *MEDIA_MIMETYPE_VIDEO_HEVC = "video/hevc";
 const char *MEDIA_MIMETYPE_VIDEO_MPEG4 = "video/mp4v-es";
@@ -71,7 +72,10 @@ const char *MEDIA_MIMETYPE_AUDIO_MS_ADPCM = "audio/x-adpcm-ms";
 const char *MEDIA_MIMETYPE_AUDIO_DVI_IMA_ADPCM = "audio/x-adpcm-dvi-ima";
 const char *MEDIA_MIMETYPE_AUDIO_DTS = "audio/vnd.dts";
 const char *MEDIA_MIMETYPE_AUDIO_DTS_HD = "audio/vnd.dts.hd";
+const char *MEDIA_MIMETYPE_AUDIO_DTS_HD_MA = "audio/vnd.dts.hd;profile=dtsma";
 const char *MEDIA_MIMETYPE_AUDIO_DTS_UHD = "audio/vnd.dts.uhd";
+const char *MEDIA_MIMETYPE_AUDIO_DTS_UHD_P1 = "audio/vnd.dts.uhd;profile=p1";
+const char *MEDIA_MIMETYPE_AUDIO_DTS_UHD_P2 = "audio/vnd.dts.uhd;profile=p2";
 const char *MEDIA_MIMETYPE_AUDIO_EVRC = "audio/evrc";
 const char *MEDIA_MIMETYPE_AUDIO_EVRCB = "audio/evrcb";
 const char *MEDIA_MIMETYPE_AUDIO_EVRCWB = "audio/evrcwb";
@@ -120,6 +124,8 @@ const char *MEDIA_MIMETYPE_AUDIO_AAC_LATM_HE_V2 = "audio/mp4a-latm.29";
 const char *MEDIA_MIMETYPE_AUDIO_IEC61937 = "audio/x-iec61937";
 // Note: not in the IANA registry.
 const char *MEDIA_MIMETYPE_AUDIO_IEC60958 = "audio/x-iec60958";
+// Note: not in the IANA registry.
+const char *MEDIA_MIMETYPE_AUDIO_IAMF = "audio/iamf";
 
 const char *MEDIA_MIMETYPE_CONTAINER_MPEG4 = "video/mp4";
 const char *MEDIA_MIMETYPE_CONTAINER_WAV = "audio/x-wav";

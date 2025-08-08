@@ -15,12 +15,33 @@
  */
 
 //#define LOG_NDEBUG 0
+#define LOG_TAG "AudioTrackTests"
 
+#include <binder/ProcessState.h>
 #include <gtest/gtest.h>
 
 #include "audio_test_utils.h"
+#include "test_execution_tracer.h"
 
 using namespace android;
+
+// Test that the basic constructor returns an object that doesn't crash
+// on stop() or destruction.
+
+TEST(AudioTrackTestBasic, EmptyAudioTrack) {
+    AttributionSourceState attributionSource;
+    attributionSource.packageName = "AudioTrackTest";
+    attributionSource.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(getuid()));
+    attributionSource.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(getpid()));
+    attributionSource.token = sp<BBinder>::make();
+    const auto at = sp<AudioTrack>::make(attributionSource);
+
+    EXPECT_EQ(NO_INIT, at->initCheck());
+    EXPECT_EQ(true, at->stopped());
+
+    // ensure we do not crash.
+    at->stop();
+}
 
 TEST(AudioTrackTest, TestPlayTrack) {
     const auto ap = sp<AudioPlayback>::make(44100 /* sampleRate */, AUDIO_FORMAT_PCM_16_BIT,
@@ -136,18 +157,21 @@ TEST(AudioTrackTest, TestAudioCbNotifier) {
     EXPECT_EQ(OK, ap->start()) << "audio track start failed";
     EXPECT_EQ(OK, ap->onProcess());
     EXPECT_EQ(OK, cb->waitForAudioDeviceCb());
-    EXPECT_EQ(AUDIO_IO_HANDLE_NONE, cbOld->mAudioIo);
-    EXPECT_EQ(AUDIO_PORT_HANDLE_NONE, cbOld->mDeviceId);
-    EXPECT_NE(AUDIO_IO_HANDLE_NONE, cb->mAudioIo);
-    EXPECT_NE(AUDIO_PORT_HANDLE_NONE, cb->mDeviceId);
-    EXPECT_EQ(cb->mAudioIo, ap->getAudioTrackHandle()->getOutput());
-    EXPECT_EQ(cb->mDeviceId, ap->getAudioTrackHandle()->getRoutedDeviceId());
+    const auto [oldAudioIo, oldDeviceIds] = cbOld->getLastPortAndDevices();
+    EXPECT_EQ(AUDIO_IO_HANDLE_NONE, oldAudioIo);
+    EXPECT_TRUE(oldDeviceIds.empty());
+    const auto [audioIo, deviceIds] = cb->getLastPortAndDevices();
+    EXPECT_NE(AUDIO_IO_HANDLE_NONE, audioIo);
+    EXPECT_FALSE(deviceIds.empty());
+    EXPECT_EQ(audioIo, ap->getAudioTrackHandle()->getOutput());
+    DeviceIdVector routedDeviceIds = ap->getAudioTrackHandle()->getRoutedDeviceIds();
+    EXPECT_TRUE(areDeviceIdsEqual(routedDeviceIds, deviceIds));
     String8 keys;
     keys = ap->getAudioTrackHandle()->getParameters(keys);
-    if (!keys.isEmpty()) {
+    if (!keys.empty()) {
         std::cerr << "track parameters :: " << keys << std::endl;
     }
-    EXPECT_TRUE(checkPatchPlayback(cb->mAudioIo, cb->mDeviceId));
+    EXPECT_TRUE(checkPatchPlayback(audioIo, deviceIds));
     EXPECT_EQ(BAD_VALUE, ap->getAudioTrackHandle()->removeAudioDeviceCallback(nullptr));
     EXPECT_EQ(INVALID_OPERATION, ap->getAudioTrackHandle()->removeAudioDeviceCallback(cbOld));
     EXPECT_EQ(OK, ap->getAudioTrackHandle()->removeAudioDeviceCallback(cb));
@@ -209,3 +233,10 @@ INSTANTIATE_TEST_SUITE_P(
                                              AUDIO_OUTPUT_FLAG_RAW | AUDIO_OUTPUT_FLAG_FAST,
                                              AUDIO_OUTPUT_FLAG_DEEP_BUFFER),
                            ::testing::Values(AUDIO_SESSION_NONE)));
+
+int main(int argc, char** argv) {
+    android::ProcessState::self()->startThreadPool();
+    ::testing::InitGoogleTest(&argc, argv);
+    ::testing::UnitTest::GetInstance()->listeners().Append(new TestExecutionTracer());
+    return RUN_ALL_TESTS();
+}

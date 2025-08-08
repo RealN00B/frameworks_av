@@ -19,15 +19,19 @@
 
 #include <gtest/gtest.h>
 
+#include <android/content/AttributionSourceState.h>
+#include <android/hardware/ICameraService.h>
 #include <binder/ProcessState.h>
-#include <utils/Errors.h>
-#include <utils/Log.h>
+#include <camera/Camera.h>
+#include <camera/CameraMetadata.h>
+#include <camera/CameraParameters.h>
+#include <camera/CameraUtils.h>
+#include <camera/StringUtils.h>
+#include <gui/Flags.h>
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
-#include <camera/CameraParameters.h>
-#include <camera/CameraMetadata.h>
-#include <camera/Camera.h>
-#include <android/hardware/ICameraService.h>
+#include <utils/Errors.h>
+#include <utils/Log.h>
 
 using namespace android;
 using namespace android::hardware;
@@ -82,8 +86,11 @@ void CameraZSLTests::SetUp() {
     sp<IServiceManager> sm = defaultServiceManager();
     sp<IBinder> binder = sm->getService(String16("media.camera"));
     mCameraService = interface_cast<ICameraService>(binder);
+    AttributionSourceState clientAttribution;
+    clientAttribution.deviceId = kDefaultDeviceId;
     rc = mCameraService->getNumberOfCameras(
-            hardware::ICameraService::CAMERA_TYPE_ALL, &numCameras);
+            hardware::ICameraService::CAMERA_TYPE_ALL, clientAttribution, /*devicePolicy*/0,
+            &numCameras);
     EXPECT_TRUE(rc.isOk());
 
     mComposerClient = new SurfaceComposerClient;
@@ -108,7 +115,6 @@ void CameraZSLTests::notifyCallback(int32_t msgType, int32_t,
 
 void CameraZSLTests::dataCallback(int32_t msgType, const sp<IMemory>& /*data*/,
         camera_frame_metadata_t *) {
-
     switch (msgType) {
     case CAMERA_MSG_PREVIEW_FRAME: {
         Mutex::Autolock l(mPreviewLock);
@@ -126,7 +132,7 @@ void CameraZSLTests::dataCallback(int32_t msgType, const sp<IMemory>& /*data*/,
     default:
         ALOGV("%s: msgType: %d", __FUNCTION__, msgType);
     }
-};
+}
 
 status_t CameraZSLTests::waitForPreviewStart() {
     status_t rc = NO_ERROR;
@@ -169,7 +175,7 @@ TEST_F(CameraZSLTests, TestAllPictureSizes) {
         sp<SurfaceControl> surfaceControl;
         sp<ICamera> cameraDevice;
 
-        String16 cameraIdStr = String16(String8::format("%d", cameraId));
+        std::string cameraIdStr = std::to_string(cameraId);
         bool isSupported = false;
         rc = mCameraService->supportsCameraApi(cameraIdStr,
                 hardware::ICameraService::API_VERSION_1, &isSupported);
@@ -181,8 +187,11 @@ TEST_F(CameraZSLTests, TestAllPictureSizes) {
         }
 
         CameraMetadata metadata;
+        AttributionSourceState clientAttribution;
+        clientAttribution.deviceId = kDefaultDeviceId;
         rc = mCameraService->getCameraCharacteristics(cameraIdStr,
-                /*targetSdkVersion*/__ANDROID_API_FUTURE__, &metadata);
+                /*targetSdkVersion*/__ANDROID_API_FUTURE__, /*overrideToPortrait*/false,
+                clientAttribution, /*devicePolicy*/0, &metadata);
         if (!rc.isOk()) {
             // The test is relevant only for cameras with Hal 3.x
             // support.
@@ -206,10 +215,13 @@ TEST_F(CameraZSLTests, TestAllPictureSizes) {
             continue;
         }
 
+        clientAttribution.uid = hardware::ICameraService::USE_CALLING_UID;
+        clientAttribution.pid = hardware::ICameraService::USE_CALLING_PID;
+        clientAttribution.packageName = "ZSLTest";
         rc = mCameraService->connect(this, cameraId,
-                String16("ZSLTest"), hardware::ICameraService::USE_CALLING_UID,
-                hardware::ICameraService::USE_CALLING_PID,
-                /*targetSdkVersion*/__ANDROID_API_FUTURE__, &cameraDevice);
+                /*targetSdkVersion*/__ANDROID_API_FUTURE__,
+                /*overrideToPortrait*/false, /*forceSlowJpegMode*/false, clientAttribution,
+                /*devicePolicy*/0, &cameraDevice);
         EXPECT_TRUE(rc.isOk());
 
         CameraParameters params(cameraDevice->getParameters());
@@ -265,8 +277,11 @@ TEST_F(CameraZSLTests, TestAllPictureSizes) {
 
         previewSurface = surfaceControl->getSurface();
         ASSERT_TRUE(previewSurface != NULL);
-        ASSERT_EQ(NO_ERROR, cameraDevice->setPreviewTarget(
-                previewSurface->getIGraphicBufferProducer()));
+        ASSERT_EQ(NO_ERROR, cameraDevice->setPreviewTarget(previewSurface
+#if !WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+                                                                   ->getIGraphicBufferProducer()
+#endif
+                                                                   ));
 
         cameraDevice->setPreviewCallbackFlag(
                 CAMERA_FRAME_CALLBACK_FLAG_CAMCORDER);

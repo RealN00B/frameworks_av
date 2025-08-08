@@ -57,14 +57,21 @@ void AudioPort::importAudioPort(const sp<AudioPort>& port, bool force __unused)
 
 void AudioPort::importAudioPort(const audio_port_v7 &port) {
     for (size_t i = 0; i < port.num_audio_profiles; ++i) {
+        if (port.audio_profiles[i].format == AUDIO_FORMAT_DEFAULT) {
+            // The dynamic format from AudioPort should not be AUDIO_FORMAT_DEFAULT.
+            continue;
+        }
         sp<AudioProfile> profile = new AudioProfile(port.audio_profiles[i].format,
                 ChannelMaskSet(port.audio_profiles[i].channel_masks,
                         port.audio_profiles[i].channel_masks +
-                        port.audio_profiles->num_channel_masks),
+                        port.audio_profiles[i].num_channel_masks),
                 SampleRateSet(port.audio_profiles[i].sample_rates,
                         port.audio_profiles[i].sample_rates +
                         port.audio_profiles[i].num_sample_rates),
                 port.audio_profiles[i].encapsulation_type);
+        profile->setDynamicFormat(true);
+        profile->setDynamicChannels(true);
+        profile->setDynamicRate(true);
         if (!mProfiles.contains(profile)) {
             addAudioProfile(profile);
         }
@@ -185,7 +192,8 @@ void AudioPort::dump(std::string *dst, int spaces, const char* extraInfo, bool v
                 dst->append(
                         base::StringPrintf("%*s extra audio descriptor %zu:\n", eadSpaces, "", i));
                 dst->append(base::StringPrintf(
-                    "%*s- standard: %u\n", descSpaces, "", mExtraAudioDescriptors[i].standard));
+                        "%*s- standard: %u\n", descSpaces, "",
+                        static_cast<unsigned>(mExtraAudioDescriptors[i].standard)));
                 dst->append(base::StringPrintf("%*s- descriptor:", descSpaces, ""));
                 for (auto v : mExtraAudioDescriptors[i].audioDescriptor) {
                     dst->append(base::StringPrintf(" %02x", v));
@@ -222,7 +230,7 @@ bool AudioPort::equals(const sp<AudioPort> &other) const
            mExtraAudioDescriptors == other->getExtraAudioDescriptors();
 }
 
-status_t AudioPort::writeToParcelable(media::AudioPort* parcelable) const {
+status_t AudioPort::writeToParcelable(media::AudioPortFw* parcelable) const {
     parcelable->hal.name = mName;
     parcelable->sys.type = VALUE_OR_RETURN_STATUS(
             legacy2aidl_audio_port_type_t_AudioPortType(mType));
@@ -249,7 +257,7 @@ status_t AudioPort::writeToParcelable(media::AudioPort* parcelable) const {
     return OK;
 }
 
-status_t AudioPort::readFromParcelable(const media::AudioPort& parcelable) {
+status_t AudioPort::readFromParcelable(const media::AudioPortFw& parcelable) {
     mName = parcelable.hal.name;
     mType = VALUE_OR_RETURN_STATUS(
             aidl2legacy_AudioPortType_audio_port_type_t(parcelable.sys.type));

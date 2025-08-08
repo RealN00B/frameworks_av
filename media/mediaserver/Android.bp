@@ -1,4 +1,3 @@
-
 package {
     default_applicable_licenses: ["frameworks_av_media_mediaserver_license"],
 }
@@ -52,8 +51,15 @@ soong_config_module_type {
     ],
 }
 
+vintf_fragment {
+    name: "manifest_media_c2_software.xml",
+    src: "manifest_media_c2_software.xml",
+}
+
 mediaserver_cc_binary {
     name: "mediaserver",
+
+    defaults: ["libcodec2_hal_selection"],
 
     srcs: ["main_mediaserver.cpp"],
 
@@ -62,6 +68,7 @@ mediaserver_cc_binary {
         "libicu",
         "libfmq",
         "libbinder",
+        "libbinder_ndk",
         "libhidlbase",
         "liblog",
         "libmediaplayerservice",
@@ -86,7 +93,7 @@ mediaserver_cc_binary {
         "-Wall",
     ],
 
-    vintf_fragments: ["manifest_media_c2_software.xml"],
+    vintf_fragment_modules: ["manifest_media_c2_software.xml"],
 
     soong_config_variables: {
         TARGET_DYNAMIC_64_32_MEDIASERVER: {

@@ -19,14 +19,17 @@
 
 #include <algorithm>
 #include <functional>
+#include <vector>
 #include <stdint.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <android/media/audio/common/AudioMMapPolicyInfo.h>
 #include <utils/Errors.h>
 #include <system/audio.h>
 
 #include "aaudio/AAudio.h"
+#include "aaudio/AAudioTesting.h"
 
 /**
  * Convert an AAudio result into the closest matching Android status.
@@ -62,6 +65,7 @@ audio_format_t AAudioConvert_aaudioToAndroidDataFormat(aaudio_format_t aaudio_fo
 
 aaudio_format_t AAudioConvert_androidToAAudioDataFormat(audio_format_t format);
 
+aaudio_format_t AAudioConvert_androidToNearestAAudioDataFormat(audio_format_t format);
 
 /**
  * Note that this function does not validate the passed in value.
@@ -90,10 +94,11 @@ audio_source_t AAudioConvert_inputPresetToAudioSource(aaudio_input_preset_t pres
  * That is done somewhere else.
  * @return internal audio flags mask
  */
-audio_flags_mask_t AAudioConvert_allowCapturePolicyToAudioFlagsMask(
+audio_flags_mask_t AAudio_computeAudioFlagsMask(
         aaudio_allowed_capture_policy_t policy,
         aaudio_spatialization_behavior_t spatializationBehavior,
-        bool isContentSpatialized);
+        bool isContentSpatialized,
+        audio_output_flags_t outputFlags);
 
 audio_flags_mask_t AAudioConvert_privacySensitiveToAudioFlagsMask(
         bool privacySensitive);
@@ -342,5 +347,32 @@ enum {
     AAUDIO_CHANNEL_INDEX_MASK_23 = AAUDIO_CHANNEL_BIT_INDEX | (1 << 23) - 1,
     AAUDIO_CHANNEL_INDEX_MASK_24 = AAUDIO_CHANNEL_BIT_INDEX | (1 << 24) - 1,
 };
+
+/**
+ * Returns the aaudio mmap policy based on the vector of mmap policy info. The rule as
+ * 1. Returns AUTO if any of the policy is AUTO or ALWAYS
+ * 2. Returns NEVER if all of the policies are NEVER or UNSPECIFIED
+ * 3. Returns default policy if all of the policies are UNSPECIFIED
+ *
+ * @param policyInfos
+ * @param defaultPolicy
+ * @return
+ */
+aaudio_policy_t AAudio_getAAudioPolicy(
+        const std::vector<android::media::audio::common::AudioMMapPolicyInfo>& policyInfos,
+        android::media::audio::common::AudioMMapPolicy defaultPolicy =
+                android::media::audio::common::AudioMMapPolicy::NEVER);
+
+/**
+ * Convert the aaudio device type to android device type. Returns AUDIO_DEVICE_NONE if
+ * the given device is not a valid one.
+ */
+audio_devices_t AAudioConvert_aaudioToAndroidDeviceType(
+        AAudio_DeviceType device, aaudio_direction_t direction);
+
+aaudio_policy_t AAudioConvert_androidToAAudioMMapPolicy(
+        android::media::audio::common::AudioMMapPolicy policy);
+
+bool AAudio_isCompressedFormat(audio_format_t format);
 
 #endif //UTILITY_AAUDIO_UTILITIES_H

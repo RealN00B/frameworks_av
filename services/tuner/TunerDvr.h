@@ -61,6 +61,7 @@ public:
     ::ndk::ScopedAStatus stop() override;
     ::ndk::ScopedAStatus flush() override;
     ::ndk::ScopedAStatus close() override;
+    ::ndk::ScopedAStatus setStatusCheckIntervalHint(int64_t in_milliseconds) override;
 
     struct DvrCallback : public BnDvrCallback {
         DvrCallback(const shared_ptr<ITunerDvrCallback> tunerDvrCallback)
@@ -76,6 +77,7 @@ public:
 private:
     shared_ptr<IDvr> mDvr;
     DvrType mType;
+    bool isClosed = false;
 };
 
 }  // namespace tuner

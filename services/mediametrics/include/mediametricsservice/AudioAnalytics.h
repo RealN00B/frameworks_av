@@ -67,11 +67,12 @@ public:
      * different locks, so may not be 100% consistent with the last data
      * delivered.
      *
+     * \param details dumps the detailed internal state.
      * \param lines the maximum number of lines in the string returned.
      * \param sinceNs the nanoseconds since Unix epoch to start dump (0 shows all)
      * \param prefix the desired key prefix to match (nullptr shows all)
      */
-    std::pair<std::string, int32_t> dump(
+    std::pair<std::string, int32_t> dump(bool details,
             int32_t lines = INT32_MAX, int64_t sinceNs = 0, const char *prefix = nullptr) const;
 
     /**
@@ -362,6 +363,20 @@ private:
         std::map<std::string, DeviceState> mDeviceStateMap GUARDED_BY(mLock);
         SimpleLog mSimpleLog GUARDED_BY(mLock) {64};
     } mSpatializer{*this};
+
+    // MidiLogging collects info whenever a MIDI device is closed.
+    class MidiLogging {
+    public:
+        explicit MidiLogging(AudioAnalytics &audioAnalytics)
+            : mAudioAnalytics(audioAnalytics) {}
+
+        void onEvent(
+                const std::shared_ptr<const android::mediametrics::Item> &item) const;
+
+    private:
+
+        AudioAnalytics &mAudioAnalytics;
+    } mMidiLogging{*this};
 
     AudioPowerUsage mAudioPowerUsage;
 };

@@ -17,6 +17,7 @@
 #ifndef ANDROID_SERVERS_CAMERA3_STREAM_INTERFACE_H
 #define ANDROID_SERVERS_CAMERA3_STREAM_INTERFACE_H
 
+#include <gui/Flags.h>
 #include <utils/RefBase.h>
 
 #include <camera/camera2/OutputConfiguration.h>
@@ -62,11 +63,12 @@ typedef struct camera_stream {
     uint32_t max_buffers;
     android_dataspace_t data_space;
     camera_stream_rotation_t rotation;
-    const char* physical_camera_id;
+    std::string physical_camera_id;
 
     std::unordered_set<int32_t> sensor_pixel_modes_used;
     int64_t dynamic_range_profile;
     int64_t use_case;
+    int32_t color_space;
 } camera_stream_t;
 
 typedef struct camera_stream_buffer {
@@ -113,21 +115,28 @@ class OutputStreamInfo {
         int64_t dynamicRangeProfile;
         int64_t streamUseCase;
         int timestampBase;
-        int mirrorMode;
+        int32_t colorSpace;
         OutputStreamInfo() :
             width(-1), height(-1), format(-1), dataSpace(HAL_DATASPACE_UNKNOWN),
             consumerUsage(0),
             dynamicRangeProfile(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD),
             streamUseCase(ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT),
             timestampBase(OutputConfiguration::TIMESTAMP_BASE_DEFAULT),
-            mirrorMode(OutputConfiguration::MIRROR_MODE_AUTO) {}
+            colorSpace(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED) {}
         OutputStreamInfo(int _width, int _height, int _format, android_dataspace _dataSpace,
                 uint64_t _consumerUsage, const std::unordered_set<int32_t>& _sensorPixelModesUsed,
-                int64_t _dynamicRangeProfile, int _streamUseCase, int _timestampBase, int _mirrorMode) :
+                int64_t _dynamicRangeProfile, int _streamUseCase, int _timestampBase,
+                int32_t _colorSpace) :
             width(_width), height(_height), format(_format),
             dataSpace(_dataSpace), consumerUsage(_consumerUsage),
             sensorPixelModesUsed(_sensorPixelModesUsed), dynamicRangeProfile(_dynamicRangeProfile),
-            streamUseCase(_streamUseCase), timestampBase(_timestampBase), mirrorMode(_mirrorMode) {}
+            streamUseCase(_streamUseCase), timestampBase(_timestampBase), colorSpace(_colorSpace) {}
+};
+
+// A holder containing a surface and its corresponding mirroring mode
+struct SurfaceHolder {
+    sp<Surface> mSurface;
+    int mMirrorMode = OutputConfiguration::MIRROR_MODE_AUTO;
 };
 
 // Utility class to lock and unlock a GraphicBuffer
@@ -206,6 +215,7 @@ class Camera3StreamInterface : public virtual RefBase {
     virtual int      getFormat() const = 0;
     virtual int64_t  getDynamicRangeProfile() const = 0;
     virtual android_dataspace getDataSpace() const = 0;
+    virtual int32_t getColorSpace() const = 0;
     virtual void setFormatOverride(bool formatOverriden) = 0;
     virtual bool isFormatOverridden() const = 0;
     virtual int getOriginalFormat() const = 0;
@@ -389,11 +399,6 @@ class Camera3StreamInterface : public virtual RefBase {
          */
         std::vector<size_t> surface_ids;
     };
-    /**
-     * Similar to getBuffer() except this method fills multiple buffers.
-     */
-    virtual status_t getBuffers(std::vector<OutstandingBuffer>* buffers,
-            nsecs_t waitBufferTimeout) = 0;
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -434,12 +439,14 @@ class Camera3StreamInterface : public virtual RefBase {
      */
     virtual status_t returnInputBuffer(const camera_stream_buffer &buffer) = 0;
 
+#if !WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
     /**
      * Get the buffer producer of the input buffer queue.
      *
      * This method only applies to input streams.
      */
     virtual status_t getInputBufferProducer(sp<IGraphicBufferProducer> *producer) = 0;
+#endif
 
     /**
      * Whether any of the stream's buffers are currently in use by the HAL,
@@ -478,7 +485,7 @@ class Camera3StreamInterface : public virtual RefBase {
     /**
      * Debug dump of the stream's state.
      */
-    virtual void     dump(int fd, const Vector<String16> &args) const = 0;
+    virtual void     dump(int fd, const Vector<String16> &args) = 0;
 
     virtual void     addBufferListener(
             wp<Camera3StreamBufferListener> listener) = 0;

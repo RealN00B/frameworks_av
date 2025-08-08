@@ -21,9 +21,9 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 
 #include <utils/RefBase.h>
-#include <utils/String8.h>
 #include <utils/Timers.h>
 
 #include <media/RingBuffer.h>
@@ -42,7 +42,7 @@ class TagMonitor {
   public:
 
     // Monitor argument
-    static const String16 kMonitorOption;
+    static const std::string kMonitorOption;
 
     enum eventSource {
         REQUEST,
@@ -59,7 +59,7 @@ class TagMonitor {
     // If invalid, do nothing.
     // Recognizes "3a" as a shortcut for enabling tracking 3A state, mode, and
     // triggers
-    void parseTagsToMonitor(String8 tagNames);
+    void parseTagsToMonitor(std::string tagNames);
 
     // Disable monitoring; does not clear the event log
     void disableMonitoring();
@@ -85,12 +85,8 @@ class TagMonitor {
     // function.
     void dumpMonitoredTagEventsToVectorLocked(std::vector<std::string> &out);
 
-    static String8 getEventDataString(const uint8_t *data_ptr,
-                                       uint32_t tag, int type,
-                                       int count,
-                                       int indentation,
-                                       const std::unordered_set<int32_t> &outputStreamIds,
-                                       int32_t inputStreamId);
+    static std::string getEventDataString(const uint8_t* data_ptr, uint32_t tag, int type,
+            int count, int indentation);
 
     void monitorSingleMetadata(TagMonitor::eventSource source, int64_t frameNumber,
             nsecs_t timestamp, const std::string& cameraId, uint32_t tag,
@@ -128,12 +124,15 @@ class TagMonitor {
         eventSource source;
         uint32_t frameNumber;
         nsecs_t timestamp;
+        std::string cameraId;
         uint32_t tag;
         uint8_t type;
         std::vector<uint8_t> newData;
-        std::string cameraId;
+        // NOTE: We want to print changes to outputStreamIds and inputStreamId in their own lines.
+        // So any MonitorEvent where these fields are not the default value will have garbage
+        // values for all fields other than source, frameNumber, timestamp, and cameraId.
         std::unordered_set<int32_t> outputStreamIds;
-        int32_t inputStreamId = 1;
+        int32_t inputStreamId = -1;
     };
 
     // A ring buffer for tracking the last kMaxMonitorEvents metadata changes

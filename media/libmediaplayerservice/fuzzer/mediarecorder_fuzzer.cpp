@@ -15,17 +15,23 @@
  *
  */
 
-#include <media/stagefright/foundation/AString.h>
-#include "fuzzer/FuzzedDataProvider.h"
-
+#include <AudioFlinger.h>
+#include <MediaPlayerService.h>
+#include <ResourceManagerService.h>
 #include <StagefrightRecorder.h>
 #include <camera/Camera.h>
 #include <camera/android/hardware/ICamera.h>
+#include <fakeservicemanager/FakeServiceManager.h>
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/Surface.h>
+#include <gui/Flags.h>
 #include <gui/SurfaceComposerClient.h>
 #include <media/stagefright/PersistentSurface.h>
+#include <media/stagefright/foundation/AString.h>
+#include <mediametricsservice/MediaMetricsService.h>
 #include <thread>
+#include "CameraService.h"
+#include "fuzzer/FuzzedDataProvider.h"
 
 using namespace std;
 using namespace android;
@@ -41,31 +47,26 @@ constexpr audio_source_t kSupportedAudioSources[] = {
     AUDIO_SOURCE_VOICE_RECOGNITION, AUDIO_SOURCE_VOICE_COMMUNICATION,
     AUDIO_SOURCE_REMOTE_SUBMIX,     AUDIO_SOURCE_UNPROCESSED,
     AUDIO_SOURCE_VOICE_PERFORMANCE, AUDIO_SOURCE_ECHO_REFERENCE,
-    AUDIO_SOURCE_FM_TUNER,          AUDIO_SOURCE_HOTWORD};
+    AUDIO_SOURCE_FM_TUNER,          AUDIO_SOURCE_HOTWORD,
+    AUDIO_SOURCE_ULTRASOUND};
+
+constexpr output_format kOutputFormat[] = {
+        OUTPUT_FORMAT_DEFAULT,        OUTPUT_FORMAT_THREE_GPP,
+        OUTPUT_FORMAT_MPEG_4,         OUTPUT_FORMAT_AUDIO_ONLY_START,
+        OUTPUT_FORMAT_RAW_AMR,        OUTPUT_FORMAT_AMR_NB,
+        OUTPUT_FORMAT_AMR_WB,         OUTPUT_FORMAT_AAC_ADTS,
+        OUTPUT_FORMAT_AUDIO_ONLY_END, OUTPUT_FORMAT_RTP_AVP,
+        OUTPUT_FORMAT_MPEG2TS,        OUTPUT_FORMAT_WEBM,
+        OUTPUT_FORMAT_HEIF,           OUTPUT_FORMAT_OGG,
+        OUTPUT_FORMAT_LIST_END};
+
+constexpr video_encoder kVideoEncoder[] = {
+        VIDEO_ENCODER_DEFAULT,      VIDEO_ENCODER_H263, VIDEO_ENCODER_H264,
+        VIDEO_ENCODER_MPEG_4_SP,    VIDEO_ENCODER_VP8,  VIDEO_ENCODER_HEVC,
+        VIDEO_ENCODER_DOLBY_VISION, VIDEO_ENCODER_AV1,  VIDEO_ENCODER_LIST_END};
 
 constexpr audio_microphone_direction_t kSupportedMicrophoneDirections[] = {
     MIC_DIRECTION_UNSPECIFIED, MIC_DIRECTION_FRONT, MIC_DIRECTION_BACK, MIC_DIRECTION_EXTERNAL};
-
-struct RecordingConfig {
-    output_format outputFormat;
-    audio_encoder audioEncoder;
-    video_encoder videoEncoder;
-};
-
-const struct RecordingConfig kRecordingConfigList[] = {
-    {OUTPUT_FORMAT_AMR_NB, AUDIO_ENCODER_AMR_NB, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_AMR_WB, AUDIO_ENCODER_AMR_WB, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_AAC_ADTS, AUDIO_ENCODER_AAC, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_AAC_ADTS, AUDIO_ENCODER_HE_AAC, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_AAC_ADTS, AUDIO_ENCODER_AAC_ELD, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_OGG, AUDIO_ENCODER_OPUS, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_RTP_AVP, AUDIO_ENCODER_DEFAULT, VIDEO_ENCODER_DEFAULT},
-    {OUTPUT_FORMAT_MPEG2TS, AUDIO_ENCODER_AAC, VIDEO_ENCODER_H264},
-    {OUTPUT_FORMAT_WEBM, AUDIO_ENCODER_VORBIS, VIDEO_ENCODER_VP8},
-    {OUTPUT_FORMAT_THREE_GPP, AUDIO_ENCODER_DEFAULT, VIDEO_ENCODER_MPEG_4_SP},
-    {OUTPUT_FORMAT_MPEG_4, AUDIO_ENCODER_AAC, VIDEO_ENCODER_H264},
-    {OUTPUT_FORMAT_MPEG_4, AUDIO_ENCODER_DEFAULT, VIDEO_ENCODER_MPEG_4_SP},
-    {OUTPUT_FORMAT_MPEG_4, AUDIO_ENCODER_DEFAULT, VIDEO_ENCODER_HEVC}};
 
 const string kParametersList[] = {"max-duration",
                                   "max-filesize",
@@ -99,21 +100,23 @@ const string kParametersList[] = {"max-duration",
                                   "rtp-param-ext-cvo-degrees",
                                   "video-param-request-i-frame",
                                   "rtp-param-set-socket-dscp",
-                                  "rtp-param-set-socket-network"};
+                                  "rtp-param-set-socket-network",
+                                  "rtp-param-set-socket-ecn",
+                                  "rtp-param-remote-ip",
+                                  "rtp-param-set-socket-network",
+                                  "log-session-id"};
 
-constexpr int32_t kMaxSleepTimeInMs = 100;
-constexpr int32_t kMinSleepTimeInMs = 0;
 constexpr int32_t kMinVideoSize = 2;
 constexpr int32_t kMaxVideoSize = 8192;
-constexpr int32_t kNumRecordMin = 1;
-constexpr int32_t kNumRecordMax = 10;
+const char kOutputFile[] = "OutputFile";
+const char kNextOutputFile[] = "NextOutputFile";
 
 class TestAudioDeviceCallback : public AudioSystem::AudioDeviceCallback {
    public:
     virtual ~TestAudioDeviceCallback() = default;
 
     void onAudioDeviceUpdate(audio_io_handle_t /*audioIo*/,
-                             audio_port_handle_t /*deviceId*/) override{};
+                             const DeviceIdVector& /*deviceIds*/) override{};
 };
 
 class TestCamera : public ICamera {
@@ -124,14 +127,9 @@ class TestCamera : public ICamera {
     status_t connect(const sp<ICameraClient> & /*client*/) override { return 0; };
     status_t lock() override { return 0; };
     status_t unlock() override { return 0; };
-    status_t setPreviewTarget(const sp<IGraphicBufferProducer> & /*bufferProducer*/) override {
-        return 0;
-    };
+    status_t setPreviewTarget(const sp<SurfaceType> & /*target*/) override { return 0; };
+    status_t setPreviewCallbackTarget(const sp<SurfaceType> & /*target*/) override { return 0; };
     void setPreviewCallbackFlag(int /*flag*/) override{};
-    status_t setPreviewCallbackTarget(
-        const sp<IGraphicBufferProducer> & /*callbackProducer*/) override {
-        return 0;
-    };
     status_t startPreview() override { return 0; };
     void stopPreview() override{};
     bool previewEnabled() override { return true; };
@@ -150,9 +148,7 @@ class TestCamera : public ICamera {
         return 0;
     };
     status_t setVideoBufferMode(int32_t /*videoBufferMode*/) override { return 0; };
-    status_t setVideoTarget(const sp<IGraphicBufferProducer> & /*bufferProducer*/) override {
-        return 0;
-    };
+    status_t setVideoTarget(const sp<SurfaceType> & /*target*/) override { return 0; };
     status_t setAudioRestriction(int32_t /*mode*/) override { return 0; };
     int32_t getGlobalAudioRestriction() override { return 0; };
     IBinder *onAsBinder() override { return reinterpret_cast<IBinder *>(this); };
@@ -189,11 +185,10 @@ void MediaRecorderClientFuzzer::getConfig() {
     int32_t max;
     mStfRecorder->getMaxAmplitude(&max);
 
-    int32_t deviceId = mFdp.ConsumeIntegral<int32_t>();
-    mStfRecorder->setInputDevice(deviceId);
-    mStfRecorder->getRoutedDeviceId(&deviceId);
+    DeviceIdVector deviceIds;
+    mStfRecorder->getRoutedDeviceIds(deviceIds);
 
-    vector<android::media::MicrophoneInfo> activeMicrophones{};
+    vector<android::media::MicrophoneInfoFw> activeMicrophones{};
     mStfRecorder->getActiveMicrophones(&activeMicrophones);
 
     int32_t portId;
@@ -208,101 +203,205 @@ void MediaRecorderClientFuzzer::getConfig() {
     sp<IGraphicBufferProducer> buffer = mStfRecorder->querySurfaceMediaSource();
 }
 
-void MediaRecorderClientFuzzer::dumpInfo() {
-    int32_t dumpFd = memfd_create("DumpFile", MFD_ALLOW_SEALING);
-    Vector<String16> args;
-    args.push_back(String16(mFdp.ConsumeRandomLengthString().c_str()));
-    mStfRecorder->dump(dumpFd, args);
-    close(dumpFd);
-}
-
-void MediaRecorderClientFuzzer::setConfig() {
-    mStfRecorder->setOutputFile(mMediaRecorderOutputFd);
-    mStfRecorder->setAudioSource(mFdp.PickValueInArray(kSupportedAudioSources));
-    mStfRecorder->setVideoSource(mFdp.PickValueInArray(kSupportedVideoSources));
-    mStfRecorder->setPreferredMicrophoneDirection(
-        mFdp.PickValueInArray(kSupportedMicrophoneDirections));
-    mStfRecorder->setPrivacySensitive(mFdp.ConsumeBool());
-    bool isPrivacySensitive;
-    mStfRecorder->isPrivacySensitive(&isPrivacySensitive);
-    mStfRecorder->setVideoSize(mFdp.ConsumeIntegralInRange<int32_t>(kMinVideoSize, kMaxVideoSize),
-                               mFdp.ConsumeIntegralInRange<int32_t>(kMinVideoSize, kMaxVideoSize));
-    mStfRecorder->setVideoFrameRate(mFdp.ConsumeIntegral<int32_t>());
-    mStfRecorder->enableAudioDeviceCallback(mFdp.ConsumeBool());
-    mStfRecorder->setPreferredMicrophoneFieldDimension(mFdp.ConsumeFloatingPoint<float>());
-    mStfRecorder->setClientName(String16(mFdp.ConsumeRandomLengthString().c_str()));
-
-    int32_t Idx = mFdp.ConsumeIntegralInRange<int32_t>(0, size(kRecordingConfigList) - 1);
-    mStfRecorder->setOutputFormat(kRecordingConfigList[Idx].outputFormat);
-    mStfRecorder->setAudioEncoder(kRecordingConfigList[Idx].audioEncoder);
-    mStfRecorder->setVideoEncoder(kRecordingConfigList[Idx].videoEncoder);
-
-    int32_t nextOutputFd = memfd_create("NextOutputFile", MFD_ALLOW_SEALING);
-    mStfRecorder->setNextOutputFile(nextOutputFd);
-    close(nextOutputFd);
-
-    for (Idx = 0; Idx < size(kParametersList); ++Idx) {
-        if (mFdp.ConsumeBool()) {
-            int32_t value = mFdp.ConsumeIntegral<int32_t>();
-            mStfRecorder->setParameters(
-                String8((kParametersList[Idx] + "=" + to_string(value)).c_str()));
-        }
+template <typename FuncWrapper>
+void callMediaAPI(FuncWrapper funcWrapper, FuzzedDataProvider* fdp) {
+    if (fdp->ConsumeBool()) {
+        funcWrapper();
     }
 }
 
-MediaRecorderClientFuzzer::MediaRecorderClientFuzzer(const uint8_t *data, size_t size)
-    : mFdp(data, size), mMediaRecorderOutputFd(memfd_create("OutputFile", MFD_ALLOW_SEALING)) {
+void MediaRecorderClientFuzzer::setConfig() {
+    callMediaAPI(
+            [this]() {
+                mSurfaceControl = mComposerClient.createSurface(
+                        String8(mFdp.ConsumeRandomLengthString().c_str()) /* name */,
+                        mFdp.ConsumeIntegral<uint32_t>() /* width */,
+                        mFdp.ConsumeIntegral<uint32_t>() /* height */,
+                        mFdp.ConsumeIntegral<int32_t>() /* pixel-format */,
+                        mFdp.ConsumeIntegral<int32_t>() /* flags */);
+                if (mSurfaceControl) {
+                    mSurface = mSurfaceControl->getSurface();
+                    mStfRecorder->setPreviewSurface(mSurface->getIGraphicBufferProducer());
+                }
+            },
+            &mFdp);
+
+    callMediaAPI([this]() { mStfRecorder->setInputDevice(mFdp.ConsumeIntegral<int32_t>()); },
+                 &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                sp<TestMediaRecorderClient> listener = sp<TestMediaRecorderClient>::make();
+                mStfRecorder->setListener(listener);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                sp<TestCamera> testCamera = sp<TestCamera>::make();
+                sp<Camera> camera = Camera::create(testCamera);
+                mStfRecorder->setCamera(camera->remote(), camera->getRecordingProxy());
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                sp<PersistentSurface> persistentSurface = sp<PersistentSurface>::make();
+                mStfRecorder->setInputSurface(persistentSurface);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                sp<TestAudioDeviceCallback> callback = sp<TestAudioDeviceCallback>::make();
+                mStfRecorder->setAudioDeviceCallback(callback);
+                mStfRecorder->setOutputFile(mMediaRecorderOutputFd);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setAudioSource(mFdp.PickValueInArray(kSupportedAudioSources));
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setVideoSource(mFdp.PickValueInArray(kSupportedVideoSources));
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setPreferredMicrophoneDirection(
+                        mFdp.PickValueInArray(kSupportedMicrophoneDirections));
+            },
+            &mFdp);
+
+    callMediaAPI([this]() { mStfRecorder->setPrivacySensitive(mFdp.ConsumeBool()); }, &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                bool isPrivacySensitive;
+                mStfRecorder->isPrivacySensitive(&isPrivacySensitive);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setVideoSize(mFdp.ConsumeIntegralInRange<int32_t>(
+                                                   kMinVideoSize, kMaxVideoSize) /* width */,
+                                           mFdp.ConsumeIntegralInRange<int32_t>(
+                                                   kMinVideoSize, kMaxVideoSize) /* height */);
+            },
+            &mFdp);
+
+    callMediaAPI([this]() { mStfRecorder->setVideoFrameRate(mFdp.ConsumeIntegral<int32_t>()); },
+                 &mFdp);
+
+    callMediaAPI([this]() { mStfRecorder->enableAudioDeviceCallback(mFdp.ConsumeBool()); }, &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setPreferredMicrophoneFieldDimension(
+                        mFdp.ConsumeFloatingPoint<float>());
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                mStfRecorder->setClientName(String16(mFdp.ConsumeRandomLengthString().c_str()));
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                output_format OutputFormat = mFdp.PickValueInArray(kOutputFormat);
+                audio_encoder AudioEncoderFormat =
+                        (audio_encoder)mFdp.ConsumeIntegralInRange<int32_t>(AUDIO_ENCODER_DEFAULT,
+                                                                            AUDIO_ENCODER_LIST_END);
+                video_encoder VideoEncoderFormat = mFdp.PickValueInArray(kVideoEncoder);
+                if (OutputFormat == OUTPUT_FORMAT_AMR_NB) {
+                    AudioEncoderFormat =
+                            mFdp.ConsumeBool() ? AUDIO_ENCODER_DEFAULT : AUDIO_ENCODER_AMR_NB;
+                } else if (OutputFormat == OUTPUT_FORMAT_AMR_WB) {
+                    AudioEncoderFormat = AUDIO_ENCODER_AMR_WB;
+                } else if (OutputFormat == OUTPUT_FORMAT_AAC_ADIF ||
+                           OutputFormat == OUTPUT_FORMAT_AAC_ADTS ||
+                           OutputFormat == OUTPUT_FORMAT_MPEG2TS) {
+                    AudioEncoderFormat = (audio_encoder)mFdp.ConsumeIntegralInRange<int32_t>(
+                            AUDIO_ENCODER_AAC, AUDIO_ENCODER_AAC_ELD);
+                    if (OutputFormat == OUTPUT_FORMAT_MPEG2TS) {
+                        VideoEncoderFormat = VIDEO_ENCODER_H264;
+                    }
+                }
+                mStfRecorder->setOutputFormat(OutputFormat);
+                mStfRecorder->setAudioEncoder(AudioEncoderFormat);
+                mStfRecorder->setVideoEncoder(VideoEncoderFormat);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                int32_t nextOutputFd = memfd_create(kNextOutputFile, MFD_ALLOW_SEALING);
+                mStfRecorder->setNextOutputFile(nextOutputFd);
+                close(nextOutputFd);
+            },
+            &mFdp);
+
+    callMediaAPI(
+            [this]() {
+                for (int32_t idx = 0; idx < size(kParametersList); ++idx) {
+                    if (mFdp.ConsumeBool()) {
+                        int32_t value = mFdp.ConsumeIntegral<int32_t>();
+                        mStfRecorder->setParameters(
+                                String8((kParametersList[idx] + "=" + to_string(value)).c_str()));
+                    }
+                }
+            },
+            &mFdp);
+}
+
+MediaRecorderClientFuzzer::MediaRecorderClientFuzzer(const uint8_t* data, size_t size)
+    : mFdp(data, size), mMediaRecorderOutputFd(memfd_create(kOutputFile, MFD_ALLOW_SEALING)) {
     AttributionSourceState attributionSource;
     attributionSource.packageName = mFdp.ConsumeRandomLengthString().c_str();
     attributionSource.token = sp<BBinder>::make();
     mStfRecorder = make_unique<StagefrightRecorder>(attributionSource);
-
-    mSurfaceControl = mComposerClient.createSurface(
-        String8(mFdp.ConsumeRandomLengthString().c_str()), mFdp.ConsumeIntegral<uint32_t>(),
-        mFdp.ConsumeIntegral<uint32_t>(), mFdp.ConsumeIntegral<int32_t>(),
-        mFdp.ConsumeIntegral<int32_t>());
-    if (mSurfaceControl) {
-        mSurface = mSurfaceControl->getSurface();
-        mStfRecorder->setPreviewSurface(mSurface->getIGraphicBufferProducer());
-    }
-
-    sp<TestMediaRecorderClient> listener = sp<TestMediaRecorderClient>::make();
-    mStfRecorder->setListener(listener);
-
-    sp<TestCamera> testCamera = sp<TestCamera>::make();
-    sp<Camera> camera = Camera::create(testCamera);
-    mStfRecorder->setCamera(camera->remote(), camera->getRecordingProxy());
-
-    sp<PersistentSurface> persistentSurface = sp<PersistentSurface>::make();
-    mStfRecorder->setInputSurface(persistentSurface);
-
-    sp<TestAudioDeviceCallback> callback = sp<TestAudioDeviceCallback>::make();
-    mStfRecorder->setAudioDeviceCallback(callback);
 }
 
 void MediaRecorderClientFuzzer::process() {
-    setConfig();
-
     mStfRecorder->init();
     mStfRecorder->prepare();
-    size_t numRecord = mFdp.ConsumeIntegralInRange<size_t>(kNumRecordMin, kNumRecordMax);
-    for (size_t Idx = 0; Idx < numRecord; ++Idx) {
-        mStfRecorder->start();
-        this_thread::sleep_for(chrono::milliseconds(
-            mFdp.ConsumeIntegralInRange<int32_t>(kMinSleepTimeInMs, kMaxSleepTimeInMs)));
-        mStfRecorder->pause();
-        this_thread::sleep_for(chrono::milliseconds(
-            mFdp.ConsumeIntegralInRange<int32_t>(kMinSleepTimeInMs, kMaxSleepTimeInMs)));
-        mStfRecorder->resume();
-        this_thread::sleep_for(chrono::milliseconds(
-            mFdp.ConsumeIntegralInRange<int32_t>(kMinSleepTimeInMs, kMaxSleepTimeInMs)));
-        mStfRecorder->stop();
+    while (mFdp.remaining_bytes()) {
+        auto invokeMediaPLayerApi = mFdp.PickValueInArray<const std::function<void()>>({
+                [&]() { setConfig(); },
+                [&]() { mStfRecorder->start(); },
+                [&]() { mStfRecorder->pause(); },
+                [&]() { mStfRecorder->resume(); },
+                [&]() { mStfRecorder->stop(); },
+                [&]() { getConfig(); },
+                [&]() { mStfRecorder->close(); },
+                [&]() { mStfRecorder->reset(); },
+        });
+        invokeMediaPLayerApi();
     }
-    dumpInfo();
-    getConfig();
+}
 
-    mStfRecorder->close();
-    mStfRecorder->reset();
+extern "C" int LLVMFuzzerInitialize(int /* *argc */, char /* ***argv */) {
+    /**
+     * Initializing a FakeServiceManager and adding the instances
+     * of all the required services
+     */
+    sp<IServiceManager> fakeServiceManager = new FakeServiceManager();
+    setDefaultServiceManager(fakeServiceManager);
+    MediaPlayerService::instantiate();
+    AudioFlinger::instantiate();
+    ResourceManagerService::instantiate();
+    CameraService::instantiate();
+    fakeServiceManager->addService(String16(MediaMetricsService::kServiceName),
+                                    new MediaMetricsService());
+    return 0;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {

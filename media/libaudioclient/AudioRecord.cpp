@@ -68,16 +68,26 @@ status_t AudioRecord::getMinFrameCount(
     }
 
     // We double the size of input buffer for ping pong use of record buffer.
-    // Assumes audio_is_linear_pcm(format)
-    const auto sampleSize = audio_channel_count_from_in_mask(channelMask) *
-                                      audio_bytes_per_sample(format);
-    if (sampleSize == 0 || ((*frameCount = (size * 2) / sampleSize) == 0)) {
+    const auto frameSize = audio_bytes_per_frame(
+            audio_channel_count_from_in_mask(channelMask), format);
+    if (frameSize == 0 || ((*frameCount = (size * 2) / frameSize) == 0)) {
         ALOGE("%s(): Unsupported configuration: sampleRate %u, format %#x, channelMask %#x",
                 __func__, sampleRate, format, channelMask);
         return BAD_VALUE;
     }
 
     return NO_ERROR;
+}
+
+status_t AudioRecord::logIfErrorAndReturnStatus(status_t status, const std::string& errorMessage,
+                                                const std::string& func) {
+    if (status != NO_ERROR) {
+        if (!func.empty()) mMediaMetrics.markError(status, func.c_str());
+        ALOGE_IF(!errorMessage.empty(), "%s", errorMessage.c_str());
+        reportError(status, AMEDIAMETRICS_PROP_EVENT_VALUE_CREATE, errorMessage.c_str());
+    }
+    mStatus = status;
+    return mStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,11 +141,7 @@ status_t AudioRecord::getMetrics(mediametrics::Item * &item)
 }
 
 AudioRecord::AudioRecord(const AttributionSourceState &client)
-    : mActive(false), mStatus(NO_INIT), mClientAttributionSource(client),
-      mSessionId(AUDIO_SESSION_ALLOCATE), mPreviousPriority(ANDROID_PRIORITY_NORMAL),
-      mPreviousSchedulingGroup(SP_DEFAULT), mSelectedDeviceId(AUDIO_PORT_HANDLE_NONE),
-      mRoutedDeviceId(AUDIO_PORT_HANDLE_NONE), mSelectedMicDirection(MIC_DIRECTION_UNSPECIFIED),
-      mSelectedMicFieldDimension(MIC_FIELD_DIMENSION_DEFAULT)
+    : mClientAttributionSource(client)
 {
 }
 
@@ -155,13 +161,7 @@ AudioRecord::AudioRecord(
         audio_port_handle_t selectedDeviceId,
         audio_microphone_direction_t selectedMicDirection,
         float microphoneFieldDimension)
-    : mActive(false),
-      mStatus(NO_INIT),
-      mClientAttributionSource(client),
-      mSessionId(AUDIO_SESSION_ALLOCATE),
-      mPreviousPriority(ANDROID_PRIORITY_NORMAL),
-      mPreviousSchedulingGroup(SP_DEFAULT),
-      mProxy(nullptr)
+    : mClientAttributionSource(client)
 {
     uid_t uid = VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(mClientAttributionSource.uid));
     pid_t pid = VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mClientAttributionSource.pid));
@@ -200,9 +200,6 @@ AudioRecord::~AudioRecord()
 }
 
 void AudioRecord::stopAndJoinCallbacks() {
-    // Prevent nullptr crash if it did not open properly.
-    if (mStatus != NO_ERROR) return;
-
     // Make sure that callback function exits in the case where
     // it is looping on buffer empty condition in obtainBuffer().
     // Otherwise the callback thread will never exit.
@@ -260,22 +257,43 @@ status_t AudioRecord::set(
     if (pid == -1 || (callingPid != myPid)) {
         adjPid = callingPid;
     }
-    mClientAttributionSource.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(adjPid));
-
+    auto clientAttributionSourcePid = legacy2aidl_pid_t_int32_t(adjPid);
+    if (!clientAttributionSourcePid.ok()) {
+        return logIfErrorAndReturnStatus(BAD_VALUE,
+                                         StringPrintf("%s: received invalid client attribution "
+                                                      "source pid, pid: %d, sessionId: %d",
+                                                      __func__, pid, sessionId),
+                                         __func__);
+    }
+    mClientAttributionSource.pid = clientAttributionSourcePid.value();
     uid_t adjUid = uid;
     if (uid == -1 || (callingPid != myPid)) {
         adjUid = IPCThreadState::self()->getCallingUid();
     }
-    mClientAttributionSource.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(adjUid));
+    auto clientAttributionSourceUid = legacy2aidl_uid_t_int32_t(adjUid);
+    if (!clientAttributionSourceUid.ok()) {
+        return logIfErrorAndReturnStatus(BAD_VALUE,
+                                         StringPrintf("%s: received invalid client attribution "
+                                                      "source uid, pid: %d, session id: %d",
+                                                      __func__, pid, sessionId),
+                                         __func__);
+    }
+    mClientAttributionSource.uid = clientAttributionSourceUid.value();
 
     mTracker.reset(new RecordingActivityTracker());
+
+    sp<IBinder> binder = defaultServiceManager()->checkService(String16("audio"));
+    if (binder != nullptr) {
+        // Barrier to ensure runtime permission update propagates to audioflinger
+        // Must be client-side
+        interface_cast<IAudioManager>(binder)->permissionUpdateBarrier();
+    }
 
     mSelectedDeviceId = selectedDeviceId;
     mSelectedMicDirection = selectedMicDirection;
     mSelectedMicFieldDimension = microphoneFieldDimension;
     mMaxSharedAudioHistoryMs = maxSharedAudioHistoryMs;
 
-    std::string errorMessage;
     // Copy the state variables early so they are available for error reporting.
     if (pAttributes == nullptr) {
         mAttributes = AUDIO_ATTRIBUTES_INITIALIZER;
@@ -318,47 +336,52 @@ status_t AudioRecord::set(
         break;
     case TRANSFER_CALLBACK:
         if (callback == nullptr) {
-            errorMessage = StringPrintf(
-                    "%s: Transfer type TRANSFER_CALLBACK but callback == nullptr", __func__);
-            status = BAD_VALUE;
-            goto error;
+            return logIfErrorAndReturnStatus(
+                    BAD_VALUE,
+                    StringPrintf("%s: Transfer type TRANSFER_CALLBACK but callback == nullptr, "
+                                 "pid: %d, session id: %d",
+                                 __func__, pid, sessionId),
+                    __func__);
         }
         break;
     case TRANSFER_OBTAIN:
     case TRANSFER_SYNC:
         break;
     default:
-        errorMessage = StringPrintf("%s: Invalid transfer type %d", __func__, mTransfer);
-        status = BAD_VALUE;
-        goto error;
+        return logIfErrorAndReturnStatus(
+                BAD_VALUE,
+                StringPrintf("%s: Invalid transfer type %d, pid: %d, session id: %d", __func__,
+                             mTransfer, pid, sessionId),
+                __func__);
     }
 
     // invariant that mAudioRecord != 0 is true only after set() returns successfully
     if (mAudioRecord != 0) {
-        errorMessage = StringPrintf("%s: Track already in use", __func__);
-        status = INVALID_OPERATION;
-        goto error;
+        return logIfErrorAndReturnStatus(
+                INVALID_OPERATION,
+                StringPrintf("%s: Track already in use, pid: %d, session id: %d", __func__, pid,
+                             sessionId),
+                __func__);
     }
 
     if (!audio_is_valid_format(mFormat)) {
-        errorMessage = StringPrintf("%s: Format %#x is not valid", __func__, mFormat);
-        status = BAD_VALUE;
-        goto error;
+        return logIfErrorAndReturnStatus(
+                BAD_VALUE,
+                StringPrintf("%s: Format %#x is not valid, pid: %d, session id: %d", __func__,
+                             mFormat, pid, sessionId),
+                __func__);
     }
 
     if (!audio_is_input_channel(mChannelMask)) {
-        errorMessage = StringPrintf("%s: Invalid channel mask %#x", __func__, mChannelMask);
-        status = BAD_VALUE;
-        goto error;
+        return logIfErrorAndReturnStatus(
+                BAD_VALUE,
+                StringPrintf("%s: Invalid channel mask %#x, pid: %d, session id: %d", __func__,
+                             mChannelMask, pid, sessionId),
+                __func__);
     }
 
     mChannelCount = audio_channel_count_from_in_mask(mChannelMask);
-
-    if (audio_is_linear_pcm(mFormat)) {
-        mFrameSize = mChannelCount * audio_bytes_per_sample(mFormat);
-    } else {
-        mFrameSize = sizeof(uint8_t);
-    }
+    mFrameSize = audio_bytes_per_frame(mChannelCount, mFormat);
 
     // mFrameCount is initialized in createRecord_l
     mReqFrameCount = frameCount;
@@ -388,7 +411,8 @@ status_t AudioRecord::set(
             mAudioRecordThread.clear();
         }
         // bypass error message to avoid logging twice (createRecord_l logs the error).
-        goto exit;
+        mStatus = status;
+        return mStatus;
     }
 
     // TODO: add audio hardware input latency here
@@ -404,15 +428,7 @@ status_t AudioRecord::set(
     mFramesRead = 0;
     mFramesReadServerOffset = 0;
 
-error:
-    if (status != NO_ERROR) {
-        mMediaMetrics.markError(status, __FUNCTION__);
-        ALOGE_IF(!errorMessage.empty(), "%s", errorMessage.c_str());
-        reportError(status, AMEDIAMETRICS_PROP_EVENT_VALUE_CREATE, errorMessage.c_str());
-    }
-exit:
-    mStatus = status;
-    return status;
+    return logIfErrorAndReturnStatus(status, "", __func__);
 }
 
 // -------------------------------------------------------------------------
@@ -560,6 +576,21 @@ status_t AudioRecord::setMarkerPosition(uint32_t marker)
     return NO_ERROR;
 }
 
+uint32_t AudioRecord::getHalSampleRate() const
+{
+    return mHalSampleRate;
+}
+
+uint32_t AudioRecord::getHalChannelCount() const
+{
+    return mHalChannelCount;
+}
+
+audio_format_t AudioRecord::getHalFormat() const
+{
+    return mHalFormat;
+}
+
 status_t AudioRecord::getMarkerPosition(uint32_t *marker) const
 {
     if (marker == NULL) {
@@ -684,16 +715,38 @@ status_t AudioRecord::setInputDevice(audio_port_handle_t deviceId) {
     AutoMutex lock(mLock);
     ALOGV("%s(%d): deviceId=%d mSelectedDeviceId=%d",
             __func__, mPortId, deviceId, mSelectedDeviceId);
+    const int64_t beginNs = systemTime();
+    mediametrics::Defer defer([&] {
+        mediametrics::LogItem(mMetricsId)
+                .set(AMEDIAMETRICS_PROP_CALLERNAME,
+                     mCallerName.empty()
+                     ? AMEDIAMETRICS_PROP_CALLERNAME_VALUE_UNKNOWN
+                     : mCallerName.c_str())
+                .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_SETPREFERREDDEVICE)
+                .set(AMEDIAMETRICS_PROP_EXECUTIONTIMENS, (int64_t)(systemTime() - beginNs))
+                .set(AMEDIAMETRICS_PROP_SELECTEDDEVICEID, (int32_t)deviceId)
+                .record(); });
+
     if (mSelectedDeviceId != deviceId) {
         mSelectedDeviceId = deviceId;
         if (mStatus == NO_ERROR) {
-            // stop capture so that audio policy manager does not reject the new instance start request
-            // as only one capture can be active at a time.
-            if (mAudioRecord != 0 && mActive) {
-                mAudioRecord->stop();
+            if (mActive) {
+                if (getFirstDeviceId(mRoutedDeviceIds) != mSelectedDeviceId) {
+                    // stop capture so that audio policy manager does not reject the new instance
+                    // start request as only one capture can be active at a time.
+                    if (mAudioRecord != 0) {
+                        mAudioRecord->stop();
+                    }
+                    android_atomic_or(CBLK_INVALID, &mCblk->mFlags);
+                    mProxy->interrupt();
+                }
+            } else {
+                // if the track is idle, try to restore now and
+                // defer to next start if not possible
+                if (restoreRecord_l("setInputDevice") != OK) {
+                    android_atomic_or(CBLK_INVALID, &mCblk->mFlags);
+                }
             }
-            android_atomic_or(CBLK_INVALID, &mCblk->mFlags);
-            mProxy->interrupt();
         }
     }
     return NO_ERROR;
@@ -705,7 +758,7 @@ audio_port_handle_t AudioRecord::getInputDevice() {
 }
 
 // must be called with mLock held
-void AudioRecord::updateRoutedDeviceId_l()
+void AudioRecord::updateRoutedDeviceIds_l()
 {
     // if the record is inactive, do not update actual device as the input stream maybe routed
     // from a device not relevant to this client because of other active use cases.
@@ -713,17 +766,21 @@ void AudioRecord::updateRoutedDeviceId_l()
         return;
     }
     if (mInput != AUDIO_IO_HANDLE_NONE) {
-        audio_port_handle_t deviceId = AudioSystem::getDeviceIdForIo(mInput);
-        if (deviceId != AUDIO_PORT_HANDLE_NONE) {
-            mRoutedDeviceId = deviceId;
+        DeviceIdVector deviceIds;
+        status_t result = AudioSystem::getDeviceIdsForIo(mInput, deviceIds);
+        if (result != OK) {
+            ALOGW("%s: getDeviceIdsForIo returned: %d", __func__, result);
+        }
+        if (!deviceIds.empty()) {
+            mRoutedDeviceIds = deviceIds;
         }
      }
 }
 
-audio_port_handle_t AudioRecord::getRoutedDeviceId() {
+DeviceIdVector AudioRecord::getRoutedDeviceIds() {
     AutoMutex lock(mLock);
-    updateRoutedDeviceId_l();
-    return mRoutedDeviceId;
+    updateRoutedDeviceIds_l();
+    return mRoutedDeviceIds;
 }
 
 status_t AudioRecord::dump(int fd, const Vector<String16>& args __unused) const
@@ -741,11 +798,12 @@ status_t AudioRecord::dump(int fd, const Vector<String16>& args __unused) const
                   mFrameCount, mReqFrameCount);
     result.appendFormat("  notif. frame count(%u), req. notif. frame count(%u)\n",
              mNotificationFramesAct, mNotificationFramesReq);
-    result.appendFormat("  input(%d), latency(%u), selected device Id(%d), routed device Id(%d)\n",
-                        mInput, mLatency, mSelectedDeviceId, mRoutedDeviceId);
-    result.appendFormat("  mic direction(%d) mic field dimension(%f)",
-                        mSelectedMicDirection, mSelectedMicFieldDimension);
-    ::write(fd, result.string(), result.size());
+    result.appendFormat("  input(%d), latency(%u), selected device Id(%d)\n",
+                        mInput, mLatency, mSelectedDeviceId);
+    result.appendFormat("  routed device Ids(%s), mic direction(%d) mic field dimension(%f)",
+                        toString(mRoutedDeviceIds).c_str(), mSelectedMicDirection,
+                        mSelectedMicFieldDimension);
+    ::write(fd, result.c_str(), result.size());
     return NO_ERROR;
 }
 
@@ -776,12 +834,10 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
     status_t status;
     static const int32_t kMaxCreateAttempts = 3;
     int32_t remainingAttempts = kMaxCreateAttempts;
-    std::string errorMessage;
 
     if (audioFlinger == 0) {
-        errorMessage = StringPrintf("%s(%d): Could not get audioflinger", __func__, mPortId);
-        status = NO_INIT;
-        goto exit;
+        return logIfErrorAndReturnStatus(
+                NO_INIT, StringPrintf("%s(%d): Could not get audioflinger", __func__, mPortId), "");
     }
 
     // mFlags (not mOrigFlags) is modified depending on whether fast request is accepted.
@@ -839,16 +895,34 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
 
     do {
         media::CreateRecordResponse response;
-        status = audioFlinger->createRecord(VALUE_OR_FATAL(input.toAidl()), response);
-        output = VALUE_OR_FATAL(IAudioFlinger::CreateRecordOutput::fromAidl(response));
+        auto aidlInput = input.toAidl();
+        if (!aidlInput.ok()) {
+            return logIfErrorAndReturnStatus(
+                    BAD_VALUE,
+                    StringPrintf("%s(%d): Could not create record due to invalid input", __func__,
+                                 mPortId),
+                    "");
+        }
+        status = audioFlinger->createRecord(aidlInput.value(), response);
+
+        auto recordOutput = IAudioFlinger::CreateRecordOutput::fromAidl(response);
+        if (!recordOutput.ok()) {
+            return logIfErrorAndReturnStatus(
+                    BAD_VALUE,
+                    StringPrintf("%s(%d): Could not create record output due to invalid response",
+                                 __func__, mPortId),
+                    "");
+        }
+        output = recordOutput.value();
         if (status == NO_ERROR) {
             break;
         }
         if (status != FAILED_TRANSACTION || --remainingAttempts <= 0) {
-            errorMessage = StringPrintf(
-                    "%s(%d): AudioFlinger could not create record track, status: %d",
-                    __func__, mPortId, status);
-            goto exit;
+            return logIfErrorAndReturnStatus(
+                    status,
+                    StringPrintf("%s(%d): AudioFlinger could not create record track, status: %d",
+                                 __func__, mPortId, status),
+                    "");
         }
         // FAILED_TRANSACTION happens under very specific conditions causing a state mismatch
         // between audio policy manager and audio flinger during the input stream open sequence
@@ -871,18 +945,21 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
         mAwaitBoost = true;
     }
     mFlags = output.flags;
-    mRoutedDeviceId = output.selectedDeviceId;
+    mRoutedDeviceIds = { output.selectedDeviceId };
     mSessionId = output.sessionId;
     mSampleRate = output.sampleRate;
     mServerConfig = output.serverConfig;
     mServerFrameSize = audio_bytes_per_frame(
             audio_channel_count_from_in_mask(mServerConfig.channel_mask), mServerConfig.format);
     mServerSampleSize = audio_bytes_per_sample(mServerConfig.format);
+    mHalSampleRate = output.halConfig.sample_rate;
+    mHalChannelCount = audio_channel_count_from_in_mask(output.halConfig.channel_mask);
+    mHalFormat = output.halConfig.format;
 
     if (output.cblk == 0) {
-        errorMessage = StringPrintf("%s(%d): Could not get control block", __func__, mPortId);
-        status = NO_INIT;
-        goto exit;
+        return logIfErrorAndReturnStatus(
+                NO_INIT, StringPrintf("%s(%d): Could not get control block", __func__, mPortId),
+                "");
     }
     // TODO: Using unsecurePointer() has some associated security pitfalls
     //       (see declaration for details).
@@ -890,10 +967,9 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
     //       issue (e.g. by copying).
     iMemPointer = output.cblk ->unsecurePointer();
     if (iMemPointer == NULL) {
-        errorMessage = StringPrintf(
-                "%s(%d): Could not get control block pointer", __func__, mPortId);
-        status = NO_INIT;
-        goto exit;
+        return logIfErrorAndReturnStatus(
+                NO_INIT,
+                StringPrintf("%s(%d): Could not get control block pointer", __func__, mPortId), "");
     }
     cblk = static_cast<audio_track_cblk_t*>(iMemPointer);
 
@@ -910,10 +986,9 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
         //       issue (e.g. by copying).
         buffers = output.buffers->unsecurePointer();
         if (buffers == NULL) {
-            errorMessage = StringPrintf(
-                    "%s(%d): Could not get buffer pointer", __func__, mPortId);
-            status = NO_INIT;
-            goto exit;
+            return logIfErrorAndReturnStatus(
+                    NO_INIT,
+                    StringPrintf("%s(%d): Could not get buffer pointer", __func__, mPortId), "");
         }
     }
 
@@ -993,7 +1068,8 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
         .set(AMEDIAMETRICS_PROP_SOURCE, toString(mAttributes.source).c_str())
         .set(AMEDIAMETRICS_PROP_THREADID, (int32_t)output.inputId)
         .set(AMEDIAMETRICS_PROP_SELECTEDDEVICEID, (int32_t)mSelectedDeviceId)
-        .set(AMEDIAMETRICS_PROP_ROUTEDDEVICEID, (int32_t)mRoutedDeviceId)
+        .set(AMEDIAMETRICS_PROP_ROUTEDDEVICEID, (int32_t)(getFirstDeviceId(mRoutedDeviceIds)))
+        .set(AMEDIAMETRICS_PROP_ROUTEDDEVICEIDS, toString(mRoutedDeviceIds).c_str())
         .set(AMEDIAMETRICS_PROP_ENCODING, toString(mFormat).c_str())
         .set(AMEDIAMETRICS_PROP_CHANNELMASK, (int32_t)mChannelMask)
         .set(AMEDIAMETRICS_PROP_FRAMECOUNT, (int32_t)mFrameCount)
@@ -1005,15 +1081,8 @@ status_t AudioRecord::createRecord_l(const Modulo<uint32_t> &epoch)
         .set(AMEDIAMETRICS_PROP_SELECTEDMICFIELDDIRECTION, (double)mSelectedMicFieldDimension)
         .record();
 
-exit:
-    if (status != NO_ERROR) {
-        ALOGE_IF(!errorMessage.empty(), "%s", errorMessage.c_str());
-        reportError(status, AMEDIAMETRICS_PROP_EVENT_VALUE_CREATE, errorMessage.c_str());
-    }
-
-    mStatus = status;
     // sp<IAudioTrack> track destructor will cause releaseOutput() to be called by AudioFlinger
-    return status;
+    return logIfErrorAndReturnStatus(status, "", "");
 }
 
 // Report error associated with the event and some configuration details.
@@ -1096,11 +1165,10 @@ status_t AudioRecord::obtainBuffer(Buffer* audioBuffer, const struct timespec *r
             // start of lock scope
             AutoMutex lock(mLock);
 
-            uint32_t newSequence = mSequence;
             // did previous obtainBuffer() fail due to media server death or voluntary invalidation?
             if (status == DEAD_OBJECT) {
                 // re-create track, unless someone else has already done so
-                if (newSequence == oldSequence) {
+                if (mSequence == oldSequence) {
                     if (!audio_is_linear_pcm(mFormat)) {
                         // If compressed capture, don't attempt to restore the track.
                         // Return a DEAD_OBJECT error and let the caller recreate.
@@ -1116,7 +1184,7 @@ status_t AudioRecord::obtainBuffer(Buffer* audioBuffer, const struct timespec *r
                     }
                 }
             }
-            oldSequence = newSequence;
+            oldSequence = mSequence;
 
             // Keep the extra references
             proxy = mProxy;
@@ -1213,8 +1281,12 @@ ssize_t AudioRecord::read(void* buffer, size_t userSize, bool blocking)
         }
 
         size_t bytesRead = audioBuffer.frameCount * mFrameSize;
-        memcpy_by_audio_format(buffer, mFormat, audioBuffer.raw, mServerConfig.format,
-                               audioBuffer.mSize / mServerSampleSize);
+        if (audio_is_linear_pcm(mFormat)) {
+            memcpy_by_audio_format(buffer, mFormat, audioBuffer.raw, mServerConfig.format,
+                                audioBuffer.mSize / mServerSampleSize);
+        } else {
+            memcpy(buffer, audioBuffer.raw, audioBuffer.mSize);
+        }
         buffer = ((char *) buffer) + bytesRead;
         userSize -= bytesRead;
         read += bytesRead;
@@ -1505,17 +1577,12 @@ status_t AudioRecord::restoreRecord_l(const char *from)
             .set(AMEDIAMETRICS_PROP_WHERE, from)
             .record(); });
 
-    ALOGW("%s(%d): dead IAudioRecord, creating a new one from %s()", __func__, mPortId, from);
+    ALOGW("%s(%d) called from %s()", __func__, mPortId, from);
     ++mSequence;
 
     const int INITIAL_RETRIES = 3;
     int retries = INITIAL_RETRIES;
 retry:
-    if (retries < INITIAL_RETRIES) {
-        // refresh the audio configuration cache in this process to make sure we get new
-        // input parameters and new IAudioRecord in createRecord_l()
-        AudioSystem::clearAudioConfigCache();
-    }
     mFlags = mOrigFlags;
 
     // if the new IAudioRecord is created, createRecord_l() will modify the
@@ -1595,7 +1662,7 @@ status_t AudioRecord::removeAudioDeviceCallback(
 }
 
 void AudioRecord::onAudioDeviceUpdate(audio_io_handle_t audioIo,
-                                 audio_port_handle_t deviceId)
+                                      const DeviceIdVector& deviceIds)
 {
     sp<AudioSystem::AudioDeviceCallback> callback;
     {
@@ -1607,26 +1674,20 @@ void AudioRecord::onAudioDeviceUpdate(audio_io_handle_t audioIo,
         // only update device if the record is active as route changes due to other use cases are
         // irrelevant for this client
         if (mActive) {
-            mRoutedDeviceId = deviceId;
+            mRoutedDeviceIds = deviceIds;
         }
     }
     if (callback.get() != nullptr) {
-        callback->onAudioDeviceUpdate(mInput, mRoutedDeviceId);
+        callback->onAudioDeviceUpdate(mInput, mRoutedDeviceIds);
     }
 }
 
 // -------------------------------------------------------------------------
 
-status_t AudioRecord::getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones)
+status_t AudioRecord::getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones)
 {
     AutoMutex lock(mLock);
-    std::vector<media::MicrophoneInfoData> mics;
-    status_t status = statusTFromBinderStatus(mAudioRecord->getActiveMicrophones(&mics));
-    activeMicrophones->resize(mics.size());
-    for (size_t i = 0; status == OK && i < mics.size(); ++i) {
-        status = activeMicrophones->at(i).readFromParcelable(mics[i]);
-    }
-    return status;
+    return statusTFromBinderStatus(mAudioRecord->getActiveMicrophones(activeMicrophones));
 }
 
 status_t AudioRecord::setPreferredMicrophoneDirection(audio_microphone_direction_t direction)

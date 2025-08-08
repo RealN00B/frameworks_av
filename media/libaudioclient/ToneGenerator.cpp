@@ -872,6 +872,18 @@ const ToneGenerator::ToneDescriptor ToneGenerator::sToneDescriptors[] = {
                         { .duration = 0 , .waveFreq = { 0 }, 0, 0}},
           .repeatCnt = 3,
           .repeatSegment = 0 },                              // TONE_NZ_CALL_WAITING
+        { .segments = { { .duration = 500, .waveFreq = { 425, 0 }, 0, 0 },
+                        { .duration = 250, .waveFreq = { 0 }, 0, 0 },
+                        { .duration = 0 , .waveFreq = { 0 }, 0, 0}},
+          .repeatCnt = ToneGenerator::TONEGEN_INF,
+          .repeatSegment = 0 },                             // TONE_MY_CONGESTION
+        { .segments = { { .duration = 400, .waveFreq = { 425, 0 }, 0, 0 },
+                        { .duration = 200, .waveFreq = { 0 }, 0, 0 },
+                        { .duration = 400, .waveFreq = { 425, 0 }, 0, 0 },
+                        { .duration = 2000, .waveFreq = { 0 }, 0, 0},
+                        { .duration = 0, .waveFreq = { 0 }, 0, 0}},
+          .repeatCnt = ToneGenerator::TONEGEN_INF,
+          .repeatSegment = 0 }                              // TONE_MY_RINGTONE
 };
 
 // Used by ToneGenerator::getToneForRegion() to convert user specified supervisory tone type
@@ -976,6 +988,16 @@ const unsigned char /*tone_type*/ ToneGenerator::sToneMappingTable[NUM_REGIONS-1
             TONE_SUP_ERROR,               // TONE_SUP_ERROR
             TONE_NZ_CALL_WAITING,         // TONE_SUP_CALL_WAITING
             TONE_GB_RINGTONE              // TONE_SUP_RINGTONE
+        },
+        {   // MALAYSIA
+            TONE_SUP_DIAL,                // TONE_SUP_DIAL
+            TONE_SUP_BUSY,                // TONE_SUP_BUSY
+            TONE_MY_CONGESTION,           // TONE_SUP_CONGESTION
+            TONE_SUP_RADIO_ACK,           // TONE_SUP_RADIO_ACK
+            TONE_SUP_RADIO_NOTAVAIL,      // TONE_SUP_RADIO_NOTAVAIL
+            TONE_SUP_ERROR,               // TONE_SUP_ERROR
+            TONE_SUP_CALL_WAITING,        // TONE_SUP_CALL_WAITING
+            TONE_MY_RINGTONE              // TONE_SUP_RINGTONE
         }
 };
 
@@ -1011,23 +1033,17 @@ ToneGenerator::ToneGenerator(audio_stream_type_t streamType, float volume, bool 
 
     mState = TONE_IDLE;
 
-    if (AudioSystem::getOutputSamplingRate(&mSamplingRate, streamType) != NO_ERROR) {
-        ALOGE("Unable to marshal AudioFlinger");
-        return;
-    }
     mThreadCanCallJava = threadCanCallJava;
     mStreamType = streamType;
     mVolume = volume;
     mpToneDesc = NULL;
     mpNewToneDesc = NULL;
-    // Generate tone by chunks of 20 ms to keep cadencing precision
-    mProcessSize = (mSamplingRate * 20) / 1000;
 
     char value[PROPERTY_VALUE_MAX];
     if (property_get("gsm.operator.iso-country", value, "") == 0) {
         property_get("gsm.sim.operator.iso-country", value, "");
     }
-    // If dual sim device has two SIM cards inserted and is not registerd to any network,
+    // If dual sim device has two SIM cards inserted and is not registered to any network,
     // "," is set to "gsm.operator.iso-country" prop.
     // In this case, "gsm.sim.operator.iso-country" prop should be used.
     if (strlen(value) == 1 && strstr(value, ",") != NULL) {
@@ -1055,6 +1071,8 @@ ToneGenerator::ToneGenerator(audio_stream_type_t streamType, float volume, bool 
         mRegion = TAIWAN;
     } else if (strstr(value, "nz") != NULL) {
         mRegion = NZ;
+    } else if (strstr(value, "my") != NULL) {
+        mRegion = MY;
     } else {
         mRegion = CEPT;
     }
@@ -1240,13 +1258,10 @@ void ToneGenerator::stopTone() {
                     nsec += 1000000000;
                 }
 
-                if ((sec + 1) > ((time_t)(INT_MAX / mSamplingRate))) {
-                    mMaxSmp = sec * mSamplingRate;
-                } else {
-                    // mSamplingRate is always > 1000
-                    sec = sec * 1000 + nsec / 1000000; // duration in milliseconds
-                    mMaxSmp = (unsigned int)(((int64_t)sec * mSamplingRate) / 1000);
-                }
+                const uint64_t msec = static_cast<uint64_t>(sec) * 1000 + nsec / 1'000'000;
+                mMaxSmp = std::min(static_cast<uint64_t>(TONEGEN_INF - 1),
+                        msec * mSamplingRate / 1000);
+
                 ALOGV("stopTone() forcing mMaxSmp to %d, total for far %" PRIu64, mMaxSmp,
                       mTotalSmp);
             } else {
@@ -1300,21 +1315,22 @@ bool ToneGenerator::initAudioTrack() {
     mpAudioTrack = new AudioTrack(attributionSource);
     ALOGV("AudioTrack(%p) created", mpAudioTrack.get());
 
+
     audio_attributes_t attr;
     audio_stream_type_t streamType = mStreamType;
-    if (mStreamType == AUDIO_STREAM_VOICE_CALL) {
+    if (mStreamType == AUDIO_STREAM_VOICE_CALL || mStreamType == AUDIO_STREAM_BLUETOOTH_SCO) {
         streamType = AUDIO_STREAM_DTMF;
     }
     attr = AudioSystem::streamTypeToAttributes(streamType);
+    attr.flags = static_cast<audio_flags_mask_t>(attr.flags | AUDIO_FLAG_LOW_LATENCY);
 
-    const size_t frameCount = mProcessSize;
     status_t status = mpAudioTrack->set(
             AUDIO_STREAM_DEFAULT,
             0,    // sampleRate
             AUDIO_FORMAT_PCM_16_BIT,
             AUDIO_CHANNEL_OUT_MONO,
-            frameCount,
-            AUDIO_OUTPUT_FLAG_FAST,
+            0,    // frameCount
+            AUDIO_OUTPUT_FLAG_NONE,
             wp<AudioTrack::IAudioTrackCallback>::fromExisting(this),
             0,    // notificationFrames
             0,    // sharedBuffer
@@ -1332,6 +1348,10 @@ bool ToneGenerator::initAudioTrack() {
         mpAudioTrack.clear();
         return false;
     }
+
+    mSamplingRate = mpAudioTrack->getSampleRate();
+    // Generate tone by chunks of 20 ms to keep cadencing precision
+    mProcessSize = (mSamplingRate * 20) / 1000;
 
     mpAudioTrack->setVolume(mVolume);
     mState = TONE_INIT;
@@ -1613,14 +1633,11 @@ bool ToneGenerator::prepareWave() {
 
     mpToneDesc = mpNewToneDesc;
 
-    if (mDurationMs == -1) {
+    if (mDurationMs < 0) {  // mDurationMs is signed, treat all neg numbers as INF.
         mMaxSmp = TONEGEN_INF;
     } else {
-        if (mDurationMs > (int)(TONEGEN_INF / mSamplingRate)) {
-            mMaxSmp = (mDurationMs / 1000) * mSamplingRate;
-        } else {
-            mMaxSmp = (mDurationMs * mSamplingRate) / 1000;
-        }
+        mMaxSmp = std::min(static_cast<uint64_t>(TONEGEN_INF - 1),
+                static_cast<uint64_t>(mDurationMs) * mSamplingRate / 1000);
         ALOGV("prepareWave, duration limited to %d ms", mDurationMs);
     }
 
@@ -1651,7 +1668,8 @@ bool ToneGenerator::prepareWave() {
     if (mpToneDesc->segments[0].duration == TONEGEN_INF) {
         mNextSegSmp = TONEGEN_INF;
     } else{
-        mNextSegSmp = (mpToneDesc->segments[0].duration * mSamplingRate) / 1000;
+        mNextSegSmp = std::min(static_cast<uint64_t>(TONEGEN_INF - 1),
+                static_cast<uint64_t>(mpToneDesc->segments[0].duration) * mSamplingRate / 1000);
     }
 
     return true;

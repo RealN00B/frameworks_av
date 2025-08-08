@@ -42,8 +42,8 @@ namespace android {
 using media::VolumeShaper;
 using content::AttributionSourceState;
 
-MediaPlayer::MediaPlayer(const AttributionSourceState& attributionSource)
-        : mAttributionSource(attributionSource)
+MediaPlayer::MediaPlayer(const AttributionSourceState& attributionSource,
+    const audio_session_t sessionId) : mAttributionSource(attributionSource)
 {
     ALOGV("constructor");
     mListener = NULL;
@@ -61,7 +61,12 @@ MediaPlayer::MediaPlayer(const AttributionSourceState& attributionSource)
     mLeftVolume = mRightVolume = 1.0;
     mVideoWidth = mVideoHeight = 0;
     mLockThreadId = 0;
-    mAudioSessionId = (audio_session_t) AudioSystem::newAudioUniqueId(AUDIO_UNIQUE_ID_USE_SESSION);
+    if (sessionId == AUDIO_SESSION_ALLOCATE) {
+        mAudioSessionId = static_cast<audio_session_t>(
+            AudioSystem::newAudioUniqueId(AUDIO_UNIQUE_ID_USE_SESSION));
+    } else {
+        mAudioSessionId = sessionId;
+    }
     AudioSystem::acquireAudioSessionId(mAudioSessionId, (pid_t)-1, (uid_t)-1); // always in client.
     mSendLevel = 0;
     mRetransmitEndpointValid = false;
@@ -1100,19 +1105,14 @@ status_t MediaPlayer::setOutputDevice(audio_port_handle_t deviceId)
     return mPlayer->setOutputDevice(deviceId);
 }
 
-audio_port_handle_t MediaPlayer::getRoutedDeviceId()
+status_t MediaPlayer::getRoutedDeviceIds(DeviceIdVector& deviceIds)
 {
     Mutex::Autolock _l(mLock);
     if (mPlayer == NULL) {
-        ALOGV("getRoutedDeviceId: player not init");
-        return AUDIO_PORT_HANDLE_NONE;
+        ALOGV("getRoutedDeviceIds: player not init");
+        return NO_INIT;
     }
-    audio_port_handle_t deviceId;
-    status_t status = mPlayer->getRoutedDeviceId(&deviceId);
-    if (status != NO_ERROR) {
-        return AUDIO_PORT_HANDLE_NONE;
-    }
-    return deviceId;
+    return mPlayer->getRoutedDeviceIds(deviceIds);
 }
 
 status_t MediaPlayer::enableAudioDeviceCallback(bool enabled)

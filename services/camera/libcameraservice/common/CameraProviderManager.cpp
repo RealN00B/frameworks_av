@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "system/camera_metadata.h"
+#include "system/graphics-base-v1.0.h"
+#include "system/graphics-base-v1.1.h"
 #define LOG_TAG "CameraProviderManager"
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
@@ -30,9 +33,14 @@
 #include <dlfcn.h>
 #include <future>
 #include <inttypes.h>
+#include <android_companion_virtualdevice_flags.h>
+#include <android_companion_virtualdevice_build_flags.h>
+#include <android/binder_libbinder.h>
 #include <android/binder_manager.h>
 #include <android/hidl/manager/1.2/IServiceManager.h>
 #include <hidl/ServiceManagement.h>
+#include <com_android_internal_camera_flags.h>
+#include <com_android_window_flags.h>
 #include <functional>
 #include <camera_metadata_hidden.h>
 #include <android-base/parseint.h>
@@ -40,9 +48,12 @@
 #include <cutils/properties.h>
 #include <hwbinder/IPCThreadState.h>
 #include <utils/Trace.h>
+#include <ui/PublicFormat.h>
+#include <camera/StringUtils.h>
 
 #include "api2/HeicCompositeStream.h"
 #include "device3/ZoomRatioMapper.h"
+#include "utils/Utils.h"
 
 namespace android {
 
@@ -52,16 +63,30 @@ using android::hardware::camera::common::V1_0::Status;
 using namespace camera3::SessionConfigurationUtils;
 using std::literals::chrono_literals::operator""s;
 using hardware::camera2::utils::CameraIdAndSessionConfiguration;
+using hardware::camera2::params::OutputConfiguration;
+
+namespace flags = com::android::internal::camera::flags;
+namespace vd_flags = android::companion::virtualdevice::flags;
+namespace wm_flags = com::android::window::flags;
 
 namespace {
 const bool kEnableLazyHal(property_get_bool("ro.camera.enableLazyHal", false));
 const std::string kExternalProviderName = "external/0";
+const std::string kVirtualProviderName = "virtual/0";
 } // anonymous namespace
 
 const float CameraProviderManager::kDepthARTolerance = .1f;
+const bool CameraProviderManager::kFrameworkJpegRDisabled =
+        property_get_bool("ro.camera.disableJpegR", false);
+const bool CameraProviderManager::kFrameworkHeicUltraHDRDisabled =
+    property_get_bool("ro.camera.disableHeicUltraHDR", false);
+const bool CameraProviderManager::kFrameworkHeicAllowSWCodecs =
+    property_get_bool("ro.camera.enableSWHEVC", false);
 
 CameraProviderManager::HidlServiceInteractionProxyImpl
 CameraProviderManager::sHidlServiceInteractionProxy{};
+CameraProviderManager::AidlServiceInteractionProxyImpl
+CameraProviderManager::sAidlServiceInteractionProxy{};
 
 CameraProviderManager::~CameraProviderManager() {
 }
@@ -75,7 +100,7 @@ const char* FrameworkTorchStatusToString(const TorchModeStatus& s) {
         case TorchModeStatus::AVAILABLE_ON:
             return "AVAILABLE_ON";
     }
-    ALOGW("Unexpected HAL torch mode status code %d", s);
+    ALOGW("Unexpected HAL torch mode status code %d", eToI(s));
     return "UNKNOWN_STATUS";
 }
 
@@ -88,7 +113,7 @@ const char* FrameworkDeviceStatusToString(const CameraDeviceStatus& s) {
         case CameraDeviceStatus::ENUMERATING:
             return "ENUMERATING";
     }
-    ALOGW("Unexpected HAL device status code %d", s);
+    ALOGW("Unexpected HAL device status code %d", eToI(s));
     return "UNKNOWN_STATUS";
 }
 
@@ -124,6 +149,41 @@ status_t CameraProviderManager::tryToInitAndAddHidlProvidersLocked(
     return OK;
 }
 
+std::shared_ptr<aidl::android::hardware::camera::provider::ICameraProvider>
+CameraProviderManager::AidlServiceInteractionProxyImpl::getService(
+        const std::string& serviceName) {
+    using aidl::android::hardware::camera::provider::ICameraProvider;
+
+    AIBinder* binder = nullptr;
+    binder = AServiceManager_waitForService(serviceName.c_str());
+
+    if (binder == nullptr) {
+        ALOGE("%s: AIDL Camera provider HAL '%s' is not actually available, despite waiting "
+              "indefinitely?", __FUNCTION__, serviceName.c_str());
+        return nullptr;
+    }
+    std::shared_ptr<ICameraProvider> interface =
+            ICameraProvider::fromBinder(ndk::SpAIBinder(binder));
+
+    return interface;
+}
+
+std::shared_ptr<aidl::android::hardware::camera::provider::ICameraProvider>
+CameraProviderManager::AidlServiceInteractionProxyImpl::tryGetService(
+        const std::string& serviceName) {
+    using aidl::android::hardware::camera::provider::ICameraProvider;
+
+    std::shared_ptr<ICameraProvider> interface = ICameraProvider::fromBinder(
+                    ndk::SpAIBinder(AServiceManager_checkService(serviceName.c_str())));
+    if (interface == nullptr) {
+        ALOGD("%s: AIDL Camera provider HAL '%s' is not actually available", __FUNCTION__,
+              serviceName.c_str());
+        return nullptr;
+    }
+
+    return interface;
+}
+
 static std::string getFullAidlProviderName(const std::string instance) {
     std::string aidlHalServiceDescriptor =
             std::string(aidl::android::hardware::camera::provider::ICameraProvider::descriptor);
@@ -136,9 +196,16 @@ status_t CameraProviderManager::tryToAddAidlProvidersLocked() {
     auto sm = defaultServiceManager();
     auto aidlProviders = sm->getDeclaredInstances(
             String16(aidlHalServiceDescriptor));
+
+    if (isVirtualCameraHalEnabled()) {
+        // Virtual Camera provider is not declared in the VINTF manifest so we
+        // manually add it if the binary is present.
+        aidlProviders.push_back(String16(kVirtualProviderName.c_str()));
+    }
+
     for (const auto &aidlInstance : aidlProviders) {
         std::string aidlServiceName =
-                getFullAidlProviderName(std::string(String8(aidlInstance).c_str()));
+                getFullAidlProviderName(toStdString(aidlInstance));
         auto res = sm->registerForNotifications(String16(aidlServiceName.c_str()), this);
         if (res != OK) {
             ALOGE("%s Unable to register for notifications with AIDL service manager",
@@ -151,12 +218,19 @@ status_t CameraProviderManager::tryToAddAidlProvidersLocked() {
 }
 
 status_t CameraProviderManager::initialize(wp<CameraProviderManager::StatusListener> listener,
-        HidlServiceInteractionProxy* hidlProxy) {
+        HidlServiceInteractionProxy* hidlProxy, AidlServiceInteractionProxy* aidlProxy) {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
     if (hidlProxy == nullptr) {
-        ALOGE("%s: No valid service interaction proxy provided", __FUNCTION__);
+        ALOGE("%s: No valid service Hidl interaction proxy provided", __FUNCTION__);
         return BAD_VALUE;
     }
+
+    if (aidlProxy == nullptr) {
+        ALOGE("%s: No valid service Aidl interaction proxy provided", __FUNCTION__);
+        return BAD_VALUE;
+    }
+    mAidlServiceProxy = aidlProxy;
+
     mListener = listener;
     mDeviceState = 0;
     auto res = tryToInitAndAddHidlProvidersLocked(hidlProxy);
@@ -197,12 +271,17 @@ std::pair<int, int> CameraProviderManager::getCameraCount() const {
     return std::make_pair(systemCameraCount, publicCameraCount);
 }
 
-std::vector<std::string> CameraProviderManager::getCameraDeviceIds() const {
+std::vector<std::string> CameraProviderManager::getCameraDeviceIds(std::unordered_map<
+            std::string, std::set<std::string>>* unavailablePhysicalIds) const {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
     std::vector<std::string> deviceIds;
     for (auto& provider : mProviders) {
         for (auto& id : provider->mUniqueCameraIds) {
             deviceIds.push_back(id);
+            if (unavailablePhysicalIds != nullptr &&
+                    provider->mUnavailablePhysicalCameras.count(id) > 0) {
+                (*unavailablePhysicalIds)[id] = provider->mUnavailablePhysicalCameras.at(id);
+            }
         }
     }
     return deviceIds;
@@ -306,6 +385,18 @@ bool CameraProviderManager::supportNativeZoomRatio(const std::string &id) const 
     return deviceInfo->supportNativeZoomRatio();
 }
 
+bool CameraProviderManager::isCompositeJpegRDisabled(const std::string &id) const {
+    std::lock_guard<std::mutex> lock(mInterfaceMutex);
+    return isCompositeJpegRDisabledLocked(id);
+}
+
+bool CameraProviderManager::isCompositeJpegRDisabledLocked(const std::string &id) const {
+    auto deviceInfo = findDeviceInfoLocked(id);
+    if (deviceInfo == nullptr) return false;
+
+    return deviceInfo->isCompositeJpegRDisabled();
+}
+
 status_t CameraProviderManager::getResourceCost(const std::string &id,
         CameraResourceCost* cost) const {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
@@ -318,26 +409,90 @@ status_t CameraProviderManager::getResourceCost(const std::string &id,
 }
 
 status_t CameraProviderManager::getCameraInfo(const std::string &id,
-        hardware::CameraInfo* info) const {
+         int rotationOverride, int *portraitRotation,
+         hardware::CameraInfo* info) const {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
 
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo == nullptr) return NAME_NOT_FOUND;
 
-    return deviceInfo->getCameraInfo(info);
+    return deviceInfo->getCameraInfo(rotationOverride, portraitRotation, info);
 }
 
 status_t CameraProviderManager::isSessionConfigurationSupported(const std::string& id,
         const SessionConfiguration &configuration, bool overrideForPerfClass,
-        metadataGetter getMetadata, bool *status /*out*/) const {
+        bool checkSessionParams, bool *status /*out*/) const {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo == nullptr) {
         return NAME_NOT_FOUND;
     }
 
+    metadataGetter getMetadata = [this](const std::string &id,
+            bool overrideForPerfClass) {
+        CameraMetadata metadata;
+        this->getCameraCharacteristicsLocked(id, overrideForPerfClass,
+                                             &metadata,
+                                             hardware::ICameraService::ROTATION_OVERRIDE_NONE);
+        return metadata;
+    };
     return deviceInfo->isSessionConfigurationSupported(configuration,
-            overrideForPerfClass, getMetadata, status);
+            overrideForPerfClass, getMetadata, checkSessionParams, status);
+}
+
+status_t  CameraProviderManager::createDefaultRequest(const std::string& cameraId,
+        camera_request_template_t templateId,
+        CameraMetadata* metadata) const {
+    ATRACE_CALL();
+    if (templateId <= 0 || templateId >= CAMERA_TEMPLATE_COUNT) {
+        return BAD_VALUE;
+    }
+
+    std::lock_guard<std::mutex> lock(mInterfaceMutex);
+    auto deviceInfo = findDeviceInfoLocked(cameraId);
+    if (deviceInfo == nullptr) {
+        return NAME_NOT_FOUND;
+    }
+
+    status_t res = deviceInfo->createDefaultRequest(templateId,
+            metadata);
+
+    if (res == BAD_VALUE) {
+        ALOGI("%s: template %d is not supported on this camera device",
+              __FUNCTION__, templateId);
+        return res;
+    } else if (res != OK) {
+        ALOGE("Unable to construct request template %d: %s (%d)",
+                templateId, strerror(-res), res);
+        return res;
+    }
+
+    return OK;
+}
+
+status_t CameraProviderManager::getSessionCharacteristics(
+        const std::string& id, const SessionConfiguration& configuration, bool overrideForPerfClass,
+        int rotationOverride, CameraMetadata* sessionCharacteristics /*out*/) const {
+    std::lock_guard<std::mutex> lock(mInterfaceMutex);
+    auto deviceInfo = findDeviceInfoLocked(id);
+    if (deviceInfo == nullptr) {
+        return NAME_NOT_FOUND;
+    }
+
+    metadataGetter getMetadata = [this, rotationOverride](const std::string& id,
+                                                            bool overrideForPerfClass) {
+        CameraMetadata metadata;
+        status_t ret = this->getCameraCharacteristicsLocked(id, overrideForPerfClass, &metadata,
+                                                            rotationOverride);
+        if (ret != OK) {
+            ALOGE("%s: Could not get CameraCharacteristics for device %s", __FUNCTION__,
+                  id.c_str());
+        }
+        return metadata;
+    };
+
+    return deviceInfo->getSessionCharacteristics(configuration,
+            overrideForPerfClass, getMetadata, sessionCharacteristics);
 }
 
 status_t CameraProviderManager::getCameraIdIPCTransport(const std::string &id,
@@ -356,9 +511,11 @@ status_t CameraProviderManager::getCameraIdIPCTransport(const std::string &id,
 }
 
 status_t CameraProviderManager::getCameraCharacteristics(const std::string &id,
-        bool overrideForPerfClass, CameraMetadata* characteristics) const {
+        bool overrideForPerfClass, CameraMetadata* characteristics,
+        int rotationOverride) const {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
-    return getCameraCharacteristicsLocked(id, overrideForPerfClass, characteristics);
+    return getCameraCharacteristicsLocked(id, overrideForPerfClass, characteristics,
+            rotationOverride);
 }
 
 status_t CameraProviderManager::getHighestSupportedVersion(const std::string &id,
@@ -750,14 +907,14 @@ void CameraProviderManager::saveRef(DeviceMode usageType, const std::string &cam
         primaryMap = &mCameraProviderByCameraId;
         alternateMap = &mTorchProviderByCameraId;
     }
-    auto id = cameraId.c_str();
-    (*primaryMap)[id] = provider;
-    auto search = alternateMap->find(id);
+
+    (*primaryMap)[cameraId] = provider;
+    auto search = alternateMap->find(cameraId);
     if (search != alternateMap->end()) {
         ALOGW("%s: Camera device %s is using both torch mode and camera mode simultaneously. "
-                "That should not be possible", __FUNCTION__, id);
+                "That should not be possible", __FUNCTION__, cameraId.c_str());
     }
-    ALOGV("%s: Camera device %s connected", __FUNCTION__, id);
+    ALOGV("%s: Camera device %s connected", __FUNCTION__, cameraId.c_str());
 }
 
 void CameraProviderManager::removeRef(DeviceMode usageType, const std::string &cameraId) {
@@ -772,7 +929,7 @@ void CameraProviderManager::removeRef(DeviceMode usageType, const std::string &c
         providerMap = &mCameraProviderByCameraId;
     }
     std::lock_guard<std::mutex> lock(mProviderInterfaceMapLock);
-    auto search = providerMap->find(cameraId.c_str());
+    auto search = providerMap->find(cameraId);
     if (search != providerMap->end()) {
         // Drop the reference to this ICameraProvider. This is safe to do immediately (without an
         // added delay) because hwservicemanager guarantees to hold the reference for at least five
@@ -781,7 +938,7 @@ void CameraProviderManager::removeRef(DeviceMode usageType, const std::string &c
         // restart it. An example when this could happen is switching from a front-facing to a
         // rear-facing camera. If the HAL were to exit during the camera switch, the camera could
         // appear janky to the user.
-        providerMap->erase(cameraId.c_str());
+        providerMap->erase(cameraId);
         IPCThreadState::self()->flushCommands();
     } else {
         ALOGE("%s: Asked to remove reference for camera %s, but no reference to it was found. This "
@@ -799,7 +956,7 @@ void CameraProviderManager::onServiceRegistration(const String16 &name, const sp
     {
         std::lock_guard<std::mutex> lock(mInterfaceMutex);
 
-        res = addAidlProviderLocked(String8(name).c_str());
+        res = addAidlProviderLocked(toStdString(name));
     }
 
     sp<StatusListener> listener = getStatusListener();
@@ -843,9 +1000,6 @@ status_t CameraProviderManager::dump(int fd, const Vector<String16>& args) {
 
 void CameraProviderManager::ProviderInfo::initializeProviderInfoCommon(
         const std::vector<std::string> &devices) {
-
-    sp<StatusListener> listener = mManager->getStatusListener();
-
     for (auto& device : devices) {
         std::string id;
         status_t res = addDevice(device, CameraDeviceStatus::PRESENT, &id);
@@ -860,37 +1014,21 @@ void CameraProviderManager::ProviderInfo::initializeProviderInfoCommon(
             mProviderName.c_str(), mDevices.size());
 
     // Process cached status callbacks
-    std::unique_ptr<std::vector<CameraStatusInfoT>> cachedStatus =
-            std::make_unique<std::vector<CameraStatusInfoT>>();
     {
         std::lock_guard<std::mutex> lock(mInitLock);
 
         for (auto& statusInfo : mCachedStatus) {
             std::string id, physicalId;
-            status_t res = OK;
             if (statusInfo.isPhysicalCameraStatus) {
-                res = physicalCameraDeviceStatusChangeLocked(&id, &physicalId,
+                physicalCameraDeviceStatusChangeLocked(&id, &physicalId,
                     statusInfo.cameraId, statusInfo.physicalCameraId, statusInfo.status);
             } else {
-                res = cameraDeviceStatusChangeLocked(&id, statusInfo.cameraId, statusInfo.status);
-            }
-            if (res == OK) {
-                cachedStatus->emplace_back(statusInfo.isPhysicalCameraStatus,
-                        id.c_str(), physicalId.c_str(), statusInfo.status);
+                cameraDeviceStatusChangeLocked(&id, statusInfo.cameraId, statusInfo.status);
             }
         }
         mCachedStatus.clear();
 
         mInitialized = true;
-    }
-
-    // The cached status change callbacks cannot be fired directly from this
-    // function, due to same-thread deadlock trying to acquire mInterfaceMutex
-    // twice.
-    if (listener != nullptr) {
-        mInitialStatusCallbackFuture = std::async(std::launch::async,
-                &CameraProviderManager::ProviderInfo::notifyInitialStatusChange, this,
-                listener, std::move(cachedStatus));
     }
 }
 
@@ -1011,19 +1149,21 @@ void CameraProviderManager::ProviderInfo::DeviceInfo3::getSupportedDurations(
     auto availableDurations = ch.find(tag);
     if (availableDurations.count > 0) {
         // Duration entry contains 4 elements (format, width, height, duration)
-        for (size_t i = 0; i < availableDurations.count; i += 4) {
-            for (const auto& size : sizes) {
-                int64_t width = std::get<0>(size);
-                int64_t height = std::get<1>(size);
+        for (const auto& size : sizes) {
+            int64_t width = std::get<0>(size);
+            int64_t height = std::get<1>(size);
+            for (size_t i = 0; i < availableDurations.count; i += 4) {
                 if ((availableDurations.data.i64[i] == format) &&
                         (availableDurations.data.i64[i+1] == width) &&
                         (availableDurations.data.i64[i+2] == height)) {
                     durations->push_back(availableDurations.data.i64[i+3]);
+                    break;
                 }
             }
         }
     }
 }
+
 void CameraProviderManager::ProviderInfo::DeviceInfo3::getSupportedDynamicDepthDurations(
         const std::vector<int64_t>& depthDurations, const std::vector<int64_t>& blobDurations,
         std::vector<int64_t> *dynamicDepthDurations /*out*/) {
@@ -1081,6 +1221,333 @@ void CameraProviderManager::ProviderInfo::DeviceInfo3::getSupportedDynamicDepthS
             dynamicDepthSizes->push_back(blobSize);
         }
     }
+}
+
+bool CameraProviderManager::isConcurrentDynamicRangeCaptureSupported(
+        const CameraMetadata& deviceInfo, int64_t profile, int64_t concurrentProfile) {
+    auto entry = deviceInfo.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
+    if (entry.count == 0) {
+        return false;
+    }
+
+    const auto it = std::find(entry.data.u8, entry.data.u8 + entry.count,
+            ANDROID_REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT);
+    if (it == entry.data.u8 + entry.count) {
+        return false;
+    }
+
+    entry = deviceInfo.find(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP);
+    if (entry.count == 0 || ((entry.count % 3) != 0)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < entry.count; i += 3) {
+        if (entry.data.i64[i] == profile) {
+            if ((entry.data.i64[i+1] == 0) || (entry.data.i64[i+1] & concurrentProfile)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::deriveHeicUltraHDRTags(
+        bool maxResolution) {
+    if (!flags::camera_heif_gainmap() || kFrameworkHeicUltraHDRDisabled ||
+            mCompositeHeicUltraHDRDisabled ||
+            !camera3::HeicCompositeStream::isInMemoryTempFileSupported()) {
+        return OK;
+    }
+
+    const int32_t scalerSizesTag =
+              SessionConfigurationUtils::getAppropriateModeTag(
+                      ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, maxResolution);
+    const int32_t scalerMinFrameDurationsTag = SessionConfigurationUtils::getAppropriateModeTag(
+            ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, maxResolution);
+    const int32_t scalerStallDurationsTag =
+                 SessionConfigurationUtils::getAppropriateModeTag(
+                        ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, maxResolution);
+
+    const int32_t heicUltraHDRSizesTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                    ANDROID_HEIC_AVAILABLE_HEIC_ULTRA_HDR_STREAM_CONFIGURATIONS, maxResolution);
+    const int32_t heicUltraHDRStallDurationsTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                    ANDROID_HEIC_AVAILABLE_HEIC_ULTRA_HDR_STALL_DURATIONS, maxResolution);
+    const int32_t heicUltraHDRFrameDurationsTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                 ANDROID_HEIC_AVAILABLE_HEIC_ULTRA_HDR_MIN_FRAME_DURATIONS, maxResolution);
+
+    auto& c = mCameraCharacteristics;
+    std::vector<std::tuple<size_t, size_t>> supportedP010Sizes, filteredSizes;
+    auto capabilities = c.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
+    if (capabilities.count == 0) {
+        ALOGE("%s: Supported camera capabilities is empty!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    auto end = capabilities.data.u8 + capabilities.count;
+    bool isTenBitOutputSupported = std::find(capabilities.data.u8, end,
+            ANDROID_REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT) != end;
+    if (!isTenBitOutputSupported) {
+        // No 10-bit support, nothing more to do.
+        return OK;
+    }
+
+    getSupportedSizes(c, scalerSizesTag,
+            static_cast<android_pixel_format_t>(HAL_PIXEL_FORMAT_YCBCR_P010), &supportedP010Sizes);
+    auto it = supportedP010Sizes.begin();
+    if (supportedP010Sizes.empty()) {
+        // Nothing to do in this case.
+        return OK;
+    }
+
+    std::vector<int32_t> heicUltraHDREntries;
+    int64_t stall = 0;
+    bool useHeic = false;
+    bool useGrid = false;
+    for (const auto& it : supportedP010Sizes) {
+        int32_t width = std::get<0>(it);
+        int32_t height = std::get<1>(it);
+        int32_t gainmapWidth = std::get<0>(it) / HeicCompositeStream::kGainmapScale;
+        int32_t gainmapHeight = std::get<1>(it) / HeicCompositeStream::kGainmapScale;
+        // Support gainmap sizes that are sufficiently aligned so CPU specific copy
+        // optimizations can be utilized without side effects.
+        if (((gainmapWidth % 64) == 0) && ((gainmapHeight % 2) == 0) &&
+                camera3::HeicCompositeStream::isSizeSupportedByHeifEncoder(width, height,
+                    &useHeic, &useGrid, &stall, nullptr /*hevcName*/,
+                    kFrameworkHeicAllowSWCodecs) &&
+                camera3::HeicCompositeStream::isSizeSupportedByHeifEncoder(gainmapWidth,
+                    gainmapHeight, &useHeic, &useGrid, &stall, nullptr /*hevcName*/,
+                    kFrameworkHeicAllowSWCodecs)) {
+            int32_t entry[4] = {HAL_PIXEL_FORMAT_BLOB, static_cast<int32_t> (std::get<0>(it)),
+                    static_cast<int32_t> (std::get<1>(it)),
+                    ANDROID_HEIC_AVAILABLE_HEIC_ULTRA_HDR_STREAM_CONFIGURATIONS_OUTPUT };
+            heicUltraHDREntries.insert(heicUltraHDREntries.end(), entry, entry + 4);
+            filteredSizes.push_back(it);
+        }
+    }
+
+    std::vector<int64_t> heicUltraHDRMinDurations, heicUltraHDRStallDurations;
+    auto ret = deriveBlobDurationEntries(c, maxResolution, filteredSizes,
+                                         &heicUltraHDRStallDurations, &heicUltraHDRMinDurations);
+    if (ret != OK) {
+        return ret;
+    }
+
+    return insertStreamConfigTags(heicUltraHDRSizesTag, heicUltraHDRFrameDurationsTag,
+                                  heicUltraHDRStallDurationsTag, heicUltraHDREntries,
+                                  heicUltraHDRMinDurations, heicUltraHDRStallDurations, &c);
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::insertStreamConfigTags(
+        int32_t sizeTag, int32_t minFrameDurationTag, int32_t stallDurationTag,
+        const std::vector<int32_t>& sizeEntries,
+        const std::vector<int64_t>& minFrameDurationEntries,
+        const std::vector<int64_t>& stallDurationEntries, CameraMetadata* c /*out*/) {
+    std::vector<int32_t> supportedChTags;
+    auto chTags = c->find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+    if (chTags.count == 0) {
+        ALOGE("%s: No supported camera characteristics keys!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+    supportedChTags.reserve(chTags.count + 3);
+    supportedChTags.insert(supportedChTags.end(), chTags.data.i32, chTags.data.i32 + chTags.count);
+    supportedChTags.push_back(sizeTag);
+    supportedChTags.push_back(minFrameDurationTag);
+    supportedChTags.push_back(stallDurationTag);
+    c->update(sizeTag, sizeEntries.data(), sizeEntries.size());
+    c->update(minFrameDurationTag, minFrameDurationEntries.data(), minFrameDurationEntries.size());
+    c->update(stallDurationTag, stallDurationEntries.data(), stallDurationEntries.size());
+    c->update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, supportedChTags.data(),
+              supportedChTags.size());
+
+    return OK;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::deriveBlobDurationEntries(
+        const CameraMetadata& c, bool maxResolution,
+        const std::vector<std::tuple<size_t, size_t>>& filteredSizes,
+        std::vector<int64_t>* filteredStallDurations /*out*/,
+        std::vector<int64_t>* filteredMinDurations /*out*/) {
+    std::vector<int64_t> blobMinDurations, blobStallDurations;
+    const int32_t scalerMinFrameDurationsTag = SessionConfigurationUtils::getAppropriateModeTag(
+            ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, maxResolution);
+    const int32_t scalerStallDurationsTag = SessionConfigurationUtils::getAppropriateModeTag(
+            ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, maxResolution);
+    // We use the jpeg stall and min frame durations to approximate the respective Heic UltraHDR
+    // durations.
+    getSupportedDurations(c, scalerMinFrameDurationsTag, HAL_PIXEL_FORMAT_BLOB, filteredSizes,
+                          &blobMinDurations);
+    getSupportedDurations(c, scalerStallDurationsTag, HAL_PIXEL_FORMAT_BLOB, filteredSizes,
+                          &blobStallDurations);
+    if (blobStallDurations.empty() || blobMinDurations.empty() ||
+        filteredSizes.size() != blobMinDurations.size() ||
+        blobMinDurations.size() != blobStallDurations.size()) {
+        ALOGE("%s: Unexpected number of available blob durations! %zu vs. %zu with "
+              "filteredSizes size: %zu",
+              __FUNCTION__, blobMinDurations.size(), blobStallDurations.size(),
+              filteredSizes.size());
+        return BAD_VALUE;
+    }
+
+    auto itDuration = blobMinDurations.begin();
+    auto itSize = filteredSizes.begin();
+    while (itDuration != blobMinDurations.end()) {
+        int64_t entry[4] = {HAL_PIXEL_FORMAT_BLOB, static_cast<int32_t>(std::get<0>(*itSize)),
+                            static_cast<int32_t>(std::get<1>(*itSize)), *itDuration};
+        filteredMinDurations->insert(filteredMinDurations->end(), entry, entry + 4);
+        itDuration++;
+        itSize++;
+    }
+
+    itDuration = blobStallDurations.begin();
+    itSize = filteredSizes.begin();
+    while (itDuration != blobStallDurations.end()) {
+        int64_t entry[4] = {HAL_PIXEL_FORMAT_BLOB, static_cast<int32_t>(std::get<0>(*itSize)),
+                            static_cast<int32_t>(std::get<1>(*itSize)), *itDuration};
+        filteredStallDurations->insert(filteredStallDurations->end(), entry, entry + 4);
+        itDuration++;
+        itSize++;
+    }
+
+    return OK;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::deriveJpegRTags(bool maxResolution) {
+    if (kFrameworkJpegRDisabled || mCompositeJpegRDisabled) {
+        return OK;
+    }
+
+    const int32_t scalerSizesTag =
+              SessionConfigurationUtils::getAppropriateModeTag(
+                      ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, maxResolution);
+    const int32_t scalerMinFrameDurationsTag = SessionConfigurationUtils::getAppropriateModeTag(
+            ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, maxResolution);
+    const int32_t scalerStallDurationsTag =
+                 SessionConfigurationUtils::getAppropriateModeTag(
+                        ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, maxResolution);
+
+    const int32_t jpegRSizesTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                    ANDROID_JPEGR_AVAILABLE_JPEG_R_STREAM_CONFIGURATIONS, maxResolution);
+    const int32_t jpegRStallDurationsTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                    ANDROID_JPEGR_AVAILABLE_JPEG_R_STALL_DURATIONS, maxResolution);
+    const int32_t jpegRMinFrameDurationsTag =
+            SessionConfigurationUtils::getAppropriateModeTag(
+                 ANDROID_JPEGR_AVAILABLE_JPEG_R_MIN_FRAME_DURATIONS, maxResolution);
+
+    auto& c = mCameraCharacteristics;
+    std::vector<std::tuple<size_t, size_t>> supportedP010Sizes, supportedBlobSizes;
+    auto capabilities = c.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
+    if (capabilities.count == 0) {
+        ALOGE("%s: Supported camera capabilities is empty!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    auto end = capabilities.data.u8 + capabilities.count;
+    bool isTenBitOutputSupported = std::find(capabilities.data.u8, end,
+            ANDROID_REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT) != end;
+    if (!isTenBitOutputSupported) {
+        // No 10-bit support, nothing more to do.
+        return OK;
+    }
+
+    if (!isConcurrentDynamicRangeCaptureSupported(c,
+                ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_HLG10,
+                ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD) &&
+            !property_get_bool("ro.camera.enableCompositeAPI0JpegR", false)) {
+        // API0, P010 only Jpeg/R support is meant to be used only as a reference due to possible
+        // impact on quality and performance.
+        // This data path will be turned off by default and individual device builds must enable
+        // 'ro.camera.enableCompositeAPI0JpegR' in order to experiment using it.
+        mCompositeJpegRDisabled = true;
+        return OK;
+    }
+
+    getSupportedSizes(c, scalerSizesTag,
+            static_cast<android_pixel_format_t>(HAL_PIXEL_FORMAT_BLOB), &supportedBlobSizes);
+    getSupportedSizes(c, scalerSizesTag,
+            static_cast<android_pixel_format_t>(HAL_PIXEL_FORMAT_YCBCR_P010), &supportedP010Sizes);
+    auto it = supportedP010Sizes.begin();
+    while (it != supportedP010Sizes.end()) {
+        if (std::find(supportedBlobSizes.begin(), supportedBlobSizes.end(), *it) ==
+                supportedBlobSizes.end()) {
+            it = supportedP010Sizes.erase(it);
+        } else {
+            it++;
+        }
+    }
+    if (supportedP010Sizes.empty()) {
+        // Nothing to do in this case.
+        return OK;
+    }
+
+    std::vector<int32_t> jpegREntries;
+    for (const auto& it : supportedP010Sizes) {
+        int32_t entry[4] = {HAL_PIXEL_FORMAT_BLOB, static_cast<int32_t> (std::get<0>(it)),
+                static_cast<int32_t> (std::get<1>(it)),
+                ANDROID_JPEGR_AVAILABLE_JPEG_R_STREAM_CONFIGURATIONS_OUTPUT };
+        jpegREntries.insert(jpegREntries.end(), entry, entry + 4);
+    }
+
+    std::vector<int64_t> jpegRMinDurations, jpegRStallDurations;
+    auto ret = deriveBlobDurationEntries(c, maxResolution, supportedP010Sizes, &jpegRStallDurations,
+                                         &jpegRMinDurations);
+    if (ret != OK) {
+        return ret;
+    }
+
+    ret = insertStreamConfigTags(jpegRSizesTag, jpegRMinFrameDurationsTag, jpegRStallDurationsTag,
+                                 jpegREntries, jpegRMinDurations, jpegRStallDurations, &c);
+    if (ret != OK) {
+        return ret;
+    }
+
+    auto colorSpaces = c.find(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP);
+    if (colorSpaces.count > 0 && !maxResolution) {
+        bool displayP3Support = false;
+        int64_t dynamicRange = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD;
+        for (size_t i = 0; i < colorSpaces.count; i += 3) {
+            auto colorSpace = colorSpaces.data.i64[i];
+            auto format = colorSpaces.data.i64[i+1];
+            bool formatMatch = (format == static_cast<int64_t>(PublicFormat::JPEG)) ||
+                    (format == static_cast<int64_t>(PublicFormat::UNKNOWN));
+            bool colorSpaceMatch =
+                colorSpace == ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_DISPLAY_P3;
+            if (formatMatch && colorSpaceMatch) {
+                displayP3Support = true;
+            }
+
+            // Jpeg/R will support the same dynamic range profiles as P010
+            if (format == static_cast<int64_t>(PublicFormat::YCBCR_P010)) {
+                dynamicRange |= colorSpaces.data.i64[i+2];
+            }
+        }
+        if (displayP3Support) {
+            std::vector<int64_t> supportedColorSpaces;
+            // Jpeg/R must support the default system as well ase display P3 color space
+            supportedColorSpaces.reserve(colorSpaces.count + 3*2);
+            supportedColorSpaces.insert(supportedColorSpaces.end(), colorSpaces.data.i64,
+                    colorSpaces.data.i64 + colorSpaces.count);
+
+            supportedColorSpaces.push_back(static_cast<int64_t>(
+                    ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_SRGB));
+            supportedColorSpaces.push_back(static_cast<int64_t>(PublicFormat::JPEG_R));
+            supportedColorSpaces.push_back(dynamicRange);
+
+            supportedColorSpaces.push_back(static_cast<int64_t>(
+                    ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_DISPLAY_P3));
+            supportedColorSpaces.push_back(static_cast<int64_t>(PublicFormat::JPEG_R));
+            supportedColorSpaces.push_back(dynamicRange);
+            c.update(ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP,
+                    supportedColorSpaces.data(), supportedColorSpaces.size());
+        }
+    }
+
+    return OK;
 }
 
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addDynamicDepthTags(
@@ -1273,6 +1740,58 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTag
     return res;
 }
 
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupManualFlashStrengthControlTags(
+            CameraMetadata& ch) {
+    status_t res = OK;
+    auto flashSingleStrengthMaxLevelEntry = ch.find(ANDROID_FLASH_SINGLE_STRENGTH_MAX_LEVEL);
+    if (flashSingleStrengthMaxLevelEntry.count == 0) {
+        int32_t flashSingleStrengthMaxLevel = 1;
+        res = ch.update(ANDROID_FLASH_SINGLE_STRENGTH_MAX_LEVEL,
+                &flashSingleStrengthMaxLevel, 1);
+        if (res != OK) {
+            ALOGE("%s: Failed to update ANDROID_FLASH_SINGLE_STRENGTH_MAX_LEVEL: %s (%d)",
+                    __FUNCTION__,strerror(-res), res);
+            return res;
+        }
+    }
+    auto flashSingleStrengthDefaultLevelEntry = ch.find(
+            ANDROID_FLASH_SINGLE_STRENGTH_DEFAULT_LEVEL);
+    if (flashSingleStrengthDefaultLevelEntry.count == 0) {
+        int32_t flashSingleStrengthDefaultLevel = 1;
+        res = ch.update(ANDROID_FLASH_SINGLE_STRENGTH_DEFAULT_LEVEL,
+                &flashSingleStrengthDefaultLevel, 1);
+        if (res != OK) {
+            ALOGE("%s: Failed to update ANDROID_FLASH_SINGLE_STRENGTH_DEFAULT_LEVEL: %s (%d)",
+                    __FUNCTION__,strerror(-res), res);
+            return res;
+        }
+    }
+    auto flashTorchStrengthMaxLevelEntry = ch.find(ANDROID_FLASH_TORCH_STRENGTH_MAX_LEVEL);
+    if (flashTorchStrengthMaxLevelEntry.count == 0) {
+        int32_t flashTorchStrengthMaxLevel = 1;
+        res = ch.update(ANDROID_FLASH_TORCH_STRENGTH_MAX_LEVEL,
+                &flashTorchStrengthMaxLevel, 1);
+        if (res != OK) {
+            ALOGE("%s: Failed to update ANDROID_FLASH_TORCH_STRENGTH_MAX_LEVEL: %s (%d)",
+                    __FUNCTION__,strerror(-res), res);
+            return res;
+        }
+    }
+    auto flashTorchStrengthDefaultLevelEntry = ch.find(ANDROID_FLASH_TORCH_STRENGTH_DEFAULT_LEVEL);
+    if (flashTorchStrengthDefaultLevelEntry.count == 0) {
+        int32_t flashTorchStrengthDefaultLevel = 1;
+        res = ch.update(ANDROID_FLASH_TORCH_STRENGTH_DEFAULT_LEVEL,
+                &flashTorchStrengthDefaultLevel, 1);
+        if (res != OK) {
+            ALOGE("%s: Failed to update ANDROID_FLASH_TORCH_STRENGTH_DEFAULT_LEVEL: %s (%d)",
+                    __FUNCTION__,strerror(-res), res);
+            return res;
+        }
+    }
+    return res;
+}
+
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupMonochromeTags() {
     status_t res = OK;
     auto& c = mCameraCharacteristics;
@@ -1367,6 +1886,49 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addRotateCropTags() {
     return res;
 }
 
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addAutoframingTags() {
+    status_t res = OK;
+    auto& c = mCameraCharacteristics;
+
+    auto availableAutoframingEntry = c.find(ANDROID_CONTROL_AUTOFRAMING_AVAILABLE);
+    if (availableAutoframingEntry.count == 0) {
+        uint8_t  defaultAutoframingEntry = ANDROID_CONTROL_AUTOFRAMING_AVAILABLE_FALSE;
+        res = c.update(ANDROID_CONTROL_AUTOFRAMING_AVAILABLE,
+                &defaultAutoframingEntry, 1);
+    }
+    return res;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addAePriorityModeTags() {
+    status_t res = OK;
+    auto& c = mCameraCharacteristics;
+
+    auto entry = c.find(ANDROID_CONTROL_AE_AVAILABLE_PRIORITY_MODES);
+    if (entry.count != 0) {
+        return res;
+    }
+
+    std::vector<int32_t> supportedChTags;
+    auto chTags = c.find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+    if (chTags.count == 0) {
+        ALOGE("%s: No supported camera characteristics keys!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    std::vector<uint8_t> aePriorityAvailableModes = {
+            ANDROID_CONTROL_AE_PRIORITY_MODE_OFF };
+    supportedChTags.reserve(chTags.count + 1);
+    supportedChTags.insert(supportedChTags.end(), chTags.data.i32,
+            chTags.data.i32 + chTags.count);
+    supportedChTags.push_back(ANDROID_CONTROL_AE_AVAILABLE_PRIORITY_MODES);
+    c.update(ANDROID_CONTROL_AE_AVAILABLE_PRIORITY_MODES,
+            aePriorityAvailableModes.data(), aePriorityAvailableModes.size());
+    c.update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, supportedChTags.data(),
+             supportedChTags.size());
+
+    return res;
+}
+
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addPreCorrectionActiveArraySize() {
     status_t res = OK;
     auto& c = mCameraCharacteristics;
@@ -1409,6 +1971,183 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addPreCorrectionActiv
         }
     }
 
+    return res;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addReadoutTimestampTag(
+        bool readoutTimestampSupported) {
+    status_t res = OK;
+    auto& c = mCameraCharacteristics;
+
+    auto entry = c.find(ANDROID_SENSOR_READOUT_TIMESTAMP);
+    if (entry.count == 0) {
+        uint8_t defaultReadoutTimestamp = readoutTimestampSupported ?
+                                          ANDROID_SENSOR_READOUT_TIMESTAMP_HARDWARE :
+                                          ANDROID_SENSOR_READOUT_TIMESTAMP_NOT_SUPPORTED;
+        res = c.update(ANDROID_SENSOR_READOUT_TIMESTAMP, &defaultReadoutTimestamp, 1);
+    }
+
+    return res;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addColorCorrectionAvailableModesTag(
+            CameraMetadata& c) {
+    status_t res = OK;
+
+    // The COLOR_CORRECTION_AVAILABLE_MODES key advertises the
+    // supported color correction modes. Previously, if color correction was
+    // supported (COLOR_CORRECTION_MODE was not null), it was assumed
+    // that all existing options, TRANSFORM_MATRIX, FAST, and HIGH_QUALITY, were supported.
+    // However, a new optional mode, CCT, has been introduced. To indicate
+    // whether CCT is supported, the camera device must now explicitly list all
+    // available modes using the COLOR_CORRECTION_AVAILABLE_MODES key.
+    // If the camera device doesn't set COLOR_CORRECTION_AVAILABLE_MODES,
+    // this code falls back to checking for the COLOR_CORRECTION_MODE key.
+    // If present, this adds the required supported modes TRANSFORM_MATRIX,
+    // FAST, HIGH_QUALITY.
+    auto entry = c.find(ANDROID_COLOR_CORRECTION_AVAILABLE_MODES);
+    if (entry.count != 0) {
+        return res;
+    }
+
+    auto reqKeys = c.find(ANDROID_REQUEST_AVAILABLE_REQUEST_KEYS);
+    if (reqKeys.count == 0) {
+        ALOGE("%s: No supported camera request keys!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    bool colorCorrectionModeAvailable = false;
+    for (size_t i = 0; i < reqKeys.count; i++) {
+        if (reqKeys.data.i32[i] == ANDROID_COLOR_CORRECTION_MODE) {
+            colorCorrectionModeAvailable = true;
+            break;
+        }
+    }
+
+    if (!colorCorrectionModeAvailable) {
+        return res;
+    }
+
+    std::vector<int32_t> supportedChTags;
+    auto chTags = c.find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+    if (chTags.count == 0) {
+        ALOGE("%s: No supported camera characteristics keys!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    std::vector<uint8_t> colorCorrectionAvailableModes = {
+            ANDROID_COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
+            ANDROID_COLOR_CORRECTION_MODE_FAST,
+            ANDROID_COLOR_CORRECTION_MODE_HIGH_QUALITY };
+    supportedChTags.reserve(chTags.count + 1);
+    supportedChTags.insert(supportedChTags.end(), chTags.data.i32,
+            chTags.data.i32 + chTags.count);
+    supportedChTags.push_back(ANDROID_COLOR_CORRECTION_AVAILABLE_MODES);
+    c.update(ANDROID_COLOR_CORRECTION_AVAILABLE_MODES,
+            colorCorrectionAvailableModes.data(), colorCorrectionAvailableModes.size());
+    c.update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, supportedChTags.data(),
+             supportedChTags.size());
+
+    return res;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addSessionConfigQueryVersionTag() {
+    sp<ProviderInfo> parentProvider = mParentProvider.promote();
+    if (parentProvider == nullptr) {
+        return DEAD_OBJECT;
+    }
+
+    int versionCode = ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION_UPSIDE_DOWN_CAKE;
+    IPCTransport ipcTransport = parentProvider->getIPCTransport();
+    auto& c = mCameraCharacteristics;
+    status_t res = OK;
+    if (ipcTransport != IPCTransport::AIDL) {
+        res = c.update(ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION, &versionCode, 1);
+        mSessionConfigQueryVersion = versionCode;
+        return res;
+    }
+
+    int deviceVersion = HARDWARE_DEVICE_API_VERSION(mVersion.get_major(), mVersion.get_minor());
+    if (deviceVersion == CAMERA_DEVICE_API_VERSION_1_3) {
+        versionCode = ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION_VANILLA_ICE_CREAM;
+    } else if (deviceVersion >= CAMERA_DEVICE_API_VERSION_1_4) {
+        if (flags::feature_combination_baklava()) {
+            versionCode = ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION_BAKLAVA;
+        } else {
+            versionCode = ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION_VANILLA_ICE_CREAM;
+        }
+    }
+    res = c.update(ANDROID_INFO_SESSION_CONFIGURATION_QUERY_VERSION, &versionCode, 1);
+    mSessionConfigQueryVersion = versionCode;
+    return res;
+}
+
+bool CameraProviderManager::ProviderInfo::DeviceInfo3::isAutomotiveDevice() {
+    // Checks the property ro.hardware.type and returns true if it is
+    // automotive.
+    char value[PROPERTY_VALUE_MAX] = {0};
+    property_get("ro.hardware.type", value, "");
+    return strncmp(value, "automotive", PROPERTY_VALUE_MAX) == 0;
+}
+
+status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addSharedSessionConfigurationTags() {
+    status_t res = OK;
+    if (flags::camera_multi_client()) {
+        const int32_t sharedColorSpaceTag = ANDROID_SHARED_SESSION_COLOR_SPACE;
+        const int32_t sharedOutputConfigurationsTag = ANDROID_SHARED_SESSION_OUTPUT_CONFIGURATIONS;
+        auto& c = mCameraCharacteristics;
+        uint8_t colorSpace = 0;
+
+        res = c.update(sharedColorSpaceTag, &colorSpace, 1);
+
+        // ToDo: b/372321187 Hardcoding the shared session configuration. Update the code to
+        // take these values from XML instead.
+        std::vector<int64_t> sharedOutputConfigEntries;
+        int64_t surfaceType1 =  OutputConfiguration::SURFACE_TYPE_IMAGE_READER;
+        int64_t width = 1280;
+        int64_t height = 800;
+        int64_t format1 = HAL_PIXEL_FORMAT_RGBA_8888;
+        int64_t mirrorMode = OutputConfiguration::MIRROR_MODE_AUTO;
+        int64_t timestampBase = OutputConfiguration::TIMESTAMP_BASE_DEFAULT;
+        int64_t usage1 = 3;
+        int64_t dataspace = 0;
+        int64_t useReadoutTimestamp = 0;
+        int64_t streamUseCase = ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT;
+        int64_t physicalCamIdLen = 0;
+
+        // Stream 1 configuration hardcoded
+        sharedOutputConfigEntries.push_back(surfaceType1);
+        sharedOutputConfigEntries.push_back(width);
+        sharedOutputConfigEntries.push_back(height);
+        sharedOutputConfigEntries.push_back(format1);
+        sharedOutputConfigEntries.push_back(mirrorMode);
+        sharedOutputConfigEntries.push_back(useReadoutTimestamp);
+        sharedOutputConfigEntries.push_back(timestampBase);
+        sharedOutputConfigEntries.push_back(dataspace);
+        sharedOutputConfigEntries.push_back(usage1);
+        sharedOutputConfigEntries.push_back(streamUseCase);
+        sharedOutputConfigEntries.push_back(physicalCamIdLen);
+
+        // Stream 2 configuration hardcoded
+        int64_t surfaceType2 =  OutputConfiguration::SURFACE_TYPE_SURFACE_VIEW;
+        int64_t format2 = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+        int64_t usage2 = 0;
+
+        sharedOutputConfigEntries.push_back(surfaceType2);
+        sharedOutputConfigEntries.push_back(width);
+        sharedOutputConfigEntries.push_back(height);
+        sharedOutputConfigEntries.push_back(format2);
+        sharedOutputConfigEntries.push_back(mirrorMode);
+        sharedOutputConfigEntries.push_back(useReadoutTimestamp);
+        sharedOutputConfigEntries.push_back(timestampBase);
+        sharedOutputConfigEntries.push_back(dataspace);
+        sharedOutputConfigEntries.push_back(usage2);
+        sharedOutputConfigEntries.push_back(streamUseCase);
+        sharedOutputConfigEntries.push_back(physicalCamIdLen);
+
+        res = c.update(sharedOutputConfigurationsTag, sharedOutputConfigEntries.data(),
+                sharedOutputConfigEntries.size());
+    }
     return res;
 }
 
@@ -1474,7 +2213,7 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fillHeicStreamCombina
         bool useGrid = false;
         if (camera3::HeicCompositeStream::isSizeSupportedByHeifEncoder(
                 halStreamConfigs.data.i32[i+1], halStreamConfigs.data.i32[i+2],
-                &useHeic, &useGrid, &stall)) {
+                &useHeic, &useGrid, &stall, nullptr /*hevcName*/, kFrameworkHeicAllowSWCodecs)) {
             if (useGrid != (format == HAL_PIXEL_FORMAT_YCBCR_420_888)) {
                 continue;
             }
@@ -1670,9 +2409,9 @@ CameraProviderManager::isHiddenPhysicalCameraInternal(const std::string& cameraI
 status_t CameraProviderManager::tryToInitializeAidlProviderLocked(
         const std::string& providerName, const sp<ProviderInfo>& providerInfo) {
     using aidl::android::hardware::camera::provider::ICameraProvider;
-    std::shared_ptr<ICameraProvider> interface =
-            ICameraProvider::fromBinder(ndk::SpAIBinder(
-                    AServiceManager_getService(providerName.c_str())));
+
+    // Only get remote instance if already running. Lazy Providers will be woken up later.
+    std::shared_ptr<ICameraProvider> interface = mAidlServiceProxy->tryGetService(providerName);
 
     if (interface == nullptr) {
         ALOGW("%s: AIDL Camera provider HAL '%s' is not actually available", __FUNCTION__,
@@ -1681,7 +2420,19 @@ status_t CameraProviderManager::tryToInitializeAidlProviderLocked(
     }
 
     AidlProviderInfo *aidlProviderInfo = static_cast<AidlProviderInfo *>(providerInfo.get());
-    return aidlProviderInfo->initializeAidlProvider(interface, mDeviceState);
+    status_t res = aidlProviderInfo->initializeAidlProvider(interface, mDeviceState);
+
+    if (flags::enable_hal_abort_from_cameraservicewatchdog()) {
+        pid_t pid = 0;
+
+        if (AIBinder_toPlatformBinder(interface->asBinder().get())->getDebugPid(&pid) == OK
+                && res == OK) {
+            std::lock_guard<std::mutex> lock(mProviderPidMapLock);
+            mProviderPidMap[providerInfo->mProviderInstance] = pid;
+        }
+    }
+
+    return res;
 }
 
 status_t CameraProviderManager::tryToInitializeHidlProviderLocked(
@@ -1698,7 +2449,23 @@ status_t CameraProviderManager::tryToInitializeHidlProviderLocked(
     }
 
     HidlProviderInfo *hidlProviderInfo = static_cast<HidlProviderInfo *>(providerInfo.get());
-    return hidlProviderInfo->initializeHidlProvider(interface, mDeviceState);
+    status_t res = hidlProviderInfo->initializeHidlProvider(interface, mDeviceState);
+
+    if (flags::enable_hal_abort_from_cameraservicewatchdog()) {
+        pid_t pid = 0;
+
+        auto ret = interface->getDebugInfo([&pid](
+                const ::android::hidl::base::V1_0::DebugInfo& info) {
+            pid = info.pid;
+        });
+
+        if (ret.isOk() && res == OK) {
+            std::lock_guard<std::mutex> lock(mProviderPidMapLock);
+            mProviderPidMap[providerInfo->mProviderInstance] = pid;
+        }
+    }
+
+    return res;
 }
 
 status_t CameraProviderManager::addAidlProviderLocked(const std::string& newProvider) {
@@ -1708,15 +2475,15 @@ status_t CameraProviderManager::addAidlProviderLocked(const std::string& newProv
     bool providerPresent = false;
     bool preexisting =
             (mAidlProviderWithBinders.find(newProvider) != mAidlProviderWithBinders.end());
-
-    // We need to use the extracted provider name here since 'newProvider' has
-    // the fully qualified name of the provider service in case of AIDL. We want
-    // just instance name.
     using aidl::android::hardware::camera::provider::ICameraProvider;
-    std::string extractedProviderName =
-            newProvider.substr(std::string(ICameraProvider::descriptor).size() + 1);
+
+    // 'newProvider' has the fully qualified name of the provider service in case of AIDL.
+    // ProviderInfo::mProviderName also has the fully qualified name - so we just compare them
+    // here.
+    std::string providerNameUsed = newProvider;
+
     for (const auto& providerInfo : mProviders) {
-        if (providerInfo->mProviderName == extractedProviderName) {
+        if (providerInfo->mProviderName == providerNameUsed) {
             ALOGW("%s: Camera provider HAL with name '%s' already registered",
                     __FUNCTION__, newProvider.c_str());
             // Do not add new instances for lazy HAL external provider or aidl
@@ -1733,7 +2500,7 @@ status_t CameraProviderManager::addAidlProviderLocked(const std::string& newProv
     }
 
     sp<AidlProviderInfo> providerInfo =
-            new AidlProviderInfo(extractedProviderName, providerInstance, this);
+            new AidlProviderInfo(providerNameUsed, providerInstance, this);
 
     if (!providerPresent) {
         status_t res = tryToInitializeAidlProviderLocked(newProvider, providerInfo);
@@ -1788,14 +2555,14 @@ status_t CameraProviderManager::addHidlProviderLocked(const std::string& newProv
 status_t CameraProviderManager::removeProvider(const std::string& provider) {
     std::lock_guard<std::mutex> providerLock(mProviderLifecycleLock);
     std::unique_lock<std::mutex> lock(mInterfaceMutex);
-    std::vector<String8> removedDeviceIds;
+    std::vector<std::string> removedDeviceIds;
     status_t res = NAME_NOT_FOUND;
     std::string removedProviderName;
     for (auto it = mProviders.begin(); it != mProviders.end(); it++) {
         if ((*it)->mProviderInstance == provider) {
             removedDeviceIds.reserve((*it)->mDevices.size());
             for (auto& deviceInfo : (*it)->mDevices) {
-                removedDeviceIds.push_back(String8(deviceInfo->mId.c_str()));
+                removedDeviceIds.push_back(deviceInfo->mId);
             }
             removedProviderName = (*it)->mProviderName;
             mProviders.erase(it);
@@ -1807,20 +2574,26 @@ status_t CameraProviderManager::removeProvider(const std::string& provider) {
         ALOGW("%s: Camera provider HAL with name '%s' is not registered", __FUNCTION__,
                 provider.c_str());
     } else {
+        if (flags::enable_hal_abort_from_cameraservicewatchdog()) {
+            {
+                std::lock_guard<std::mutex> pidLock(mProviderPidMapLock);
+                mProviderPidMap.erase(provider);
+            }
+        }
+
         // Check if there are any newer camera instances from the same provider and try to
         // initialize.
         for (const auto& providerInfo : mProviders) {
             if (providerInfo->mProviderName == removedProviderName) {
                 IPCTransport providerTransport = providerInfo->getIPCTransport();
-                std::string removedAidlProviderName = getFullAidlProviderName(removedProviderName);
                 switch(providerTransport) {
                     case IPCTransport::HIDL:
                         return tryToInitializeHidlProviderLocked(removedProviderName, providerInfo);
                     case IPCTransport::AIDL:
-                        return tryToInitializeAidlProviderLocked(removedAidlProviderName,
+                        return tryToInitializeAidlProviderLocked(removedProviderName,
                                 providerInfo);
                     default:
-                        ALOGE("%s Unsupported Transport %d", __FUNCTION__, providerTransport);
+                        ALOGE("%s Unsupported Transport %d", __FUNCTION__, eToI(providerTransport));
                 }
             }
         }
@@ -1849,13 +2622,12 @@ sp<CameraProviderManager::StatusListener> CameraProviderManager::getStatusListen
 CameraProviderManager::ProviderInfo::ProviderInfo(
         const std::string &providerName,
         const std::string &providerInstance,
-        CameraProviderManager *manager) :
+        [[maybe_unused]] CameraProviderManager *manager) :
         mProviderName(providerName),
         mProviderInstance(providerInstance),
         mProviderTagid(generateVendorTagId(providerName)),
         mUniqueDeviceCount(0),
         mManager(manager) {
-    (void) mManager;
 }
 
 const std::string& CameraProviderManager::ProviderInfo::getType() const {
@@ -1908,7 +2680,7 @@ status_t CameraProviderManager::ProviderInfo::addDevice(
             }
             break;
         default:
-            ALOGE("%s Invalid transport %d", __FUNCTION__, transport);
+            ALOGE("%s Invalid transport %d", __FUNCTION__, eToI(transport));
             return BAD_VALUE;
     }
 
@@ -1936,10 +2708,11 @@ status_t CameraProviderManager::ProviderInfo::addDevice(
     return OK;
 }
 
-void CameraProviderManager::ProviderInfo::removeDevice(std::string id) {
+void CameraProviderManager::ProviderInfo::removeDevice(const std::string &id) {
     for (auto it = mDevices.begin(); it != mDevices.end(); it++) {
         if ((*it)->mId == id) {
             mUniqueCameraIds.erase(id);
+            mUnavailablePhysicalCameras.erase(id);
             if ((*it)->isAPI1Compatible()) {
                 mUniqueAPI1CompatibleCameraIds.erase(std::remove(
                     mUniqueAPI1CompatibleCameraIds.begin(),
@@ -1975,15 +2748,34 @@ void CameraProviderManager::ProviderInfo::removeAllDevices() {
             ALOGV("%s: notify device not_present: %s",
                   __FUNCTION__,
                   deviceName.c_str());
-            listener->onDeviceStatusChanged(String8(id.c_str()),
-                                            CameraDeviceStatus::NOT_PRESENT);
+            listener->onDeviceStatusChanged(id, CameraDeviceStatus::NOT_PRESENT);
             mLock.lock();
         }
     }
 }
 
 bool CameraProviderManager::ProviderInfo::isExternalLazyHAL() const {
-    return kEnableLazyHal && (mProviderName == kExternalProviderName);
+    std::string providerName = mProviderName;
+    if (getIPCTransport() == IPCTransport::AIDL) {
+        using aidl::android::hardware::camera::provider::ICameraProvider;
+        providerName =
+                mProviderName.substr(std::string(ICameraProvider::descriptor).size() + 1);
+    }
+    return kEnableLazyHal && (providerName == kExternalProviderName);
+}
+
+std::set<pid_t> CameraProviderManager::getProviderPids() {
+    std::set<pid_t> pids;
+
+    if (flags::enable_hal_abort_from_cameraservicewatchdog()) {
+        std::lock_guard<std::mutex> lock(mProviderPidMapLock);
+
+        std::transform(mProviderPidMap.begin(), mProviderPidMap.end(),
+                    std::inserter(pids, pids.begin()),
+                    [](std::pair<const std::string, pid_t>& entry) { return entry.second; });
+    }
+
+    return pids;
 }
 
 status_t CameraProviderManager::ProviderInfo::dump(int fd, const Vector<String16>&) const {
@@ -2010,7 +2802,10 @@ status_t CameraProviderManager::ProviderInfo::dump(int fd, const Vector<String16
         dprintf(fd, "    Has a flash unit: %s\n",
                 device->hasFlashUnit() ? "true" : "false");
         hardware::CameraInfo info;
-        status_t res = device->getCameraInfo(&info);
+        int portraitRotation;
+        status_t res = device->getCameraInfo(
+                /*rotationOverride*/hardware::ICameraService::ROTATION_OVERRIDE_NONE,
+                &portraitRotation, &info);
         if (res != OK) {
             dprintf(fd, "   <Error reading camera info: %s (%d)>\n",
                     strerror(-res), res);
@@ -2020,7 +2815,8 @@ status_t CameraProviderManager::ProviderInfo::dump(int fd, const Vector<String16
             dprintf(fd, "    Orientation: %d\n", info.orientation);
         }
         CameraMetadata info2;
-        res = device->getCameraCharacteristics(true /*overrideForPerfClass*/, &info2);
+        res = device->getCameraCharacteristics(true /*overrideForPerfClass*/, &info2,
+                hardware::ICameraService::ROTATION_OVERRIDE_NONE);
         if (res == INVALID_OPERATION) {
             dprintf(fd, "  API2 not directly supported\n");
         } else if (res != OK) {
@@ -2074,8 +2870,7 @@ void CameraProviderManager::ProviderInfo::cameraDeviceStatusChangeInternal(
     CameraDeviceStatus internalNewStatus = newStatus;
     if (!mInitialized) {
         mCachedStatus.emplace_back(false /*isPhysicalCameraStatus*/,
-                cameraDeviceName.c_str(), std::string().c_str(),
-                internalNewStatus);
+                cameraDeviceName, std::string(), internalNewStatus);
         return;
     }
 
@@ -2089,7 +2884,7 @@ void CameraProviderManager::ProviderInfo::cameraDeviceStatusChangeInternal(
 
     // Call without lock held to allow reentrancy into provider manager
     if (listener != nullptr) {
-        listener->onDeviceStatusChanged(String8(id.c_str()), internalNewStatus);
+        listener->onDeviceStatusChanged(id, internalNewStatus);
     }
 }
 
@@ -2165,8 +2960,7 @@ void CameraProviderManager::ProviderInfo::physicalCameraDeviceStatusChangeIntern
     }
     // Call without lock held to allow reentrancy into provider manager
     if (listener != nullptr) {
-        listener->onDeviceStatusChanged(String8(id.c_str()),
-                String8(physicalId.c_str()), newStatus);
+        listener->onDeviceStatusChanged(id, physicalId, newStatus);
     }
     return;
 }
@@ -2207,8 +3001,17 @@ status_t CameraProviderManager::ProviderInfo::physicalCameraDeviceStatusChangeLo
         return BAD_VALUE;
     }
 
+    if (mUnavailablePhysicalCameras.count(cameraId) == 0) {
+        mUnavailablePhysicalCameras.emplace(cameraId, std::set<std::string>{});
+    }
+    if (newStatus != CameraDeviceStatus::PRESENT) {
+        mUnavailablePhysicalCameras[cameraId].insert(physicalCameraDeviceName);
+    } else {
+        mUnavailablePhysicalCameras[cameraId].erase(physicalCameraDeviceName);
+    }
+
     *id = cameraId;
-    *physicalId = physicalCameraDeviceName.c_str();
+    *physicalId = physicalCameraDeviceName;
     return OK;
 }
 
@@ -2237,7 +3040,7 @@ void CameraProviderManager::ProviderInfo::torchModeStatusChangeInternal(
         }
         if (!known) {
             ALOGW("Camera provider %s says an unknown camera %s now has torch status %d. Curious.",
-                    mProviderName.c_str(), cameraDeviceName.c_str(), newStatus);
+                mProviderName.c_str(), cameraDeviceName.c_str(), eToI(newStatus));
             return;
         }
         // no lock needed since listener is set up only once during
@@ -2252,7 +3055,7 @@ void CameraProviderManager::ProviderInfo::torchModeStatusChangeInternal(
     // findDeviceInfo, which should be holding mLock while iterating through
     // each provider's devices).
     if (listener != nullptr) {
-        listener->onTorchStatusChanged(String8(id.c_str()), newStatus, systemCameraKind);
+        listener->onTorchStatusChanged(id, newStatus, systemCameraKind);
     }
     return;
 }
@@ -2265,27 +3068,17 @@ void CameraProviderManager::ProviderInfo::notifyDeviceInfoStateChangeLocked(
     }
 }
 
-void CameraProviderManager::ProviderInfo::notifyInitialStatusChange(
-        sp<StatusListener> listener,
-        std::unique_ptr<std::vector<CameraStatusInfoT>> cachedStatus) {
-    for (auto& statusInfo : *cachedStatus) {
-        if (statusInfo.isPhysicalCameraStatus) {
-            listener->onDeviceStatusChanged(String8(statusInfo.cameraId.c_str()),
-                    String8(statusInfo.physicalCameraId.c_str()), statusInfo.status);
-        } else {
-            listener->onDeviceStatusChanged(
-                    String8(statusInfo.cameraId.c_str()), statusInfo.status);
-        }
-    }
-}
-
 CameraProviderManager::ProviderInfo::DeviceInfo3::DeviceInfo3(const std::string& name,
         const metadata_vendor_id_t tagId, const std::string &id,
         uint16_t minorVersion,
         const CameraResourceCost& resourceCost,
         sp<ProviderInfo> parentProvider,
         const std::vector<std::string>& publicCameraIds) :
-        DeviceInfo(name, tagId, id, hardware::hidl_version{3, minorVersion},
+        DeviceInfo(name, tagId, id,
+                   hardware::hidl_version{
+                        static_cast<uint16_t >(
+                                parentProvider->getIPCTransport() == IPCTransport::HIDL ? 3 : 1),
+                                minorVersion},
                    publicCameraIds, resourceCost, parentProvider) { }
 
 void CameraProviderManager::ProviderInfo::DeviceInfo3::notifyDeviceStateChange(int64_t newState) {
@@ -2293,13 +3086,23 @@ void CameraProviderManager::ProviderInfo::DeviceInfo3::notifyDeviceStateChange(i
             (mDeviceStateOrientationMap.find(newState) != mDeviceStateOrientationMap.end())) {
         mCameraCharacteristics.update(ANDROID_SENSOR_ORIENTATION,
                 &mDeviceStateOrientationMap[newState], 1);
+        if (mCameraCharNoPCOverride.get() != nullptr) {
+            mCameraCharNoPCOverride->update(ANDROID_SENSOR_ORIENTATION,
+                &mDeviceStateOrientationMap[newState], 1);
+        }
     }
 }
 
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::getCameraInfo(
+        int rotationOverride, int *portraitRotation,
         hardware::CameraInfo *info) const {
     if (info == nullptr) return BAD_VALUE;
 
+    bool freeform_compat_enabled = wm_flags::enable_camera_compat_for_desktop_windowing();
+    if (!freeform_compat_enabled &&
+            rotationOverride > hardware::ICameraService::ROTATION_OVERRIDE_OVERRIDE_TO_PORTRAIT) {
+        ALOGW("Camera compat freeform flag disabled but rotation override is %d", rotationOverride);
+    }
     camera_metadata_ro_entry facing =
             mCameraCharacteristics.find(ANDROID_LENS_FACING);
     if (facing.count == 1) {
@@ -2327,6 +3130,22 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::getCameraInfo(
         return NAME_NOT_FOUND;
     }
 
+    if (rotationOverride == hardware::ICameraService::ROTATION_OVERRIDE_OVERRIDE_TO_PORTRAIT
+            && (info->orientation == 0 || info->orientation == 180)) {
+        *portraitRotation = 90;
+        if (info->facing == hardware::CAMERA_FACING_FRONT) {
+            info->orientation = (360 + info->orientation - 90) % 360;
+        } else {
+            info->orientation = (360 + info->orientation + 90) % 360;
+        }
+    } else if (freeform_compat_enabled &&
+            rotationOverride == hardware::ICameraService::ROTATION_OVERRIDE_ROTATION_ONLY
+            && (info->orientation == 90 || info->orientation == 270)) {
+        *portraitRotation = info->facing == hardware::CAMERA_FACING_BACK ? 90 : 270;
+    } else {
+        *portraitRotation = 0;
+    }
+
     return OK;
 }
 bool CameraProviderManager::ProviderInfo::DeviceInfo3::isAPI1Compatible() const {
@@ -2352,13 +3171,45 @@ bool CameraProviderManager::ProviderInfo::DeviceInfo3::isAPI1Compatible() const 
 }
 
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::getCameraCharacteristics(
-        bool overrideForPerfClass, CameraMetadata *characteristics) const {
+        bool overrideForPerfClass, CameraMetadata *characteristics,
+        int rotationOverride) {
     if (characteristics == nullptr) return BAD_VALUE;
 
     if (!overrideForPerfClass && mCameraCharNoPCOverride != nullptr) {
         *characteristics = *mCameraCharNoPCOverride;
     } else {
         *characteristics = mCameraCharacteristics;
+    }
+
+    if (rotationOverride == hardware::ICameraService::ROTATION_OVERRIDE_OVERRIDE_TO_PORTRAIT) {
+        const auto &lensFacingEntry = characteristics->find(ANDROID_LENS_FACING);
+        const auto &sensorOrientationEntry = characteristics->find(ANDROID_SENSOR_ORIENTATION);
+        uint8_t lensFacing = lensFacingEntry.data.u8[0];
+        if (lensFacingEntry.count > 0 && sensorOrientationEntry.count > 0) {
+            int32_t sensorOrientation = sensorOrientationEntry.data.i32[0];
+            int32_t newSensorOrientation = sensorOrientation;
+
+            if (sensorOrientation == 0 || sensorOrientation == 180) {
+                if (lensFacing == ANDROID_LENS_FACING_FRONT) {
+                    newSensorOrientation = (360 + sensorOrientation - 90) % 360;
+                } else if (lensFacing == ANDROID_LENS_FACING_BACK) {
+                    newSensorOrientation = (360 + sensorOrientation + 90) % 360;
+                }
+            }
+
+            if (newSensorOrientation != sensorOrientation) {
+                ALOGV("%s: Update ANDROID_SENSOR_ORIENTATION for lens facing %d "
+                        "from %d to %d", __FUNCTION__, lensFacing, sensorOrientation,
+                        newSensorOrientation);
+                characteristics->update(ANDROID_SENSOR_ORIENTATION, &newSensorOrientation, 1);
+            }
+        }
+
+        if (characteristics->exists(ANDROID_INFO_DEVICE_STATE_ORIENTATIONS)) {
+            ALOGV("%s: Erasing ANDROID_INFO_DEVICE_STATE_ORIENTATIONS for lens facing %d",
+                    __FUNCTION__, lensFacing);
+            characteristics->erase(ANDROID_INFO_DEVICE_STATE_ORIENTATIONS);
+        }
     }
 
     return OK;
@@ -2392,8 +3243,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
     for (size_t i = 0; i < streamConfigs.count; i += 4) {
         if ((streamConfigs.data.i32[i] == HAL_PIXEL_FORMAT_BLOB) && (streamConfigs.data.i32[i+3] ==
                 ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT)) {
-            if (streamConfigs.data.i32[i+1] < thresholdW  ||
-                    streamConfigs.data.i32[i+2] < thresholdH) {
+            if (streamConfigs.data.i32[i+1] * streamConfigs.data.i32[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount ++;
@@ -2413,8 +3264,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
             mCameraCharacteristics.find(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
     for (size_t i = 0; i < minDurations.count; i += 4) {
         if (minDurations.data.i64[i] == HAL_PIXEL_FORMAT_BLOB) {
-            if (minDurations.data.i64[i+1] < thresholdW ||
-                    minDurations.data.i64[i+2] < thresholdH) {
+            if ((int32_t)minDurations.data.i64[i+1] * (int32_t)minDurations.data.i64[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount++;
@@ -2434,8 +3285,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
             mCameraCharacteristics.find(ANDROID_SCALER_AVAILABLE_STALL_DURATIONS);
     for (size_t i = 0; i < stallDurations.count; i += 4) {
         if (stallDurations.data.i64[i] == HAL_PIXEL_FORMAT_BLOB) {
-            if (stallDurations.data.i64[i+1] < thresholdW ||
-                    stallDurations.data.i64[i+2] < thresholdH) {
+            if ((int32_t)stallDurations.data.i64[i+1] * (int32_t)stallDurations.data.i64[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount++;
@@ -2628,9 +3479,6 @@ status_t CameraProviderManager::ProviderInfo::parseDeviceName(const std::string&
 }
 
 CameraProviderManager::ProviderInfo::~ProviderInfo() {
-    if (mInitialStatusCallbackFuture.valid()) {
-        mInitialStatusCallbackFuture.wait();
-    }
     // Destruction of ProviderInfo is only supposed to happen when the respective
     // CameraProvider interface dies, so do not unregister callbacks.
 }
@@ -2693,10 +3541,12 @@ status_t CameraProviderManager::isConcurrentSessionConfigurationSupported(
 }
 
 status_t CameraProviderManager::getCameraCharacteristicsLocked(const std::string &id,
-        bool overrideForPerfClass, CameraMetadata* characteristics) const {
+        bool overrideForPerfClass, CameraMetadata* characteristics,
+        int rotationOverride) const {
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo != nullptr) {
-        return deviceInfo->getCameraCharacteristics(overrideForPerfClass, characteristics);
+        return deviceInfo->getCameraCharacteristics(overrideForPerfClass, characteristics,
+                rotationOverride);
     }
 
     // Find hidden physical camera characteristics
@@ -2731,7 +3581,10 @@ void CameraProviderManager::filterLogicalCameraIdsLocked(
         combo.push_back(deviceId);
 
         hardware::CameraInfo info;
-        status_t res = deviceInfo->getCameraInfo(&info);
+        int portraitRotation;
+        status_t res = deviceInfo->getCameraInfo(
+                /*rotationOverride*/hardware::ICameraService::ROTATION_OVERRIDE_NONE,
+                &portraitRotation, &info);
         if (res != OK) {
             ALOGE("%s: Error reading camera info: %s (%d)", __FUNCTION__, strerror(-res), res);
             continue;
@@ -2757,6 +3610,11 @@ void CameraProviderManager::filterLogicalCameraIdsLocked(
                 return removedIds.find(s) != removedIds.end();}),
                 deviceIds.end());
     }
+}
+
+bool CameraProviderManager::isVirtualCameraHalEnabled() {
+    return vd_flags::virtual_camera_service_discovery() &&
+           vd_flags::virtual_camera_service_build_flag();
 }
 
 } // namespace android

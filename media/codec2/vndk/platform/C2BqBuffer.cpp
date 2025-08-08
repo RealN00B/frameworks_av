@@ -16,8 +16,10 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2BqBuffer"
+#define ATRACE_TAG  ATRACE_TAG_VIDEO
 #include <android/hardware_buffer.h>
 #include <utils/Log.h>
+#include <utils/Trace.h>
 
 #include <ui/BufferQueueDefs.h>
 #include <ui/GraphicBuffer.h>
@@ -33,10 +35,12 @@
 #include <C2FenceFactory.h>
 #include <C2SurfaceSyncObj.h>
 
+#include <atomic>
 #include <list>
 #include <map>
 #include <mutex>
 
+using ::android::ScopedTrace;
 using ::android::BufferQueueDefs::NUM_BUFFER_SLOTS;
 using ::android::C2AllocatorGralloc;
 using ::android::C2AndroidMemoryUsage;
@@ -392,6 +396,12 @@ private:
                     if (c2Fence) {
                         *c2Fence = _C2FenceFactory::CreateSurfaceFence(mSyncMem, waitId);
                     }
+                    if (mInvalidated) {
+                        if (c2Fence) {
+                            *c2Fence = C2Fence();
+                        }
+                        return C2_BAD_STATE;
+                    }
                     return C2_BLOCKING;
                 }
                 if (syncVar->getSyncStatusLocked() != C2SyncVariables::STATUS_ACTIVE) {
@@ -399,6 +409,12 @@ private:
                     syncVar->unlock();
                     if (c2Fence) {
                         *c2Fence = _C2FenceFactory::CreateSurfaceFence(mSyncMem, waitId);
+                    }
+                    if (mInvalidated) {
+                        if (c2Fence) {
+                            *c2Fence = C2Fence();
+                        }
+                        return C2_BAD_STATE;
                     }
                     return C2_BLOCKING;
                 }
@@ -432,12 +448,16 @@ private:
         if (fence) {
             static constexpr int kFenceWaitTimeMs = 10;
 
+            if (bufferNeedsReallocation) {
+                mBuffers[slot].clear();
+            }
+
             status_t status = fence->wait(kFenceWaitTimeMs);
             if (status == -ETIME) {
                 // fence is not signalled yet.
                 if (syncVar) {
-                    syncVar->lock();
                     (void)mProducer->cancelBuffer(slot, hFenceWrapper.getHandle()).isOk();
+                    syncVar->lock();
                     dequeueable = syncVar->notifyQueuedLocked(&waitId);
                     syncVar->unlock();
                     if (c2Fence) {
@@ -452,8 +472,8 @@ private:
             if (status != android::NO_ERROR) {
                 ALOGD("buffer fence wait error %d", status);
                 if (syncVar) {
-                    syncVar->lock();
                     (void)mProducer->cancelBuffer(slot, hFenceWrapper.getHandle()).isOk();
+                    syncVar->lock();
                     syncVar->notifyQueuedLocked();
                     syncVar->unlock();
                     if (c2Fence) {
@@ -502,8 +522,8 @@ private:
             } else if (status != android::NO_ERROR) {
                 slotBuffer.clear();
                 if (syncVar) {
-                    syncVar->lock();
                     (void)mProducer->cancelBuffer(slot, hFenceWrapper.getHandle()).isOk();
+                    syncVar->lock();
                     syncVar->notifyQueuedLocked();
                     syncVar->unlock();
                     if (c2Fence) {
@@ -550,8 +570,8 @@ private:
             // Block was not created. call requestBuffer# again next time.
             slotBuffer.clear();
             if (syncVar) {
-                syncVar->lock();
                 (void)mProducer->cancelBuffer(slot, hFenceWrapper.getHandle()).isOk();
+                syncVar->lock();
                 syncVar->notifyQueuedLocked();
                 syncVar->unlock();
                 if (c2Fence) {
@@ -568,11 +588,22 @@ private:
         return C2_BAD_VALUE;
     }
 
+    void clearDeferredBlocks_l() {
+        if (mHavingDeallocationDeferred) {
+            mHavingDeallocationDeferred = false;
+            for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
+                mBuffersWithDeallocationDeferred[i].clear();
+            }
+        }
+    }
+
 public:
     Impl(const std::shared_ptr<C2Allocator> &allocator)
         : mInit(C2_OK), mProducerId(0), mGeneration(0),
           mConsumerUsage(0), mDqFailure(0), mLastDqTs(0),
-          mLastDqLogTs(0), mAllocator(allocator), mIgbpValidityToken(std::make_shared<int>(0)) {
+          mLastDqLogTs(0), mAllocator(allocator),
+          mDeferDeallocationAfterStop(false),
+          mHavingDeallocationDeferred(false), mIgbpValidityToken(std::make_shared<int>(0)) {
     }
 
     ~Impl() {
@@ -597,6 +628,9 @@ public:
         static int kMaxIgbpRetryDelayUs = 10000;
 
         std::unique_lock<std::mutex> lock(mMutex);
+        if (mInvalidated) {
+            return C2_BAD_STATE;
+        }
         if (mLastDqLogTs == 0) {
             mLastDqLogTs = getTimestampNow();
         } else {
@@ -611,6 +645,7 @@ public:
             }
         }
         if (mProducerId == 0) {
+            clearDeferredBlocks_l();
             std::shared_ptr<C2GraphicAllocation> alloc;
             c2_status_t err = mAllocator->newGraphicAllocation(
                     width, height, format, usage, &alloc);
@@ -669,6 +704,7 @@ public:
                            uint32_t generation,
                            uint64_t usage,
                            bool bqInformation) {
+        bool toNullSurface = false;
         std::shared_ptr<C2SurfaceSyncMemory> c2SyncMem;
         if (syncHandle) {
             if (!producer) {
@@ -679,7 +715,6 @@ public:
             }
         }
         int migrated = 0;
-        std::shared_ptr<C2SurfaceSyncMemory> oldMem;
         // poolDatas dtor should not be called during lock is held.
         std::shared_ptr<C2BufferQueueBlockPoolData>
                 poolDatas[NUM_BUFFER_SLOTS];
@@ -692,13 +727,30 @@ public:
                 mProducerId = producerId;
                 mGeneration = bqInformation ? generation : 0;
             } else {
+                if (mProducer) {
+                    toNullSurface = true;
+                }
                 mProducer = nullptr;
                 mProducerId = 0;
                 mGeneration = 0;
                 ALOGD("configuring null producer: igbp_information(%d)", bqInformation);
             }
-            oldMem = mSyncMem; // preven destruction while locked.
-            mSyncMem = c2SyncMem;
+            if (mInvalidated) {
+                return;
+            }
+            {
+                std::unique_lock<std::mutex> memLock(mSyncMemMutex);
+                mOldMem = mSyncMem; // prevent destruction while locked.
+                                    // The waiters from the old memory will be
+                                    // woken up by the client after this
+                                    // configuration from HAL being finished.
+                                    // But we will keep this in case of the
+                                    // client being dead in between.
+                                    // In the case the death listener will wake
+                                    // up the wiators for the old memory using
+                                    // mOldMem here.
+                mSyncMem = c2SyncMem;
+            }
             C2SyncVariables *syncVar = mSyncMem ? mSyncMem->mem() : nullptr;
             if (syncVar) {
                 syncVar->lock();
@@ -724,6 +776,20 @@ public:
                 // old buffers should not be cancelled since the associated IGBP
                 // is no longer valid.
                 mIgbpValidityToken = std::make_shared<int>(0);
+                if (mDeferDeallocationAfterStop) {
+                    if (toNullSurface) {
+                        mHavingDeallocationDeferred = true;
+                        for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
+                            mBuffersWithDeallocationDeferred[i] = mBuffers[i];
+                        }
+                    }
+                }
+            }
+            if (!toNullSurface) {
+                clearDeferredBlocks_l();
+            }
+            if (mInvalidated) {
+                mIgbpValidityToken = std::make_shared<int>(0);
             }
             for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
                 mBuffers[i] = buffers[i];
@@ -740,6 +806,46 @@ public:
 
     void getConsumerUsage(uint64_t *consumeUsage) {
         *consumeUsage = mConsumerUsage;
+    }
+
+    void invalidate() {
+        std::shared_ptr<C2SurfaceSyncMemory> syncMem;
+        std::shared_ptr<C2SurfaceSyncMemory> oldMem;
+        {
+            std::unique_lock<std::mutex> l(mSyncMemMutex);
+            bool old = mInvalidated.exchange(true);
+            if (old) {
+                return;
+            }
+            syncMem = mSyncMem;
+            oldMem = mOldMem;
+        }
+        mIgbpValidityToken.reset();
+        C2SyncVariables *syncVar = syncMem ? syncMem->mem(): nullptr;
+        if (syncVar) {
+            syncVar->invalidate();
+        }
+        C2SyncVariables *oldVar = oldMem ? oldMem->mem(): nullptr;
+        if (oldVar) {
+            oldVar->invalidate();
+        }
+        // invalidate pending lock from a dead process if any
+        if (syncVar) {
+            syncVar->clearLockIfNecessary();
+        }
+        if (oldVar) {
+            oldVar->clearLockIfNecessary();
+        }
+    }
+
+    void setDeferDeallocationAfterStop() {
+        std::scoped_lock<std::mutex> lock(mMutex);
+        mDeferDeallocationAfterStop = true;
+    }
+
+    void clearDeferredBlocks() {
+        std::scoped_lock<std::mutex> lock(mMutex);
+        clearDeferredBlocks_l();
     }
 
 private:
@@ -764,7 +870,17 @@ private:
     sp<GraphicBuffer> mBuffers[NUM_BUFFER_SLOTS];
     std::weak_ptr<C2BufferQueueBlockPoolData> mPoolDatas[NUM_BUFFER_SLOTS];
 
+    // In order to workaround b/322731059,
+    // deallocating buffers due to stop using the current surface
+    // could be deferred until the component calling stop or a
+    // new allocation being requested.
+    bool mDeferDeallocationAfterStop;
+    bool mHavingDeallocationDeferred;
+    sp<GraphicBuffer> mBuffersWithDeallocationDeferred[NUM_BUFFER_SLOTS];
+
+    std::mutex mSyncMemMutex;
     std::shared_ptr<C2SurfaceSyncMemory> mSyncMem;
+    std::shared_ptr<C2SurfaceSyncMemory> mOldMem;
 
     // IGBP invalidation notification token.
     // The buffers(C2BufferQueueBlockPoolData) has the reference to the IGBP where
@@ -779,6 +895,7 @@ private:
     // if the token has been expired, the buffers will not call IGBP::cancelBuffer()
     // when they are no longer used.
     std::shared_ptr<int> mIgbpValidityToken;
+    std::atomic<bool> mInvalidated{false};
 };
 
 C2BufferQueueBlockPoolData::C2BufferQueueBlockPoolData(
@@ -813,11 +930,10 @@ C2BufferQueueBlockPoolData::~C2BufferQueueBlockPoolData() {
         if (mGeneration == mCurrentGeneration && mBqId == mCurrentBqId && !mOwner.expired()) {
             C2SyncVariables *syncVar = mSyncMem ? mSyncMem->mem() : nullptr;
             if (syncVar) {
+                mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
                 syncVar->lock();
-                if (syncVar->getSyncStatusLocked() == C2SyncVariables::STATUS_ACTIVE) {
-                    mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
-                    syncVar->notifyQueuedLocked();
-                }
+                syncVar->notifyQueuedLocked(nullptr,
+                        syncVar->getSyncStatusLocked() == C2SyncVariables::STATUS_ACTIVE);
                 syncVar->unlock();
             } else {
                 mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
@@ -826,11 +942,10 @@ C2BufferQueueBlockPoolData::~C2BufferQueueBlockPoolData() {
     } else if (!mOwner.expired()) {
         C2SyncVariables *syncVar = mSyncMem ? mSyncMem->mem() : nullptr;
         if (syncVar) {
+            mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
             syncVar->lock();
-            if (syncVar->getSyncStatusLocked() != C2SyncVariables::STATUS_SWITCHING) {
-                mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
-                syncVar->notifyQueuedLocked();
-            }
+            syncVar->notifyQueuedLocked(nullptr,
+                    syncVar->getSyncStatusLocked() != C2SyncVariables::STATUS_SWITCHING);
             syncVar->unlock();
         } else {
             mIgbp->cancelBuffer(mBqSlot, hidl_handle{}).isOk();
@@ -882,7 +997,7 @@ int C2BufferQueueBlockPoolData::migrate(
         return -1;
     }
 
-    if (toUsage != graphicBuffer->getUsage()) {
+    if ((toUsage & graphicBuffer->getUsage()) != toUsage) {
         sp<GraphicBuffer> newBuffer = new GraphicBuffer(
             graphicBuffer->handle, GraphicBuffer::CLONE_HANDLE,
             graphicBuffer->width, graphicBuffer->height, graphicBuffer->format,
@@ -1052,6 +1167,7 @@ c2_status_t C2BufferQueueBlockPool::fetchGraphicBlock(
         uint32_t format,
         C2MemoryUsage usage,
         std::shared_ptr<C2GraphicBlock> *block /* nonnull */) {
+    ScopedTrace trace(ATRACE_TAG,"C2BufferQueueBlockPool::fetchGraphicBlock");
     if (mImpl) {
         return mImpl->fetchGraphicBlock(width, height, format, usage, block, nullptr);
     }
@@ -1098,6 +1214,24 @@ void C2BufferQueueBlockPool::setRenderCallback(const OnRenderCallback &renderCal
 void C2BufferQueueBlockPool::getConsumerUsage(uint64_t *consumeUsage) {
     if (mImpl) {
         mImpl->getConsumerUsage(consumeUsage);
+    }
+}
+
+void C2BufferQueueBlockPool::invalidate() {
+    if (mImpl) {
+        mImpl->invalidate();
+    }
+}
+
+void C2BufferQueueBlockPool::setDeferDeallocationAfterStop() {
+    if (mImpl) {
+        mImpl->setDeferDeallocationAfterStop();
+    }
+}
+
+void C2BufferQueueBlockPool::clearDeferredBlocks() {
+    if (mImpl) {
+        mImpl->clearDeferredBlocks();
     }
 }
 

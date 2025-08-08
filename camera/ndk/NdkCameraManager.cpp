@@ -27,6 +27,8 @@
 #include "ndk_vendor/impl/ACameraManager.h"
 #else
 #include "impl/ACameraManager.h"
+#include <com_android_internal_camera_flags.h>
+namespace flags = com::android::internal::camera::flags;
 #endif
 #include "impl/ACameraMetadata.h"
 
@@ -68,7 +70,7 @@ void ACameraManager_deleteCameraIdList(ACameraIdList* cameraIdList) {
 
 EXPORT
 camera_status_t ACameraManager_registerAvailabilityCallback(
-        ACameraManager*, const ACameraManager_AvailabilityCallbacks *callback) {
+        ACameraManager* manager, const ACameraManager_AvailabilityCallbacks* callback) {
     ATRACE_CALL();
     if (callback == nullptr) {
         ALOGE("%s: invalid argument! callback is null!", __FUNCTION__);
@@ -81,13 +83,13 @@ camera_status_t ACameraManager_registerAvailabilityCallback(
                callback->onCameraAvailable, callback->onCameraUnavailable);
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
-    CameraManagerGlobal::getInstance().registerAvailabilityCallback(callback);
+    manager->registerAvailabilityCallback(callback);
     return ACAMERA_OK;
 }
 
 EXPORT
 camera_status_t ACameraManager_unregisterAvailabilityCallback(
-        ACameraManager*, const ACameraManager_AvailabilityCallbacks *callback) {
+        ACameraManager* manager, const ACameraManager_AvailabilityCallbacks* callback) {
     ATRACE_CALL();
     if (callback == nullptr) {
         ALOGE("%s: invalid argument! callback is null!", __FUNCTION__);
@@ -100,13 +102,13 @@ camera_status_t ACameraManager_unregisterAvailabilityCallback(
                callback->onCameraAvailable, callback->onCameraUnavailable);
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
-    CameraManagerGlobal::getInstance().unregisterAvailabilityCallback(callback);
+    manager->unregisterAvailabilityCallback(callback);
     return ACAMERA_OK;
 }
 
 EXPORT
 camera_status_t ACameraManager_registerExtendedAvailabilityCallback(
-        ACameraManager* /*manager*/, const ACameraManager_ExtendedAvailabilityCallbacks *callback) {
+        ACameraManager* manager, const ACameraManager_ExtendedAvailabilityCallbacks* callback) {
     ATRACE_CALL();
     if (callback == nullptr) {
         ALOGE("%s: invalid argument! callback is null!", __FUNCTION__);
@@ -131,13 +133,13 @@ camera_status_t ACameraManager_registerExtendedAvailabilityCallback(
             return ACAMERA_ERROR_INVALID_PARAMETER;
         }
     }
-    CameraManagerGlobal::getInstance().registerExtendedAvailabilityCallback(callback);
+    manager->registerExtendedAvailabilityCallback(callback);
     return ACAMERA_OK;
 }
 
 EXPORT
 camera_status_t ACameraManager_unregisterExtendedAvailabilityCallback(
-        ACameraManager* /*manager*/, const ACameraManager_ExtendedAvailabilityCallbacks *callback) {
+        ACameraManager* manager, const ACameraManager_ExtendedAvailabilityCallbacks* callback) {
     ATRACE_CALL();
     if (callback == nullptr) {
         ALOGE("%s: invalid argument! callback is null!", __FUNCTION__);
@@ -154,8 +156,25 @@ camera_status_t ACameraManager_unregisterExtendedAvailabilityCallback(
                callback->onCameraAccessPrioritiesChanged);
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
-    CameraManagerGlobal::getInstance().unregisterExtendedAvailabilityCallback(callback);
+    manager->unregisterExtendedAvailabilityCallback(callback);
     return ACAMERA_OK;
+}
+
+EXPORT
+camera_status_t ACameraManager_isCameraDeviceSharingSupported(ACameraManager *mgr,
+        const char *cameraId, bool *isSharingSupported) {
+    ATRACE_CALL();
+    #ifndef __ANDROID_VNDK__
+    if (!flags::camera_multi_client()) {
+        return ACAMERA_ERROR_UNSUPPORTED_OPERATION;
+    }
+    #endif
+    if (mgr == nullptr || cameraId == nullptr || isSharingSupported == nullptr) {
+        ALOGE("%s: invalid argument! mgr %p cameraId %p isSharingSupported %p",
+                __FUNCTION__, mgr, cameraId, isSharingSupported);
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+    return mgr->isCameraDeviceSharingSupported(cameraId, isSharingSupported);
 }
 
 EXPORT
@@ -188,7 +207,27 @@ camera_status_t ACameraManager_openCamera(
                 __FUNCTION__, mgr, cameraId, callback, device);
         return ACAMERA_ERROR_INVALID_PARAMETER;
     }
-    return mgr->openCamera(cameraId, callback, device);
+    bool primaryClient;
+    return mgr->openCamera(cameraId, /*sharedMode*/false, callback, device, &primaryClient);
+}
+
+EXPORT
+camera_status_t ACameraManager_openSharedCamera(
+        ACameraManager* mgr, const char* cameraId, ACameraDevice_StateCallbacks* callback,
+        /*out*/ACameraDevice** device, /*out*/bool* primaryClient) {
+    ATRACE_CALL();
+    #ifndef __ANDROID_VNDK__
+    if (!flags::camera_multi_client()) {
+        return ACAMERA_ERROR_UNSUPPORTED_OPERATION;
+    }
+    #endif
+    if (mgr == nullptr || cameraId == nullptr || callback == nullptr || device == nullptr ||
+            primaryClient == nullptr) {
+        ALOGE("%s: invalid argument! mgr %p cameraId %p callback %p device %p primary %p",
+                __FUNCTION__, mgr, cameraId, callback, device, primaryClient);
+        return ACAMERA_ERROR_INVALID_PARAMETER;
+    }
+    return mgr->openCamera(cameraId, /*sharedMode*/true, callback, device, primaryClient);
 }
 
 #ifdef __ANDROID_VNDK__

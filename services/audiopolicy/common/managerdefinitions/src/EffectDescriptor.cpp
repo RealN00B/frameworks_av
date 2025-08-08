@@ -18,8 +18,15 @@
 //#define LOG_NDEBUG 0
 
 #include <android-base/stringprintf.h>
+
+#include "AudioInputDescriptor.h"
 #include "EffectDescriptor.h"
+#include <system/audio_effects/audio_effects_utils.h>
 #include <utils/String8.h>
+
+#include <AudioPolicyInterface.h>
+#include "AudioPolicyMix.h"
+#include "HwModule.h"
 
 namespace android {
 
@@ -151,14 +158,18 @@ status_t EffectDescriptorCollection::setEffectEnabled(const sp<EffectDescriptor>
     return NO_ERROR;
 }
 
-bool EffectDescriptorCollection::isNonOffloadableEffectEnabled() const
+bool EffectDescriptorCollection::isNonOffloadableEffectEnabled(
+        const std::optional<const effect_uuid_t>& uuid) const
 {
+    using namespace android::effect::utils;
     for (size_t i = 0; i < size(); i++) {
         sp<EffectDescriptor> effectDesc = valueAt(i);
-        if (effectDesc->mEnabled && (effectDesc->isMusicEffect()) &&
-                ((effectDesc->mDesc.flags & EFFECT_FLAG_OFFLOAD_SUPPORTED) == 0)) {
-            ALOGV("isNonOffloadableEffectEnabled() non offloadable effect %s enabled on session %d",
-                  effectDesc->mDesc.name, effectDesc->mSession);
+        if ((effectDesc->mEnabled && (effectDesc->isMusicEffect()) &&
+             ((effectDesc->mDesc.flags & EFFECT_FLAG_OFFLOAD_SUPPORTED) == 0)) &&
+            (uuid == std::nullopt || uuid.value() == effectDesc->mDesc.uuid)) {
+            ALOGE("%s: non offloadable effect %s, uuid %s, enabled on session %d", __func__,
+                  effectDesc->mDesc.name, ToString(effectDesc->mDesc.uuid).c_str(),
+                  effectDesc->mSession);
             return true;
         }
     }
@@ -175,34 +186,63 @@ uint32_t EffectDescriptorCollection::getMaxEffectsMemory() const
     return MAX_EFFECTS_MEMORY;
 }
 
-void EffectDescriptorCollection::moveEffects(audio_session_t session,
-                                             audio_io_handle_t srcOutput,
-                                             audio_io_handle_t dstOutput)
+void EffectDescriptorCollection::moveEffects(audio_session_t sessionId, audio_io_handle_t srcIo,
+                                             audio_io_handle_t dstIo,
+                                             AudioPolicyClientInterface *clientInterface)
 {
-    ALOGV("%s session %d srcOutput %d dstOutput %d", __func__, session, srcOutput, dstOutput);
+    ALOGV("%s session %d srcIo %d dstIo %d", __func__, sessionId, srcIo, dstIo);
     for (size_t i = 0; i < size(); i++) {
         sp<EffectDescriptor> effect = valueAt(i);
-        if (effect->mSession == session && effect->mIo == srcOutput) {
-            effect->mIo = dstOutput;
+        if (effect->mSession == sessionId && effect->mIo == srcIo) {
+            effect->mIo = dstIo;
+            // Backup enable state before any updatePolicyState call
+            effect->mIsOrphan = (dstIo == AUDIO_IO_HANDLE_NONE);
         }
     }
+    clientInterface->moveEffects(sessionId, srcIo, dstIo);
 }
 
-void EffectDescriptorCollection::moveEffects(const std::vector<int>& ids,
-                                             audio_io_handle_t dstOutput)
+void EffectDescriptorCollection::moveEffects(const std::vector<int>& ids, audio_io_handle_t dstIo)
 {
-    ALOGV("%s num effects %zu, first ID %d, dstOutput %d",
-        __func__, ids.size(), ids.size() ? ids[0] : 0, dstOutput);
+    ALOGV("%s num effects %zu, first ID %d, dstIo %d",
+        __func__, ids.size(), ids.size() ? ids[0] : 0, dstIo);
     for (size_t i = 0; i < size(); i++) {
         sp<EffectDescriptor> effect = valueAt(i);
         if (std::find(begin(ids), end(ids), effect->mId) != end(ids)) {
-            effect->mIo = dstOutput;
+            effect->mIo = dstIo;
+            effect->mIsOrphan = (dstIo == AUDIO_IO_HANDLE_NONE);
         }
     }
 }
 
+bool EffectDescriptorCollection::hasOrphansForSession(audio_session_t sessionId,
+                                                      const effect_uuid_t* effectType) const {
+    for (size_t i = 0; i < size(); ++i) {
+        sp<EffectDescriptor> effect = valueAt(i);
+        if (effect->mSession == sessionId && effect->mIsOrphan &&
+            (effectType == nullptr ||
+             memcmp(&effect->mDesc.type, effectType, sizeof(effect_uuid_t)) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+EffectDescriptorCollection EffectDescriptorCollection::getOrphanEffectsForSession(
+        audio_session_t sessionId) const
+{
+    EffectDescriptorCollection effects;
+    for (size_t i = 0; i < size(); i++) {
+        sp<EffectDescriptor> effect = valueAt(i);
+        if (effect->mSession == sessionId && effect->mIsOrphan) {
+            effects.add(keyAt(i), effect);
+        }
+    }
+    return effects;
+}
+
 audio_io_handle_t EffectDescriptorCollection::getIoForSession(audio_session_t sessionId,
-                                                              const effect_uuid_t *effectType)
+                                                              const effect_uuid_t *effectType) const
 {
     for (size_t i = 0; i < size(); ++i) {
         sp<EffectDescriptor> effect = valueAt(i);
@@ -212,6 +252,84 @@ audio_io_handle_t EffectDescriptorCollection::getIoForSession(audio_session_t se
         }
     }
     return AUDIO_IO_HANDLE_NONE;
+}
+
+void EffectDescriptorCollection::moveEffectsForIo(audio_session_t session,
+        audio_io_handle_t dstIo, const AudioInputCollection *inputs,
+        AudioPolicyClientInterface *clientInterface)
+{
+    // No src io: try to find from effect session the src Io to move from
+    audio_io_handle_t srcIo = getIoForSession(session);
+    if (hasOrphansForSession(session) || (srcIo != AUDIO_IO_HANDLE_NONE && srcIo != dstIo)) {
+        moveEffects(session, srcIo, dstIo, inputs, clientInterface);
+    }
+}
+
+void EffectDescriptorCollection::moveEffects(audio_session_t session,
+        audio_io_handle_t srcIo, audio_io_handle_t dstIo, const AudioInputCollection *inputs,
+        AudioPolicyClientInterface *clientInterface)
+{
+    if ((srcIo != AUDIO_IO_HANDLE_NONE && srcIo == dstIo)
+            || (srcIo == AUDIO_IO_HANDLE_NONE && !hasOrphansForSession(session))) {
+        return;
+    }
+    // Either we may find orphan effects for given session or effects for this session might have
+    // been assigned first to another input (it may happen when an input is released or recreated
+    // after client sets its preferred device)
+    EffectDescriptorCollection effectsToMove;
+    if (srcIo == AUDIO_IO_HANDLE_NONE) {
+        ALOGV("%s: restoring effects for session %d from orphan park to io=%d", __func__,
+                session, dstIo);
+        effectsToMove = getOrphanEffectsForSession(session);
+    } else {
+        ALOGV("%s: moving effects for session %d from io=%d to io=%d", __func__, session, srcIo,
+              dstIo);
+        if (const sp<AudioInputDescriptor>& previousInputDesc = inputs->valueFor(srcIo)) {
+            effectsToMove = getEffectsForIo(srcIo);
+            for (size_t i = 0; i < effectsToMove.size(); ++i) {
+                const sp<EffectDescriptor>& effect = effectsToMove.valueAt(i);
+                effect->mEnabledWhenMoved = effect->mEnabled;
+                previousInputDesc->trackEffectEnabled(effect, false);
+            }
+        } else {
+            ALOGW("%s: no effect descriptor for srcIo %d", __func__, srcIo);
+        }
+    }
+    moveEffects(session, srcIo, dstIo, clientInterface);
+
+    if (dstIo != AUDIO_IO_HANDLE_NONE) {
+        if (const sp<AudioInputDescriptor>& inputDesc = inputs->valueFor(dstIo)) {
+            for (size_t i = 0; i < effectsToMove.size(); ++i) {
+                const sp<EffectDescriptor>& effect = effectsToMove.valueAt(i);
+                inputDesc->trackEffectEnabled(effect, effect->mEnabledWhenMoved);
+            }
+        } else {
+            ALOGW("%s: no effect descriptor for dstIo %d", __func__, dstIo);
+        }
+    }
+}
+
+void EffectDescriptorCollection::putOrphanEffectsForIo(audio_io_handle_t srcIo)
+{
+    for (size_t i = 0; i < size(); i++) {
+        sp<EffectDescriptor> effect = valueAt(i);
+        if (effect->mIo == srcIo) {
+            effect->mIo = AUDIO_IO_HANDLE_NONE;
+            effect->mIsOrphan = true;
+        }
+    }
+}
+
+void EffectDescriptorCollection::putOrphanEffects(audio_session_t session,
+        audio_io_handle_t srcIo, const AudioInputCollection *inputs,
+        AudioPolicyClientInterface *clientInterface)
+{
+    if (getIoForSession(session) != srcIo) {
+       // Effect session not held by this client io handle
+       return;
+    }
+    ALOGV("%s: park effects for session %d and io=%d to orphans", __func__, session, srcIo);
+    moveEffects(session, srcIo, AUDIO_IO_HANDLE_NONE, inputs, clientInterface);
 }
 
 EffectDescriptorCollection EffectDescriptorCollection::getEffectsForIo(audio_io_handle_t io) const

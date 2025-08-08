@@ -11,6 +11,7 @@ cc_defaults {
     double_loadable: true,
 
     srcs: [
+        ":libgui_frame_event_aidl",
         "FrameDropper.cpp",
         "GraphicBufferSource.cpp",
     ],
@@ -68,9 +69,6 @@ cc_library_shared {
     name: "libstagefright_bufferqueue_helper",
     defaults: ["libstagefright_bufferqueue-defaults"],
     vendor_available: true,
-    vndk: {
-        enabled: true,
-    },
     min_sdk_version: "29",
 
     shared_libs: [ "libgui" ],

@@ -25,6 +25,7 @@
 
 static constexpr int kMaxOperations = 50;
 static constexpr int kMaxStringLen = 256;
+static constexpr int kMaxSpaces = 1000;
 
 using android::content::AttributionSourceState;
 
@@ -35,7 +36,9 @@ const std::vector<std::function<void(FuzzedDataProvider*, android::MediaPackageM
             pm.allowPlaybackCapture(uid);
         },
         [](FuzzedDataProvider* data_provider, android::MediaPackageManager pm) -> void {
-            int spaces = data_provider->ConsumeIntegral<int>();
+           /* The large value of spaces was taking time in file write operation.
+            * Limited spaces values in range to avoid timeout.*/
+            int spaces = data_provider->ConsumeIntegralInRange<int>(0, kMaxSpaces);
 
             // Dump everything into /dev/null
             int fd = open("/dev/null", O_WRONLY);
@@ -50,6 +53,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     int32_t pid = data_provider.ConsumeIntegral<int32_t>();
     audio_source_t source = static_cast<audio_source_t>(data_provider
         .ConsumeIntegral<std::underlying_type_t<audio_source_t>>());
+    uint32_t deviceId = data_provider.ConsumeIntegral<uint32_t>();
 
     std::string packageNameStr = data_provider.ConsumeRandomLengthString(kMaxStringLen);
     std::string msgStr = data_provider.ConsumeRandomLengthString(kMaxStringLen);
@@ -67,8 +71,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     android::isAudioServerOrSystemServerUid(uid);
     android::isAudioServerOrMediaServerUid(uid);
     android::recordingAllowed(attributionSource);
-    android::startRecording(attributionSource, msgStr16, source);
-    android::finishRecording(attributionSource, source);
+    android::recordingAllowed(attributionSource, deviceId, source);
+    android::startRecording(attributionSource, deviceId, msgStr16, source);
+    android::finishRecording(attributionSource, deviceId, source);
     android::captureAudioOutputAllowed(attributionSource);
     android::captureMediaOutputAllowed(attributionSource);
     android::captureHotwordAllowed(attributionSource);

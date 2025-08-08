@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include "EngineBase.h"
-#include <EngineInterface.h>
-#include <AudioPolicyPluginInterface.h>
 #include "Collection.h"
+#include "EngineBase.h"
+#include <AudioPolicyPluginInterface.h>
+#include <CapEngineConfig.h>
+#include <EngineInterface.h>
 
 namespace android {
 class AudioPolicyManagerObserver;
@@ -33,15 +34,23 @@ class Engine : public EngineBase, AudioPolicyPluginInterface
 {
 public:
     Engine();
-    virtual ~Engine();
+    virtual ~Engine() = default;
 
     template <class RequestedInterface>
     RequestedInterface *queryInterface();
 
     ///
+    /// from EngineInterface
+    ///
+    status_t loadFromHalConfigWithFallback(
+            const media::audio::common::AudioHalEngineConfig& config) override;
+
+    status_t loadFromXmlConfigWithFallback(const std::string& xmlFilePath = "") override;
+
+    ///
     /// from EngineBase
     ///
-    android::status_t initCheck() override;
+    status_t initCheck() override;
 
     status_t setPhoneState(audio_mode_t mode) override;
 
@@ -51,8 +60,8 @@ public:
 
     audio_policy_forced_cfg_t getForceUse(audio_policy_force_use_t usage) const override;
 
-    android::status_t setDeviceConnectionState(const sp<DeviceDescriptor> devDesc,
-                                               audio_policy_dev_state_t state) override;
+    status_t setDeviceConnectionState(const sp<DeviceDescriptor> devDesc,
+                                      audio_policy_dev_state_t state) override;
 
     DeviceVector getOutputDevicesForAttributes(const audio_attributes_t &attr,
                                                const sp<DeviceDescriptor> &preferedDevice = nullptr,
@@ -63,10 +72,16 @@ public:
 
     sp<DeviceDescriptor> getInputDeviceForAttributes(const audio_attributes_t &attr,
                                                      uid_t uid = 0,
+                                                     audio_session_t session = AUDIO_SESSION_NONE,
                                                      sp<AudioPolicyMix> *mix = nullptr)
                                                      const override;
 
-    void updateDeviceSelectionCache() override;
+    status_t setDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role,
+                                       const AudioDeviceTypeAddrVector &devices) override;
+
+    status_t removeDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role,
+                const AudioDeviceTypeAddrVector &devices) override;
+    status_t clearDevicesRoleForStrategy(product_strategy_t strategy, device_role_t role) override;
 
     ///
     /// from AudioPolicyPluginInterface
@@ -93,8 +108,20 @@ public:
     {
         return EngineBase::getProductStrategyByName(name);
     }
+    std::string getProductStrategyName(product_strategy_t id) const override {
+        return EngineBase::getProductStrategyName(id);
+    }
 
 private:
+    template<typename T>
+    status_t loadWithFallback(const T& configSource);
+
+    android::status_t disableDevicesForStrategy(product_strategy_t strategy,
+            const DeviceVector &devicesToDisable);
+    void enableDevicesForStrategy(product_strategy_t strategy, const DeviceVector &devicesToEnable);
+    android::status_t setOutputDevicesConnectionState(const DeviceVector &devices,
+                                                      audio_policy_dev_state_t state);
+
     /* Copy facilities are put private to disable copy. */
     Engine(const Engine &object);
     Engine &operator=(const Engine &object);
@@ -120,20 +147,19 @@ private:
     template <typename Property, typename Key>
     bool setPropertyForKey(const Property &property, const Key &key);
 
-    status_t loadAudioPolicyEngineConfig();
-
-    DeviceVector getDevicesForProductStrategy(product_strategy_t strategy) const;
     DeviceVector getCachedDevices(product_strategy_t ps) const;
+
+    ///
+    /// from EngineBase
+    ///
+    DeviceVector getDevicesForProductStrategy(product_strategy_t strategy) const override;
 
     /**
      * Policy Parameter Manager hidden through a wrapper.
      */
     ParameterManagerWrapper *mPolicyParameterMgr;
-
-    DeviceStrategyMap mDevicesForStrategies;
 };
 
 } // namespace audio_policy
 
 } // namespace android
-

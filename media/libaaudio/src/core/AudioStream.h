@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <stdint.h>
 
 #include <android-base/thread_annotations.h>
@@ -27,6 +28,7 @@
 #include <utils/StrongPointer.h>
 
 #include <aaudio/AAudio.h>
+#include <media/AudioContainers.h>
 #include <media/AudioSystem.h>
 #include <media/PlayerBase.h>
 #include <media/VolumeShaper.h>
@@ -100,10 +102,17 @@ public:
                                        int64_t *timeNanoseconds) = 0;
 
     /**
-     * Update state machine.()
-     * @return
+     * Update state machine.
+     * @return result of the operation.
      */
-    virtual aaudio_result_t updateStateMachine() = 0;
+    aaudio_result_t updateStateMachine() {
+        if (isDataCallbackActive()) {
+            return AAUDIO_OK; // state is getting updated by the callback thread read/write call
+        }
+        return processCommands();
+    };
+
+    virtual aaudio_result_t processCommands() = 0;
 
     // =========== End ABSTRACT methods ===========================
 
@@ -165,7 +174,7 @@ public:
         return createThread_l(periodNanoseconds, threadProc, threadArg);
     }
 
-    aaudio_result_t joinThread(void **returnArg);
+    aaudio_result_t joinThread(void **returnArg) EXCLUDES(mStreamLock);
 
     virtual aaudio_result_t registerThread() {
         return AAUDIO_OK;
@@ -184,8 +193,10 @@ public:
     // ============== Queries ===========================
 
     aaudio_stream_state_t getState() const {
-        return mState;
+        return mState.load();
     }
+
+    aaudio_stream_state_t getStateExternal() const;
 
     virtual int32_t getBufferSize() const {
         return AAUDIO_ERROR_UNIMPLEMENTED;
@@ -195,8 +206,16 @@ public:
         return mBufferCapacity;
     }
 
+    virtual int32_t getDeviceBufferCapacity() const {
+        return mDeviceBufferCapacity;
+    }
+
     virtual int32_t getFramesPerBurst() const {
         return mFramesPerBurst;
+    }
+
+    virtual int32_t getDeviceFramesPerBurst() const {
+        return mDeviceFramesPerBurst;
     }
 
     virtual int32_t getXRunCount() const {
@@ -215,12 +234,32 @@ public:
         return mSampleRate;
     }
 
+    aaudio_result_t getDeviceSampleRate() const {
+        return mDeviceSampleRate;
+    }
+
+    aaudio_result_t getHardwareSampleRate() const {
+        return mHardwareSampleRate;
+    }
+
     audio_format_t getFormat()  const {
         return mFormat;
     }
 
+    audio_format_t getHardwareFormat()  const {
+        return mHardwareFormat;
+    }
+
     aaudio_result_t getSamplesPerFrame() const {
         return mSamplesPerFrame;
+    }
+
+    aaudio_result_t getDeviceSamplesPerFrame() const {
+        return mDeviceSamplesPerFrame;
+    }
+
+    aaudio_result_t getHardwareSamplesPerFrame() const {
+        return mHardwareSamplesPerFrame;
     }
 
     virtual int32_t getPerformanceMode() const {
@@ -231,8 +270,8 @@ public:
         mPerformanceMode = performanceMode;
     }
 
-    int32_t getDeviceId() const {
-        return mDeviceId;
+    android::DeviceIdVector getDeviceIds() const {
+        return mDeviceIds;
     }
 
     aaudio_sharing_mode_t getSharingMode() const {
@@ -251,6 +290,10 @@ public:
 
     aaudio_content_type_t getContentType() const {
         return mContentType;
+    }
+
+    const std::set<std::string>& getTags() const {
+        return mTags;
     }
 
     aaudio_spatialization_behavior_t getSpatializationBehavior() const {
@@ -290,7 +333,7 @@ public:
      * have been called.
      */
     int32_t getBytesPerFrame() const {
-        return mSamplesPerFrame * getBytesPerSample();
+        return audio_bytes_per_frame(mSamplesPerFrame, mFormat);
     }
 
     /**
@@ -301,10 +344,10 @@ public:
     }
 
     /**
-     * This is only valid after setChannelMask() and setDeviceFormat() have been called.
+     * This is only valid after setDeviceSamplesPerFrame() and setDeviceFormat() have been called.
      */
     int32_t getBytesPerDeviceFrame() const {
-        return getSamplesPerFrame() * audio_bytes_per_sample(getDeviceFormat());
+        return audio_bytes_per_frame(getDeviceSamplesPerFrame(), getDeviceFormat());
     }
 
     virtual int64_t getFramesWritten() = 0;
@@ -344,6 +387,29 @@ public:
         mSamplesPerFrame = AAudioConvert_channelMaskToCount(channelMask);
     }
 
+    void setDeviceSamplesPerFrame(int32_t deviceSamplesPerFrame) {
+        mDeviceSamplesPerFrame = deviceSamplesPerFrame;
+    }
+
+    virtual aaudio_result_t setOffloadDelayPadding(int32_t delayInFrames, int32_t paddingInFrames) {
+        return AAUDIO_ERROR_UNIMPLEMENTED;
+    }
+
+    virtual int32_t getOffloadDelay() {
+        return AAUDIO_ERROR_UNIMPLEMENTED;
+    }
+
+    virtual int32_t getOffloadPadding() {
+        return AAUDIO_ERROR_UNIMPLEMENTED;
+    }
+
+    virtual aaudio_result_t setOffloadEndOfStream() EXCLUDES(mStreamLock) {
+        return AAUDIO_ERROR_UNIMPLEMENTED;
+    }
+
+    virtual void setPresentationEndCallbackProc(AAudioStream_presentationEndCallback proc) { }
+    virtual void setPresentationEndCallbackUserData(void* userData) { }
+
     /**
      * @return true if data callback has been specified
      */
@@ -361,11 +427,11 @@ public:
     /**
      * @return true if called from the same thread as the callback
      */
-    bool collidesWithCallback() const;
+    virtual bool collidesWithCallback() const;
 
     // Implement AudioDeviceCallback
     void onAudioDeviceUpdate(audio_io_handle_t audioIo,
-            audio_port_handle_t deviceId) override {};
+            const android::DeviceIdVector& deviceIds) override {};
 
     // ============== I/O ===========================
     // A Stream will only implement read() or write() depending on its direction.
@@ -382,7 +448,7 @@ public:
     }
 
     // This is used by the AudioManager to duck and mute the stream when changing audio focus.
-    void setDuckAndMuteVolume(float duckAndMuteVolume);
+    void setDuckAndMuteVolume(float duckAndMuteVolume) EXCLUDES(mStreamLock);
 
     float getDuckAndMuteVolume() const {
         return mDuckAndMuteVolume;
@@ -403,7 +469,7 @@ public:
      * This should only be called for client streams and not for streams
      * that run in the service.
      */
-    void registerPlayerBase() {
+    virtual void registerPlayerBase() {
         if (getDirection() == AAUDIO_DIRECTION_OUTPUT) {
             mPlayerBase->registerWithAudioManager(this);
         }
@@ -417,11 +483,11 @@ public:
         mPlayerBase->unregisterWithAudioManager();
     }
 
-    aaudio_result_t systemStart();
+    aaudio_result_t systemStart() EXCLUDES(mStreamLock);
 
-    aaudio_result_t systemPause();
+    aaudio_result_t systemPause() EXCLUDES(mStreamLock);
 
-    aaudio_result_t safeFlush();
+    aaudio_result_t safeFlush() EXCLUDES(mStreamLock);
 
     /**
      * This is called when an app calls AAudioStream_requestStop();
@@ -432,14 +498,14 @@ public:
     /**
      * This is called internally when an app callback returns AAUDIO_CALLBACK_RESULT_STOP.
      */
-    aaudio_result_t systemStopInternal();
+    aaudio_result_t systemStopInternal() EXCLUDES(mStreamLock);
 
     /**
      * Safely RELEASE a stream after taking mStreamLock and checking
      * to make sure we are not being called from a callback.
      * @return AAUDIO_OK or a negative error
      */
-    aaudio_result_t safeRelease();
+    aaudio_result_t safeRelease() EXCLUDES(mStreamLock);
 
     /**
      * Safely RELEASE and CLOSE a stream after taking mStreamLock and checking
@@ -448,7 +514,7 @@ public:
      */
     aaudio_result_t safeReleaseClose();
 
-    aaudio_result_t safeReleaseCloseInternal();
+    aaudio_result_t safeReleaseCloseInternal() EXCLUDES(mStreamLock);
 
 protected:
 
@@ -521,13 +587,33 @@ protected:
     }
 
     // This should not be called after the open() call.
+    void setDeviceSampleRate(int32_t deviceSampleRate) {
+        mDeviceSampleRate = deviceSampleRate;
+    }
+
+    // This should not be called after the open() call.
+    void setHardwareSampleRate(int32_t hardwareSampleRate) {
+        mHardwareSampleRate = hardwareSampleRate;
+    }
+
+    // This should not be called after the open() call.
     void setFramesPerBurst(int32_t framesPerBurst) {
         mFramesPerBurst = framesPerBurst;
     }
 
     // This should not be called after the open() call.
+    void setDeviceFramesPerBurst(int32_t deviceFramesPerBurst) {
+        mDeviceFramesPerBurst = deviceFramesPerBurst;
+    }
+
+    // This should not be called after the open() call.
     void setBufferCapacity(int32_t bufferCapacity) {
         mBufferCapacity = bufferCapacity;
+    }
+
+    // This should not be called after the open() call.
+    void setDeviceBufferCapacity(int32_t deviceBufferCapacity) {
+        mDeviceBufferCapacity = deviceBufferCapacity;
     }
 
     // This should not be called after the open() call.
@@ -541,6 +627,16 @@ protected:
     }
 
     // This should not be called after the open() call.
+    void setHardwareFormat(audio_format_t format) {
+        mHardwareFormat = format;
+    }
+
+    // This should not be called after the open() call.
+    void setHardwareSamplesPerFrame(int32_t hardwareSamplesPerFrame) {
+        mHardwareSamplesPerFrame = hardwareSamplesPerFrame;
+    }
+
+    // This should not be called after the open() call.
     void setDeviceFormat(audio_format_t format) {
         mDeviceFormat = format;
     }
@@ -551,8 +647,13 @@ protected:
 
     void setState(aaudio_stream_state_t state);
 
-    void setDeviceId(int32_t deviceId) {
-        mDeviceId = deviceId;
+    bool isDisconnected() const {
+        return mDisconnected.load();
+    }
+    void setDisconnected();
+
+    void setDeviceIds(const android::DeviceIdVector& deviceIds) {
+        mDeviceIds = deviceIds;
     }
 
     // This should not be called after the open() call.
@@ -566,6 +667,8 @@ protected:
                                            REQUIRES(mStreamLock);
 
     aaudio_result_t joinThread_l(void **returnArg) REQUIRES(mStreamLock);
+
+    virtual aaudio_result_t systemStopInternal_l() REQUIRES(mStreamLock);
 
     std::atomic<bool>    mCallbackEnabled{false};
 
@@ -610,6 +713,15 @@ protected:
         mContentType = contentType;
     }
 
+    /**
+     * This should not be called after the open() call.
+     */
+    void setTags(const std::set<std::string> &tags) {
+        mTags = tags;
+    }
+
+    std::string getTagsAsString() const;
+
     void setSpatializationBehavior(aaudio_spatialization_behavior_t spatializationBehavior) {
         mSpatializationBehavior = spatializationBehavior;
     }
@@ -653,13 +765,15 @@ protected:
         mAudioBalance = audioBalance;
     }
 
+    aaudio_result_t safeStop_l() REQUIRES(mStreamLock);
+
     std::string mMetricsId; // set once during open()
 
     std::mutex                 mStreamLock;
 
-private:
+    const android::sp<MyPlayerBase>   mPlayerBase;
 
-    aaudio_result_t safeStop_l() REQUIRES(mStreamLock);
+private:
 
     /**
      * Release then close the stream.
@@ -672,23 +786,32 @@ private:
         close_l();
     }
 
-    const android::sp<MyPlayerBase>   mPlayerBase;
+    std::atomic<aaudio_stream_state_t>          mState{AAUDIO_STREAM_STATE_UNINITIALIZED};
+
+    std::atomic_bool            mDisconnected{false};
 
     // These do not change after open().
     int32_t                     mSamplesPerFrame = AAUDIO_UNSPECIFIED;
+    int32_t                     mDeviceSamplesPerFrame = AAUDIO_UNSPECIFIED;
+    int32_t                     mHardwareSamplesPerFrame = AAUDIO_UNSPECIFIED;
     aaudio_channel_mask_t       mChannelMask = AAUDIO_UNSPECIFIED;
     int32_t                     mSampleRate = AAUDIO_UNSPECIFIED;
-    int32_t                     mDeviceId = AAUDIO_UNSPECIFIED;
+    int32_t                     mDeviceSampleRate = AAUDIO_UNSPECIFIED;
+    int32_t                     mHardwareSampleRate = AAUDIO_UNSPECIFIED;
+    android::DeviceIdVector     mDeviceIds;
     aaudio_sharing_mode_t       mSharingMode = AAUDIO_SHARING_MODE_SHARED;
     bool                        mSharingModeMatchRequired = false; // must match sharing mode requested
     audio_format_t              mFormat = AUDIO_FORMAT_DEFAULT;
-    aaudio_stream_state_t       mState = AAUDIO_STREAM_STATE_UNINITIALIZED;
+    audio_format_t              mHardwareFormat = AUDIO_FORMAT_DEFAULT;
     aaudio_performance_mode_t   mPerformanceMode = AAUDIO_PERFORMANCE_MODE_NONE;
     int32_t                     mFramesPerBurst = 0;
+    int32_t                     mDeviceFramesPerBurst = 0;
     int32_t                     mBufferCapacity = 0;
+    int32_t                     mDeviceBufferCapacity = 0;
 
     aaudio_usage_t              mUsage           = AAUDIO_UNSPECIFIED;
     aaudio_content_type_t       mContentType     = AAUDIO_UNSPECIFIED;
+    std::set<std::string>       mTags;
     aaudio_spatialization_behavior_t mSpatializationBehavior = AAUDIO_UNSPECIFIED;
     bool                        mIsContentSpatialized = false;
     aaudio_input_preset_t       mInputPreset     = AAUDIO_UNSPECIFIED;

@@ -63,6 +63,8 @@ public:
      * HW Audio Source.
      */
     virtual bool isInternal() const { return false; }
+    virtual bool isCallRx() const { return false; }
+    virtual bool isCallTx() const { return false; }
     audio_port_handle_t portId() const { return mPortId; }
     uid_t uid() const { return mUid; }
     audio_session_t session() const { return mSessionId; };
@@ -165,6 +167,18 @@ public:
         mIsInvalid = true;
     }
 
+    bool getInternalMute() const { return mInternalMute; }
+
+    /**
+     * Set the internal mute for a client. Return true if the existing value is different from
+     * the given value.
+     */
+    bool setInternalMute(bool muted) {
+        const bool result = (mInternalMute != muted);
+        mInternalMute = muted;
+        return result;
+    }
+
 private:
     const audio_stream_type_t mStream;
     const product_strategy_t mStrategy;
@@ -178,6 +192,7 @@ private:
      */
     uint32_t mActivityCount = 0;
     bool mIsInvalid = false;
+    bool mInternalMute = false;
 };
 
 class RecordClientDescriptor: public ClientDescriptor
@@ -222,7 +237,8 @@ public:
                            const struct audio_port_config &config,
                            const sp<DeviceDescriptor>& srcDevice,
                            audio_stream_type_t stream, product_strategy_t strategy,
-                           VolumeSource volumeSource);
+                           VolumeSource volumeSource,
+                           bool isInternal, bool isCallRx, bool isCallTx);
 
     ~SourceClientDescriptor() override = default;
 
@@ -239,14 +255,18 @@ public:
     }
     void setUseSwBridge() { mUseSwBridge = true; }
     bool useSwBridge() const { return mUseSwBridge; }
+    bool canCloseOutput() const { return mCloseOutput; }
     bool isConnected() const { return mPatchHandle != AUDIO_PATCH_HANDLE_NONE; }
     audio_patch_handle_t getPatchHandle() const { return mPatchHandle; }
     sp<DeviceDescriptor> srcDevice() const { return mSrcDevice; }
     sp<DeviceDescriptor> sinkDevice() const { return mSinkDevice; }
     wp<SwAudioOutputDescriptor> swOutput() const { return mSwOutput; }
-    void setSwOutput(const sp<SwAudioOutputDescriptor>& swOutput);
+    void setSwOutput(const sp<SwAudioOutputDescriptor>& swOutput, bool closeOutput = false);
     wp<HwAudioOutputDescriptor> hwOutput() const { return mHwOutput; }
     void setHwOutput(const sp<HwAudioOutputDescriptor>& hwOutput);
+    bool isInternal() const override { return mIsInternal; }
+    bool isCallRx() const override { return mIsCallRx; }
+    bool isCallTx() const override { return mIsCallTx; }
 
     using ClientDescriptor::dump;
     void dump(String8 *dst, int spaces) const override;
@@ -258,34 +278,28 @@ public:
     wp<SwAudioOutputDescriptor> mSwOutput;
     wp<HwAudioOutputDescriptor> mHwOutput;
     bool mUseSwBridge = false;
-};
-
-/**
- * @brief The InternalSourceClientDescriptor class
- * Specialized Client Descriptor for either a raw patch created from @see createAudioPatch API
- * or for internal audio patches managed by APM (e.g. phone call patches).
- * Whatever the bridge created (software or hardware), we need a client to track the activity
- * and manage volumes.
- * The Audio Patch requested sink is expressed as a preferred device which allows to route
- * the SwOutput. Then APM will performs checks on the UID (against UID of Audioserver) of the
- * requester to prevent rerouting SwOutput involved in raw patches.
- */
-class InternalSourceClientDescriptor: public SourceClientDescriptor
-{
-public:
-    InternalSourceClientDescriptor(
-            audio_port_handle_t portId, uid_t uid, audio_attributes_t attributes,
-            const struct audio_port_config &config, const sp<DeviceDescriptor>& srcDevice,
-             const sp<DeviceDescriptor>& sinkDevice,
-            product_strategy_t strategy, VolumeSource volumeSource) :
-        SourceClientDescriptor(
-            portId, uid, attributes, config, srcDevice, AUDIO_STREAM_PATCH, strategy,
-            volumeSource)
-    {
-        setPreferredDeviceId(sinkDevice->getId());
-    }
-    bool isInternal() const override { return true; }
-    ~InternalSourceClientDescriptor() override = default;
+    /**
+     * For either HW bridge associated to a SwOutput for activity / volume or SwBridge for also
+     * sample rendering / activity & volume, an existing playback thread may be reused (e.g.
+     * not already opened at APM startup or Direct Output).
+     * If reusing an already opened output, when this output is not used anymore, the AudioFlinger
+     * patch must be updated to refine the output device(s) information and ensure the right
+     * behavior of AudioDeviceCallback.
+     */
+    bool mCloseOutput = false;
+    /**
+     * True for specialized Client Descriptor for either a raw patch created from
+     * @see createAudioPatch API or for internal audio patches managed by APM
+     * (e.g. phone call patches).
+     * Whatever the bridge created (software or hardware), we need a client to track the activity
+     * and manage volumes.
+     * The Audio Patch requested sink is expressed as a preferred device which allows to route
+     * the SwOutput. Then APM will performs checks on the UID (against UID of Audioserver) of the
+     * requester to prevent rerouting SwOutput involved in raw patches.
+     */
+    bool mIsInternal = false;
+    bool mIsCallRx = false;
+    bool mIsCallTx = false;
 };
 
 class SourceClientCollection :

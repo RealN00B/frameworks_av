@@ -17,48 +17,47 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "AudioTestUtils"
 
+#include <android-base/file.h>
 #include <system/audio_config.h>
 #include <utils/Log.h>
 
 #include "audio_test_utils.h"
 
-template <class T>
-constexpr void (*xmlDeleter)(T* t);
-template <>
-constexpr auto xmlDeleter<xmlDoc> = xmlFreeDoc;
-template <>
-constexpr auto xmlDeleter<xmlChar> = [](xmlChar* s) { xmlFree(s); };
-
-/** @return a unique_ptr with the correct deleter for the libxml2 object. */
-template <class T>
-constexpr auto make_xmlUnique(T* t) {
-    // Wrap deleter in lambda to enable empty base optimization
-    auto deleter = [](T* t) { xmlDeleter<T>(t); };
-    return std::unique_ptr<T, decltype(deleter)>{t, deleter};
-}
-
-// Generates a random string.
-void CreateRandomFile(int& fd) {
-    std::string filename = "/data/local/tmp/record-XXXXXX";
-    fd = mkstemp(filename.data());
-}
+#define WAIT_PERIOD_MS 10  // from AudioTrack.cpp
+#define MAX_WAIT_TIME_MS 5000
 
 void OnAudioDeviceUpdateNotifier::onAudioDeviceUpdate(audio_io_handle_t audioIo,
-                                                      audio_port_handle_t deviceId) {
-    std::unique_lock<std::mutex> lock{mMutex};
-    ALOGD("%s  audioIo=%d deviceId=%d", __func__, audioIo, deviceId);
-    mAudioIo = audioIo;
-    mDeviceId = deviceId;
+                                                      const DeviceIdVector& deviceIds) {
+    ALOGI("%s: audioIo=%d deviceIds=%s", __func__, audioIo, toString(deviceIds).c_str());
+    {
+        std::lock_guard lock(mMutex);
+        mAudioIo = audioIo;
+        mDeviceIds = deviceIds;
+    }
     mCondition.notify_all();
 }
 
-status_t OnAudioDeviceUpdateNotifier::waitForAudioDeviceCb() {
-    std::unique_lock<std::mutex> lock{mMutex};
-    if (mAudioIo == AUDIO_IO_HANDLE_NONE) {
+status_t OnAudioDeviceUpdateNotifier::waitForAudioDeviceCb(audio_port_handle_t expDeviceId) {
+    std::unique_lock lock(mMutex);
+    android::base::ScopedLockAssertion lock_assertion(mMutex);
+    if (mAudioIo == AUDIO_IO_HANDLE_NONE ||
+        (expDeviceId != AUDIO_PORT_HANDLE_NONE &&
+         std::find(mDeviceIds.begin(), mDeviceIds.end(), expDeviceId) == mDeviceIds.end())) {
         mCondition.wait_for(lock, std::chrono::milliseconds(500));
-        if (mAudioIo == AUDIO_IO_HANDLE_NONE) return TIMED_OUT;
+        if (mAudioIo == AUDIO_IO_HANDLE_NONE ||
+            (expDeviceId != AUDIO_PORT_HANDLE_NONE &&
+             std::find(mDeviceIds.begin(), mDeviceIds.end(), expDeviceId) == mDeviceIds.end())) {
+            return TIMED_OUT;
+        }
     }
     return OK;
+}
+
+std::pair<audio_io_handle_t, DeviceIdVector> OnAudioDeviceUpdateNotifier::getLastPortAndDevices()
+        const {
+    std::lock_guard lock(mMutex);
+    ALOGI("%s: audioIo=%d deviceIds=%s", __func__, mAudioIo, toString(mDeviceIds).c_str());
+    return {mAudioIo, mDeviceIds};
 }
 
 AudioPlayback::AudioPlayback(uint32_t sampleRate, audio_format_t format,
@@ -161,21 +160,21 @@ status_t AudioPlayback::start() {
 }
 
 void AudioPlayback::onBufferEnd() {
-    std::unique_lock<std::mutex> lock{mMutex};
+    std::lock_guard lock(mMutex);
     mStopPlaying = true;
-    mCondition.notify_all();
 }
 
 status_t AudioPlayback::fillBuffer() {
-    if (PLAY_STARTED != mState && PLAY_STOPPED != mState) return INVALID_OPERATION;
-    int retry = 25;
+    if (PLAY_STARTED != mState) return INVALID_OPERATION;
+    const int maxTries = MAX_WAIT_TIME_MS / WAIT_PERIOD_MS;
+    int counter = 0;
     uint8_t* ipBuffer = static_cast<uint8_t*>(static_cast<void*>(mMemory->unsecurePointer()));
     size_t nonContig = 0;
     size_t bytesAvailable = mMemCapacity - mBytesUsedSoFar;
     while (bytesAvailable > 0) {
         AudioTrack::Buffer trackBuffer;
         trackBuffer.frameCount = mTrack->frameCount() * 2;
-        status_t status = mTrack->obtainBuffer(&trackBuffer, retry, &nonContig);
+        status_t status = mTrack->obtainBuffer(&trackBuffer, 1, &nonContig);
         if (OK == status) {
             size_t bytesToCopy = std::min(bytesAvailable, trackBuffer.size());
             if (bytesToCopy > 0) {
@@ -184,14 +183,11 @@ status_t AudioPlayback::fillBuffer() {
             mTrack->releaseBuffer(&trackBuffer);
             mBytesUsedSoFar += bytesToCopy;
             bytesAvailable = mMemCapacity - mBytesUsedSoFar;
-            if (bytesAvailable == 0) {
-                stop();
-            }
+            counter = 0;
         } else if (WOULD_BLOCK == status) {
-            if (mStopPlaying)
-                return OK;
-            else
-                return TIMED_OUT;
+            // if not received a buffer for MAX_WAIT_TIME_MS, something has gone wrong
+            if (counter == maxTries) return TIMED_OUT;
+            counter++;
         }
     }
     return OK;
@@ -199,14 +195,20 @@ status_t AudioPlayback::fillBuffer() {
 
 status_t AudioPlayback::waitForConsumption(bool testSeek) {
     if (PLAY_STARTED != mState) return INVALID_OPERATION;
-    // in static buffer mode, lets not play clips with duration > 30 sec
-    int retry = 30;
-    // Total number of frames in the input file.
+
+    const int maxTries = MAX_WAIT_TIME_MS / WAIT_PERIOD_MS;
+    int counter = 0;
     size_t totalFrameCount = mMemCapacity / mTrack->frameSize();
-    while (!mStopPlaying && retry > 0) {
-        // Get the total numbers of frames played.
+    bool stopPlaying;
+    {
+        std::lock_guard lock(mMutex);
+        stopPlaying = mStopPlaying;
+    }
+    while (!stopPlaying && counter < maxTries) {
         uint32_t currPosition;
         mTrack->getPosition(&currPosition);
+        if (currPosition >= totalFrameCount) counter++;
+
         if (testSeek && (currPosition > totalFrameCount * 0.6)) {
             testSeek = false;
             if (!mTrack->hasStarted()) return BAD_VALUE;
@@ -227,10 +229,12 @@ status_t AudioPlayback::waitForConsumption(bool testSeek) {
             if (bufferPosition != setPosition) return BAD_VALUE;
             mTrack->start();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        retry--;
+        std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_PERIOD_MS));
+        std::lock_guard lock(mMutex);
+        stopPlaying = mStopPlaying;
     }
-    if (!mStopPlaying) return TIMED_OUT;
+    std::lock_guard lock(mMutex);
+    if (!mStopPlaying && counter == maxTries) return TIMED_OUT;
     return OK;
 }
 
@@ -244,9 +248,11 @@ status_t AudioPlayback::onProcess(bool testSeek) {
 }
 
 void AudioPlayback::stop() {
-    std::unique_lock<std::mutex> lock{mMutex};
-    mStopPlaying = true;
-    if (mState != PLAY_STOPPED) {
+    {
+        std::lock_guard lock(mMutex);
+        mStopPlaying = true;
+    }
+    if (mState != PLAY_STOPPED && mState != PLAY_NO_INIT) {
         int32_t msec = 0;
         (void)mTrack->pendingDuration(&msec);
         mTrack->stopAndJoinCallbacks();
@@ -273,10 +279,13 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
         return 0;
     }
 
-    // no more frames to read
-    if (mNumFramesReceived > mNumFramesToRecord || mStopRecording) {
-        mStopRecording = true;
-        return 0;
+    {
+        std::lock_guard l(mMutex);
+        // no more frames to read
+        if (mNumFramesReceived >= mNumFramesToRecord || mStopRecording) {
+            mStopRecording = true;
+            return 0;
+        }
     }
 
     int64_t timeUs = 0, position = 0, timeNs = 0;
@@ -288,6 +297,7 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
         ts.getBestTimestamp(&position, &timeNs, ExtendedTimestamp::TIMEBASE_MONOTONIC, &location) ==
                 OK) {
         // Use audio timestamp.
+        std::lock_guard l(mMutex);
         timeUs = timeNs / 1000 -
                  (position - mNumFramesReceived + mNumFramesLost) * usPerSec / mSampleRate;
     } else {
@@ -316,6 +326,7 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
         } else {
             numLostBytes = 0;
         }
+        std::lock_guard l(mMutex);
         const int64_t timestampUs =
                 ((1000000LL * mNumFramesReceived) + (mRecord->getSampleRate() >> 1)) /
                 mRecord->getSampleRate();
@@ -329,6 +340,7 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
     if (buffer.size() == 0) {
         ALOGW("Nothing is available from AudioRecord callback buffer");
     } else {
+        std::lock_guard l(mMutex);
         const size_t bufferSize = buffer.size();
         const int64_t timestampUs =
                 ((1000000LL * mNumFramesReceived) + (mRecord->getSampleRate() >> 1)) /
@@ -340,9 +352,12 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
     }
 
     if (tmpQueue.size() > 0) {
-        std::unique_lock<std::mutex> lock{mMutex};
-        for (auto it = tmpQueue.begin(); it != tmpQueue.end(); it++)
-            mBuffersReceived.push_back(std::move(*it));
+        {
+            std::lock_guard lock(mMutex);
+            mBuffersReceived.insert(mBuffersReceived.end(),
+                                    std::make_move_iterator(tmpQueue.begin()),
+                                    std::make_move_iterator(tmpQueue.end()));
+        }
         mCondition.notify_all();
     }
     return buffer.size();
@@ -350,17 +365,24 @@ size_t AudioCapture::onMoreData(const AudioRecord::Buffer& buffer) {
 
 void AudioCapture::onOverrun() {
     ALOGV("received event overrun");
-    mBufferOverrun = true;
 }
 
 void AudioCapture::onMarker(uint32_t markerPosition) {
     ALOGV("received Callback at position %d", markerPosition);
-    mReceivedCbMarkerAtPosition = markerPosition;
+    {
+        std::lock_guard l(mMutex);
+        mReceivedCbMarkerAtPosition = markerPosition;
+    }
+    mMarkerCondition.notify_all();
 }
 
 void AudioCapture::onNewPos(uint32_t markerPosition) {
     ALOGV("received Callback at position %d", markerPosition);
-    mReceivedCbMarkerCount++;
+    {
+        std::lock_guard l(mMutex);
+        mReceivedCbMarkerCount = mReceivedCbMarkerCount.value_or(0) + 1;
+    }
+    mMarkerCondition.notify_all();
 }
 
 void AudioCapture::onNewIAudioRecord() {
@@ -369,30 +391,16 @@ void AudioCapture::onNewIAudioRecord() {
 
 AudioCapture::AudioCapture(audio_source_t inputSource, uint32_t sampleRate, audio_format_t format,
                            audio_channel_mask_t channelMask, audio_input_flags_t flags,
-                           audio_session_t sessionId, AudioRecord::transfer_type transferType)
+                           audio_session_t sessionId, AudioRecord::transfer_type transferType,
+                           const audio_attributes_t* attributes)
     : mInputSource(inputSource),
       mSampleRate(sampleRate),
       mFormat(format),
       mChannelMask(channelMask),
       mFlags(flags),
       mSessionId(sessionId),
-      mTransferType(transferType) {
-    mFrameCount = 0;
-    mNotificationFrames = 0;
-    mNumFramesToRecord = 0;
-    mNumFramesReceived = 0;
-    mNumFramesLost = 0;
-    mBufferOverrun = false;
-    mMarkerPosition = 0;
-    mMarkerPeriod = 0;
-    mReceivedCbMarkerAtPosition = -1;
-    mReceivedCbMarkerCount = 0;
-    mState = REC_NO_INIT;
-    mStopRecording = false;
-#if RECORD_TO_FILE
-    CreateRandomFile(mOutFileFd);
-#endif
-}
+      mTransferType(transferType),
+      mAttributes(attributes) {}
 
 AudioCapture::~AudioCapture() {
     if (mOutFileFd > 0) close(mOutFileFd);
@@ -431,19 +439,20 @@ status_t AudioCapture::create() {
         if (mSampleRate == 48000) {  // test all available constructors
             mRecord = new AudioRecord(mInputSource, mSampleRate, mFormat, mChannelMask,
                                       attributionSource, mFrameCount, nullptr /* callback */,
-                                      mNotificationFrames, mSessionId, mTransferType, mFlags);
+                                      mNotificationFrames, mSessionId, mTransferType, mFlags,
+                                      mAttributes);
         } else {
             mRecord = new AudioRecord(attributionSource);
             status = mRecord->set(mInputSource, mSampleRate, mFormat, mChannelMask, mFrameCount,
                                   nullptr /* callback */, 0 /* notificationFrames */,
                                   false /* canCallJava */, mSessionId, mTransferType, mFlags,
-                                  attributionSource.uid, attributionSource.pid);
+                                  attributionSource.uid, attributionSource.pid, mAttributes);
         }
         if (NO_ERROR != status) return status;
     } else if (mTransferType == AudioRecord::TRANSFER_CALLBACK) {
         mRecord = new AudioRecord(mInputSource, mSampleRate, mFormat, mChannelMask,
                                   attributionSource, mFrameCount, this, mNotificationFrames,
-                                  mSessionId, mTransferType, mFlags);
+                                  mSessionId, mTransferType, mFlags, mAttributes);
     } else {
         ALOGE("Test application is not handling transfer type %s",
               AudioRecord::convertTransferToText(mTransferType));
@@ -458,6 +467,26 @@ status_t AudioCapture::create() {
         mMaxBytesPerCallback = mNotificationFrames * samplesPerFrame * bytesPerSample;
     }
     return status;
+}
+
+status_t AudioCapture::setRecordDuration(float durationInSec) {
+    if (REC_READY != mState) {
+        return INVALID_OPERATION;
+    }
+    uint32_t sampleRate = mSampleRate == 0 ? mRecord->getSampleRate() : mSampleRate;
+    mNumFramesToRecord = (sampleRate * durationInSec);
+    return OK;
+}
+
+status_t AudioCapture::enableRecordDump() {
+    if (mOutFileFd != -1) {
+        return INVALID_OPERATION;
+    }
+    TemporaryFile tf("/data/local/tmp");
+    tf.DoNotRemove();
+    mOutFileFd = tf.release();
+    mFileName = std::string{tf.path};
+    return OK;
 }
 
 sp<AudioRecord> AudioCapture::getAudioRecordHandle() {
@@ -480,8 +509,11 @@ status_t AudioCapture::start(AudioSystem::sync_event_t event, audio_session_t tr
 
 status_t AudioCapture::stop() {
     status_t status = OK;
-    mStopRecording = true;
-    if (mState != REC_STOPPED) {
+    {
+        std::lock_guard l(mMutex);
+        mStopRecording = true;
+    }
+    if (mState != REC_STOPPED && mState != REC_NO_INIT) {
         if (mInputSource != AUDIO_SOURCE_DEFAULT) {
             bool state = false;
             status = AudioSystem::isSourceActive(mInputSource, &state);
@@ -495,93 +527,135 @@ status_t AudioCapture::stop() {
 }
 
 status_t AudioCapture::obtainBuffer(RawBuffer& buffer) {
-    if (REC_STARTED != mState && REC_STOPPED != mState) return INVALID_OPERATION;
-    int retry = 25;
-    AudioRecord::Buffer recordBuffer;
-    recordBuffer.frameCount = mNotificationFrames;
+    if (REC_STARTED != mState) return INVALID_OPERATION;
+    const int maxTries = MAX_WAIT_TIME_MS / WAIT_PERIOD_MS;
+    int counter = 0;
     size_t nonContig = 0;
-    status_t status = mRecord->obtainBuffer(&recordBuffer, retry, &nonContig);
-    if (OK == status) {
-        const int64_t timestampUs =
-                ((1000000LL * mNumFramesReceived) + (mRecord->getSampleRate() >> 1)) /
-                mRecord->getSampleRate();
-        RawBuffer buff{-1, timestampUs, static_cast<int32_t>(recordBuffer.size())};
-        memcpy(buff.mData.get(), recordBuffer.data(), recordBuffer.size());
-        buffer = std::move(buff);
-        mNumFramesReceived += recordBuffer.size() / mRecord->frameSize();
-        mRecord->releaseBuffer(&recordBuffer);
-        if (mNumFramesReceived > mNumFramesToRecord) {
-            stop();
+    int64_t numFramesReceived;
+    {
+        std::lock_guard l(mMutex);
+        numFramesReceived = mNumFramesReceived;
+    }
+    while (numFramesReceived < mNumFramesToRecord) {
+        AudioRecord::Buffer recordBuffer;
+        recordBuffer.frameCount = mNotificationFrames;
+        status_t status = mRecord->obtainBuffer(&recordBuffer, 1, &nonContig);
+        if (OK == status) {
+            const int64_t timestampUs =
+                    ((1000000LL * numFramesReceived) + (mRecord->getSampleRate() >> 1)) /
+                    mRecord->getSampleRate();
+            RawBuffer buff{-1, timestampUs, static_cast<int32_t>(recordBuffer.size())};
+            memcpy(buff.mData.get(), recordBuffer.data(), recordBuffer.size());
+            buffer = std::move(buff);
+            numFramesReceived += recordBuffer.size() / mRecord->frameSize();
+            mRecord->releaseBuffer(&recordBuffer);
+            counter = 0;
+        } else if (WOULD_BLOCK == status) {
+            // if not received a buffer for MAX_WAIT_TIME_MS, something has gone wrong
+            if (counter++ == maxTries) status = TIMED_OUT;
         }
-    } else if (status == WOULD_BLOCK) {
-        if (mStopRecording)
-            return WOULD_BLOCK;
-        else
-            return TIMED_OUT;
+        std::lock_guard l(mMutex);
+        mNumFramesReceived = numFramesReceived;
+        if (TIMED_OUT == status) return status;
     }
     return OK;
 }
 
 status_t AudioCapture::obtainBufferCb(RawBuffer& buffer) {
     if (REC_STARTED != mState) return INVALID_OPERATION;
-    int retry = 10;
-    std::unique_lock<std::mutex> lock{mMutex};
-    while (mBuffersReceived.empty() && !mStopRecording && retry > 0) {
-        mCondition.wait_for(lock, std::chrono::milliseconds(100));
-        retry--;
+    const int maxTries = MAX_WAIT_TIME_MS / WAIT_PERIOD_MS;
+    int counter = 0;
+    std::unique_lock lock(mMutex);
+    android::base::ScopedLockAssertion lock_assertion(mMutex);
+    while (mBuffersReceived.empty() && !mStopRecording && counter < maxTries) {
+        mCondition.wait_for(lock, std::chrono::milliseconds(WAIT_PERIOD_MS));
+        counter++;
     }
     if (!mBuffersReceived.empty()) {
         auto it = mBuffersReceived.begin();
         buffer = std::move(*it);
         mBuffersReceived.erase(it);
     } else {
-        if (retry == 0) return TIMED_OUT;
-        if (mStopRecording)
-            return WOULD_BLOCK;
-        else
-            return UNKNOWN_ERROR;
+        if (!mStopRecording && counter == maxTries) return TIMED_OUT;
     }
     return OK;
 }
 
 status_t AudioCapture::audioProcess() {
     RawBuffer buffer;
-    while (true) {
-        status_t status;
+    status_t status = OK;
+    int64_t numFramesReceived;
+    {
+        std::lock_guard l(mMutex);
+        numFramesReceived = mNumFramesReceived;
+    }
+    while (numFramesReceived < mNumFramesToRecord && status == OK) {
         if (mTransferType == AudioRecord::TRANSFER_CALLBACK)
             status = obtainBufferCb(buffer);
         else
             status = obtainBuffer(buffer);
-        switch (status) {
-            case OK:
-                if (mOutFileFd > 0) {
-                    const char* ptr =
-                            static_cast<const char*>(static_cast<void*>(buffer.mData.get()));
-                    write(mOutFileFd, ptr, buffer.mCapacity);
-                }
-                break;
-            case WOULD_BLOCK:
-                return OK;
-            case TIMED_OUT:          // "recorder application timed out from receiving buffers"
-            case NO_INIT:            // "recorder not initialized"
-            case INVALID_OPERATION:  // "recorder not started"
-            case UNKNOWN_ERROR:      // "Unknown error"
-            default:
-                return status;
+        if (OK == status && mOutFileFd > 0) {
+            const char* ptr = static_cast<const char*>(static_cast<void*>(buffer.mData.get()));
+            write(mOutFileFd, ptr, buffer.mCapacity);
         }
+        std::lock_guard l(mMutex);
+        numFramesReceived = mNumFramesReceived;
     }
+    return OK;
+}
+
+uint32_t AudioCapture::getMarkerPeriod() const {
+    std::lock_guard l(mMutex);
+    return mMarkerPeriod;
+}
+
+uint32_t AudioCapture::getMarkerPosition() const {
+    std::lock_guard l(mMutex);
+    return mMarkerPosition;
+}
+
+void AudioCapture::setMarkerPeriod(uint32_t markerPeriod) {
+    std::lock_guard l(mMutex);
+    mMarkerPeriod = markerPeriod;
+}
+
+void AudioCapture::setMarkerPosition(uint32_t markerPosition) {
+    std::lock_guard l(mMutex);
+    mMarkerPosition = markerPosition;
+}
+
+uint32_t AudioCapture::waitAndGetReceivedCbMarkerAtPosition() const {
+    std::unique_lock lock(mMutex);
+    android::base::ScopedLockAssertion lock_assertion(mMutex);
+    mMarkerCondition.wait_for(lock, std::chrono::seconds(3), [this]() {
+        android::base::ScopedLockAssertion lock_assertion(mMutex);
+        return mReceivedCbMarkerAtPosition.has_value();
+    });
+    return mReceivedCbMarkerAtPosition.value_or(~0);
+}
+
+uint32_t AudioCapture::waitAndGetReceivedCbMarkerCount() const {
+    std::unique_lock lock(mMutex);
+    android::base::ScopedLockAssertion lock_assertion(mMutex);
+    mMarkerCondition.wait_for(lock, std::chrono::seconds(3), [this]() {
+        android::base::ScopedLockAssertion lock_assertion(mMutex);
+        return mReceivedCbMarkerCount.has_value();
+    });
+    return mReceivedCbMarkerCount.value_or(0);
 }
 
 status_t listAudioPorts(std::vector<audio_port_v7>& portsVec) {
     int attempts = 5;
     status_t status;
     unsigned int generation1, generation;
-    unsigned int numPorts = 0;
+    unsigned int numPorts;
     do {
         if (attempts-- < 0) {
             status = TIMED_OUT;
             break;
         }
+        // query for number of ports.
+        numPorts = 0;
         status = AudioSystem::listAudioPorts(AUDIO_PORT_ROLE_NONE, AUDIO_PORT_TYPE_NONE, &numPorts,
                                              nullptr, &generation1);
         if (status != NO_ERROR) {
@@ -613,13 +687,15 @@ status_t getPortById(const audio_port_handle_t portId, audio_port_v7& port) {
 }
 
 status_t getPortByAttributes(audio_port_role_t role, audio_port_type_t type,
-                             audio_devices_t deviceType, audio_port_v7& port) {
+                             audio_devices_t deviceType, const std::string& address,
+                             audio_port_v7& port) {
     std::vector<struct audio_port_v7> ports;
     status_t status = listAudioPorts(ports);
     if (status != OK) return status;
     for (auto i = 0; i < ports.size(); i++) {
         if (ports[i].role == role && ports[i].type == type &&
-            ports[i].ext.device.type == deviceType) {
+            ports[i].ext.device.type == deviceType &&
+            !strncmp(ports[i].ext.device.address, address.c_str(), AUDIO_DEVICE_MAX_ADDRESS_LEN)) {
             port = ports[i];
             return OK;
         }
@@ -631,12 +707,14 @@ status_t listAudioPatches(std::vector<struct audio_patch>& patchesVec) {
     int attempts = 5;
     status_t status;
     unsigned int generation1, generation;
-    unsigned int numPatches = 0;
+    unsigned int numPatches;
     do {
         if (attempts-- < 0) {
             status = TIMED_OUT;
             break;
         }
+        // query for number of patches.
+        numPatches = 0;
         status = AudioSystem::listAudioPatches(&numPatches, nullptr, &generation1);
         if (status != NO_ERROR) {
             ALOGE("AudioSystem::listAudioPatches returned error %d", status);
@@ -686,13 +764,15 @@ status_t getPatchForInputMix(audio_io_handle_t audioIo, audio_patch& patch) {
     return BAD_VALUE;
 }
 
-bool patchContainsOutputDevice(audio_port_handle_t deviceId, audio_patch patch) {
+// Check if the patch matches all the output devices in the deviceIds vector.
+bool patchMatchesOutputDevices(const DeviceIdVector& deviceIds, audio_patch patch) {
+    DeviceIdVector patchDeviceIds;
     for (auto j = 0; j < patch.num_sinks; j++) {
-        if (patch.sinks[j].type == AUDIO_PORT_TYPE_DEVICE && patch.sinks[j].id == deviceId) {
-            return true;
+        if (patch.sinks[j].type == AUDIO_PORT_TYPE_DEVICE) {
+            patchDeviceIds.push_back(patch.sinks[j].id);
         }
     }
-    return false;
+    return areDeviceIdsEqual(deviceIds, patchDeviceIds);
 }
 
 bool patchContainsInputDevice(audio_port_handle_t deviceId, audio_patch patch) {
@@ -704,10 +784,10 @@ bool patchContainsInputDevice(audio_port_handle_t deviceId, audio_patch patch) {
     return false;
 }
 
-bool checkPatchPlayback(audio_io_handle_t audioIo, audio_port_handle_t deviceId) {
+bool checkPatchPlayback(audio_io_handle_t audioIo, const DeviceIdVector& deviceIds) {
     struct audio_patch patch;
     if (getPatchForOutputMix(audioIo, patch) == OK) {
-        return patchContainsOutputDevice(deviceId, patch);
+        return patchMatchesOutputDevices(deviceIds, patch);
     }
     return false;
 }
@@ -721,184 +801,17 @@ bool checkPatchCapture(audio_io_handle_t audioIo, audio_port_handle_t deviceId) 
 }
 
 std::string dumpPortConfig(const audio_port_config& port) {
-    std::ostringstream result;
-    std::string deviceInfo;
-    if (port.type == AUDIO_PORT_TYPE_DEVICE) {
-        if (port.ext.device.type & AUDIO_DEVICE_BIT_IN) {
-            InputDeviceConverter::maskToString(port.ext.device.type, deviceInfo);
-        } else {
-            OutputDeviceConverter::maskToString(port.ext.device.type, deviceInfo);
-        }
-        deviceInfo += std::string(", address = ") + port.ext.device.address;
-    }
-    result << "audio_port_handle_t = " << port.id << ", "
-           << "Role = " << (port.role == AUDIO_PORT_ROLE_SOURCE ? "source" : "sink") << ", "
-           << "Type = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? "device" : "mix") << ", "
-           << "deviceInfo = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? deviceInfo : "") << ", "
-           << "config_mask = 0x" << std::hex << port.config_mask << std::dec << ", ";
-    if (port.config_mask & AUDIO_PORT_CONFIG_SAMPLE_RATE) {
-        result << "sample rate = " << port.sample_rate << ", ";
-    }
-    if (port.config_mask & AUDIO_PORT_CONFIG_CHANNEL_MASK) {
-        result << "channel mask = " << port.channel_mask << ", ";
-    }
-    if (port.config_mask & AUDIO_PORT_CONFIG_FORMAT) {
-        result << "format = " << port.format << ", ";
-    }
-    result << "input flags = " << port.flags.input << ", ";
-    result << "output flags = " << port.flags.output << ", ";
-    result << "mix io handle = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? 0 : port.ext.mix.handle)
-           << "\n";
-    return result.str();
+    auto aidlPortConfig = legacy2aidl_audio_port_config_AudioPortConfigFw(port);
+    return aidlPortConfig.ok() ? aidlPortConfig.value().toString()
+                               : "Error while converting audio port config to AIDL";
 }
 
 std::string dumpPatch(const audio_patch& patch) {
-    std::ostringstream result;
-    result << "----------------- Dumping Patch ------------ \n";
-    result << "Patch Handle: " << patch.id << ", sources: " << patch.num_sources
-           << ", sink: " << patch.num_sinks << "\n";
-    audio_port_v7 port;
-    for (uint32_t i = 0; i < patch.num_sources; i++) {
-        result << "----------------- Dumping Source Port Config @ index " << i
-               << " ------------ \n";
-        result << dumpPortConfig(patch.sources[i]);
-        result << "----------------- Dumping Source Port for id " << patch.sources[i].id
-               << " ------------ \n";
-        getPortById(patch.sources[i].id, port);
-        result << dumpPort(port);
-    }
-    for (uint32_t i = 0; i < patch.num_sinks; i++) {
-        result << "----------------- Dumping Sink Port Config @ index " << i << " ------------ \n";
-        result << dumpPortConfig(patch.sinks[i]);
-        result << "----------------- Dumping Sink Port for id " << patch.sinks[i].id
-               << " ------------ \n";
-        getPortById(patch.sinks[i].id, port);
-        result << dumpPort(port);
-    }
-    return result.str();
+    auto aidlPatch = legacy2aidl_audio_patch_AudioPatchFw(patch);
+    return aidlPatch.ok() ? aidlPatch.value().toString() : "Error while converting patch to AIDL";
 }
 
 std::string dumpPort(const audio_port_v7& port) {
-    std::ostringstream result;
-    std::string deviceInfo;
-    if (port.type == AUDIO_PORT_TYPE_DEVICE) {
-        if (port.ext.device.type & AUDIO_DEVICE_BIT_IN) {
-            InputDeviceConverter::maskToString(port.ext.device.type, deviceInfo);
-        } else {
-            OutputDeviceConverter::maskToString(port.ext.device.type, deviceInfo);
-        }
-        deviceInfo += std::string(", address = ") + port.ext.device.address;
-    }
-    result << "audio_port_handle_t = " << port.id << ", "
-           << "Role = " << (port.role == AUDIO_PORT_ROLE_SOURCE ? "source" : "sink") << ", "
-           << "Type = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? "device" : "mix") << ", "
-           << "deviceInfo = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? deviceInfo : "") << ", "
-           << "Name = " << port.name << ", "
-           << "num profiles = " << port.num_audio_profiles << ", "
-           << "mix io handle = " << (port.type == AUDIO_PORT_TYPE_DEVICE ? 0 : port.ext.mix.handle)
-           << ", ";
-    for (int i = 0; i < port.num_audio_profiles; i++) {
-        result << "AudioProfile = " << i << " {";
-        result << "format = " << port.audio_profiles[i].format << ", ";
-        result << "samplerates = ";
-        for (int j = 0; j < port.audio_profiles[i].num_sample_rates; j++) {
-            result << port.audio_profiles[i].sample_rates[j] << ", ";
-        }
-        result << "channelmasks = ";
-        for (int j = 0; j < port.audio_profiles[i].num_channel_masks; j++) {
-            result << "0x" << std::hex << port.audio_profiles[i].channel_masks[j] << std::dec
-                   << ", ";
-        }
-        result << "} ";
-    }
-    result << dumpPortConfig(port.active_config);
-    return result.str();
-}
-
-std::string getXmlAttribute(const xmlNode* cur, const char* attribute) {
-    auto charPtr = make_xmlUnique(xmlGetProp(cur, reinterpret_cast<const xmlChar*>(attribute)));
-    if (charPtr == NULL) {
-        return "";
-    }
-    std::string value(reinterpret_cast<const char*>(charPtr.get()));
-    return value;
-}
-
-status_t parse_audio_policy_configuration_xml(std::vector<std::string>& attachedDevices,
-                                              std::vector<MixPort>& mixPorts,
-                                              std::vector<Route>& routes) {
-    std::string path = audio_find_readable_configuration_file("audio_policy_configuration.xml");
-    if (path.length() == 0) return UNKNOWN_ERROR;
-    auto doc = make_xmlUnique(xmlParseFile(path.c_str()));
-    if (doc == nullptr) return UNKNOWN_ERROR;
-    xmlNode* root = xmlDocGetRootElement(doc.get());
-    if (root == nullptr) return UNKNOWN_ERROR;
-    if (xmlXIncludeProcess(doc.get()) < 0) return UNKNOWN_ERROR;
-    mixPorts.clear();
-    if (!xmlStrcmp(root->name, reinterpret_cast<const xmlChar*>("audioPolicyConfiguration"))) {
-        std::string raw{getXmlAttribute(root, "version")};
-        for (auto* child = root->xmlChildrenNode; child != nullptr; child = child->next) {
-            if (!xmlStrcmp(child->name, reinterpret_cast<const xmlChar*>("modules"))) {
-                xmlNode* root = child;
-                for (auto* child = root->xmlChildrenNode; child != nullptr; child = child->next) {
-                    if (!xmlStrcmp(child->name, reinterpret_cast<const xmlChar*>("module"))) {
-                        xmlNode* root = child;
-                        for (auto* child = root->xmlChildrenNode; child != nullptr;
-                             child = child->next) {
-                            if (!xmlStrcmp(child->name,
-                                           reinterpret_cast<const xmlChar*>("mixPorts"))) {
-                                xmlNode* root = child;
-                                for (auto* child = root->xmlChildrenNode; child != nullptr;
-                                     child = child->next) {
-                                    if (!xmlStrcmp(child->name,
-                                                   reinterpret_cast<const xmlChar*>("mixPort"))) {
-                                        MixPort mixPort;
-                                        xmlNode* root = child;
-                                        mixPort.name = getXmlAttribute(root, "name");
-                                        mixPort.role = getXmlAttribute(root, "role");
-                                        mixPort.flags = getXmlAttribute(root, "flags");
-                                        if (mixPort.role == "source") mixPorts.push_back(mixPort);
-                                    }
-                                }
-                            } else if (!xmlStrcmp(child->name, reinterpret_cast<const xmlChar*>(
-                                                                       "attachedDevices"))) {
-                                xmlNode* root = child;
-                                for (auto* child = root->xmlChildrenNode; child != nullptr;
-                                     child = child->next) {
-                                    if (!xmlStrcmp(child->name,
-                                                   reinterpret_cast<const xmlChar*>("item"))) {
-                                        auto xmlValue = make_xmlUnique(xmlNodeListGetString(
-                                                child->doc, child->xmlChildrenNode, 1));
-                                        if (xmlValue == nullptr) {
-                                            raw = "";
-                                        } else {
-                                            raw = reinterpret_cast<const char*>(xmlValue.get());
-                                        }
-                                        std::string& value = raw;
-                                        attachedDevices.push_back(std::move(value));
-                                    }
-                                }
-                            } else if (!xmlStrcmp(child->name,
-                                                  reinterpret_cast<const xmlChar*>("routes"))) {
-                                xmlNode* root = child;
-                                for (auto* child = root->xmlChildrenNode; child != nullptr;
-                                     child = child->next) {
-                                    if (!xmlStrcmp(child->name,
-                                                   reinterpret_cast<const xmlChar*>("route"))) {
-                                        Route route;
-                                        xmlNode* root = child;
-                                        route.name = getXmlAttribute(root, "name");
-                                        route.sources = getXmlAttribute(root, "sources");
-                                        route.sink = getXmlAttribute(root, "sink");
-                                        routes.push_back(route);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return OK;
+    auto aidlPort = legacy2aidl_audio_port_v7_AudioPortFw(port);
+    return aidlPort.ok() ? aidlPort.value().toString() : "Error while converting port to AIDL";
 }

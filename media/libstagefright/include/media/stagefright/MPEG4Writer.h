@@ -144,6 +144,7 @@ private:
     std::mutex mFallocMutex;
     bool mPreAllocFirstTime; // Pre-allocate space for file and track headers only once per file.
     uint64_t mPrevAllTracksTotalMetaDataSizeEstimate;
+    Condition mFdCond;
 
     List<Track *> mTracks;
 
@@ -196,7 +197,12 @@ private:
     typedef key_value_pair_t< const char *, Vector<uint16_t> > ItemRefs;
     typedef struct _ItemInfo {
         bool isGrid() const { return !strcmp("grid", itemType); }
-        bool isImage() const { return !strcmp("hvc1", itemType) || isGrid(); }
+        bool isImage() const {
+            return !strcmp("hvc1", itemType) || !strcmp("av01", itemType) || isGrid();
+        }
+        bool isGainmapMeta() const {
+            return !strcmp("tmap", itemType);
+        }
         const char *itemType;
         uint16_t itemId;
         bool isPrimary;
@@ -224,10 +230,17 @@ private:
         int32_t width;
         int32_t height;
         int32_t rotation;
-        sp<ABuffer> hvcc;
+        int32_t colorPrimaries;
+        int32_t colorTransfer;
+        int32_t colorMatrix;
+        bool colorRange;
+        Vector<uint8_t> bitsPerChannel;
+        sp<ABuffer> data;
     } ItemProperty;
 
     bool mHasFileLevelMeta;
+    bool mIsAvif; // used to differentiate HEIC and AVIF under the same OUTPUT_FORMAT_HEIF
+    bool mHasGainmap;
     uint64_t mFileLevelMetaDataSize;
     bool mHasMoovBox;
     uint32_t mPrimaryItemId;
@@ -237,6 +250,8 @@ private:
     bool mHasRefs;
     std::map<uint32_t, ItemInfo> mItems;
     Vector<ItemProperty> mProperties;
+
+    bool mHasDolbyVision;
 
     // Writer thread handling
     status_t startWriterThread();
@@ -341,6 +356,7 @@ private:
     void writeIdatBox();
     void writeIrefBox();
     void writePitmBox();
+    void writeGrplBox(const Vector<uint16_t> &items);
     void writeFileLevelMetaBox();
 
     void sendSessionSummary();

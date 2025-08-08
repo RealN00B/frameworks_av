@@ -42,6 +42,10 @@ cc_library {
         "libnativewindow_headers",
     ],
 
+    static_libs: [
+        "libyuv", // for conversion routines
+    ],
+
     shared_libs: [
         "libcutils", // for properties
         "liblog", // for ALOG

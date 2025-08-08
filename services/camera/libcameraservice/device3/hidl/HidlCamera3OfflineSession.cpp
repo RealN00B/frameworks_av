@@ -22,7 +22,9 @@
 
 #include <utils/Trace.h>
 
+#include <android/hardware/ICameraService.h>
 #include <android/hardware/camera2/ICameraDeviceCallbacks.h>
+#include <camera/StringUtils.h>
 
 #include "device3/hidl/HidlCamera3OfflineSession.h"
 #include "device3/Camera3OutputStream.h"
@@ -38,8 +40,8 @@ namespace android {
 
 HidlCamera3OfflineSession::~HidlCamera3OfflineSession() {
     ATRACE_CALL();
-    ALOGV("%s: Tearing down hidl offline session for camera id %s", __FUNCTION__, mId.string());
-    HidlCamera3OfflineSession::disconnectSession();
+    ALOGV("%s: Tearing down hidl offline session for camera id %s", __FUNCTION__, mId.c_str());
+    Camera3OfflineSession::disconnectImpl();
 }
 
 status_t HidlCamera3OfflineSession::initialize(wp<NotificationListener> listener) {
@@ -92,8 +94,9 @@ hardware::Return<void> HidlCamera3OfflineSession::processCaptureResult_3_4(
         listener = mListener.promote();
     }
 
+    std::string activePhysicalId("");
     HidlCaptureOutputStates states {
-      {mId,
+      { mId,
         mOfflineReqsLock, mLastCompletedRegularFrameNumber,
         mLastCompletedReprocessFrameNumber, mLastCompletedZslFrameNumber,
         mOfflineReqs, mOutputLock, mResultQueue, mResultSignal,
@@ -101,11 +104,12 @@ hardware::Return<void> HidlCamera3OfflineSession::processCaptureResult_3_4(
         mNextReprocessShutterFrameNumber, mNextZslStillShutterFrameNumber,
         mNextResultFrameNumber,
         mNextReprocessResultFrameNumber, mNextZslStillResultFrameNumber,
-        mUseHalBufManager, mUsePartialResult, mNeedFixupMonochromeTags,
+        mUseHalBufManager, mHalBufManagedStreamIds, mUsePartialResult, mNeedFixupMonochromeTags,
         mNumPartialResults, mVendorTagId, mDeviceInfo, mPhysicalDeviceInfoMap,
         mDistortionMappers, mZoomRatioMappers, mRotateAndCropMappers,
         mTagMonitor, mInputStream, mOutputStreams, mSessionStatsBuilder, listener, *this, *this,
-        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration}, mResultMetadataQueue
+        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration, mIsFixedFps,
+        hardware::ICameraService::ROTATION_OVERRIDE_NONE, activePhysicalId}, mResultMetadataQueue
     };
 
     std::lock_guard<std::mutex> lock(mProcessCaptureResultLock);
@@ -132,8 +136,9 @@ hardware::Return<void> HidlCamera3OfflineSession::processCaptureResult(
 
     hardware::hidl_vec<hardware::camera::device::V3_4::PhysicalCameraMetadata> noPhysMetadata;
 
+    std::string activePhysicalId("");
     HidlCaptureOutputStates states {
-      {mId,
+      { mId,
         mOfflineReqsLock, mLastCompletedRegularFrameNumber,
         mLastCompletedReprocessFrameNumber, mLastCompletedZslFrameNumber,
         mOfflineReqs, mOutputLock, mResultQueue, mResultSignal,
@@ -141,11 +146,12 @@ hardware::Return<void> HidlCamera3OfflineSession::processCaptureResult(
         mNextReprocessShutterFrameNumber, mNextZslStillShutterFrameNumber,
         mNextResultFrameNumber,
         mNextReprocessResultFrameNumber, mNextZslStillResultFrameNumber,
-        mUseHalBufManager, mUsePartialResult, mNeedFixupMonochromeTags,
+        mUseHalBufManager, mHalBufManagedStreamIds, mUsePartialResult, mNeedFixupMonochromeTags,
         mNumPartialResults, mVendorTagId, mDeviceInfo, mPhysicalDeviceInfoMap,
         mDistortionMappers, mZoomRatioMappers, mRotateAndCropMappers,
         mTagMonitor, mInputStream, mOutputStreams, mSessionStatsBuilder, listener, *this, *this,
-        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration}, mResultMetadataQueue
+        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration, mIsFixedFps,
+        hardware::ICameraService::ROTATION_OVERRIDE_NONE, activePhysicalId}, mResultMetadataQueue
     };
 
     std::lock_guard<std::mutex> lock(mProcessCaptureResultLock);
@@ -167,8 +173,9 @@ hardware::Return<void> HidlCamera3OfflineSession::notify(
         listener = mListener.promote();
     }
 
+    std::string activePhysicalId("");
     HidlCaptureOutputStates states {
-      {mId,
+      { mId,
         mOfflineReqsLock, mLastCompletedRegularFrameNumber,
         mLastCompletedReprocessFrameNumber, mLastCompletedZslFrameNumber,
         mOfflineReqs, mOutputLock, mResultQueue, mResultSignal,
@@ -176,11 +183,12 @@ hardware::Return<void> HidlCamera3OfflineSession::notify(
         mNextReprocessShutterFrameNumber, mNextZslStillShutterFrameNumber,
         mNextResultFrameNumber,
         mNextReprocessResultFrameNumber, mNextZslStillResultFrameNumber,
-        mUseHalBufManager, mUsePartialResult, mNeedFixupMonochromeTags,
+        mUseHalBufManager, mHalBufManagedStreamIds, mUsePartialResult, mNeedFixupMonochromeTags,
         mNumPartialResults, mVendorTagId, mDeviceInfo, mPhysicalDeviceInfoMap,
         mDistortionMappers, mZoomRatioMappers, mRotateAndCropMappers,
         mTagMonitor, mInputStream, mOutputStreams, mSessionStatsBuilder, listener, *this, *this,
-        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration}, mResultMetadataQueue
+        mBufferRecords, /*legacyClient*/ false, mMinExpectedDuration, mIsFixedFps,
+        hardware::ICameraService::ROTATION_OVERRIDE_NONE, activePhysicalId}, mResultMetadataQueue
     };
     for (const auto& msg : msgs) {
         camera3::notify(states, msg);
@@ -200,7 +208,8 @@ hardware::Return<void> HidlCamera3OfflineSession::requestStreamBuffers(
     }
 
     RequestBufferStates states {
-        mId, mRequestBufferInterfaceLock, mUseHalBufManager, mOutputStreams, mSessionStatsBuilder,
+        mId, mRequestBufferInterfaceLock, mUseHalBufManager,mHalBufManagedStreamIds,
+        mOutputStreams, mSessionStatsBuilder,
         *this, mBufferRecords, *this};
     camera3::requestStreamBuffers(states, bufReqs, _hidl_cb);
     return hardware::Void();
@@ -217,19 +226,24 @@ hardware::Return<void> HidlCamera3OfflineSession::returnStreamBuffers(
     }
 
     ReturnBufferStates states {
-        mId, mUseHalBufManager, mOutputStreams, mSessionStatsBuilder, mBufferRecords};
+        mId, mUseHalBufManager, mHalBufManagedStreamIds, mOutputStreams, mSessionStatsBuilder,
+        mBufferRecords};
 
     camera3::returnStreamBuffers(states, buffers);
     return hardware::Void();
 }
 
-void HidlCamera3OfflineSession::disconnectSession() {
-  // TODO: Make sure this locking is correct.
-  std::lock_guard<std::mutex> lock(mLock);
-  if (mSession != nullptr) {
-      mSession->close();
-  }
-  mSession.clear();
+void HidlCamera3OfflineSession::closeSessionLocked() {
+    if (mSession != nullptr) {
+        auto err = mSession->close();
+        if (!err.isOk()) {
+            ALOGE("%s: Close transaction error: %s", __FUNCTION__, err.description().c_str());
+        }
+    }
+}
+
+void HidlCamera3OfflineSession::releaseSessionLocked() {
+    mSession.clear();
 }
 
 }; // namespace android

@@ -17,6 +17,7 @@
 #ifndef ANDROID_AUDIO_MMAP_STREAM_CALLBACK_H
 #define ANDROID_AUDIO_MMAP_STREAM_CALLBACK_H
 
+#include <media/AudioContainers.h>
 #include <system/audio.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
@@ -37,18 +38,15 @@ class MmapStreamCallback : public virtual RefBase {
 
     /**
      * The volume to be applied to the use case specified when opening the stream has changed
-     * \param[in] channels a channel mask containing all channels the volume should be applied to.
-     * \param[in] values the volume values to be applied to each channel. The size of the vector
-     *                   should correspond to the channel count retrieved with
-     *                   audio_channel_count_from_in_mask() or audio_channel_count_from_out_mask()
+     * \param[in] volume the new target volume
      */
-    virtual void onVolumeChanged(audio_channel_mask_t channels, Vector<float> values) = 0;
+    virtual void onVolumeChanged(float volume) = 0;
 
     /**
-     * The device the stream is routed to/from has changed
-     * \param[in] onRoutingChanged the unique device ID of the new device.
+     * The devices the stream is routed to/from has changed
+     * \param[in] deviceIds a set of the device IDs of the new devices.
      */
-    virtual void onRoutingChanged(audio_port_handle_t deviceId) = 0;
+    virtual void onRoutingChanged(const DeviceIdVector& deviceIds) = 0;
 
   protected:
     MmapStreamCallback() {}

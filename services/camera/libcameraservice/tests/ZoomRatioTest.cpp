@@ -160,11 +160,9 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
             false/*hasZoomRatioRange*/, zoomRatioRange,
             usePreCorrectArray));
 
-    size_t index = 0;
     int32_t width = testActiveArraySize[2];
     int32_t height = testActiveArraySize[3];
     if (usePreCorrectArray) {
-        index = 1;
         width = testPreCorrActiveArraySize[2];
         height = testPreCorrActiveArraySize[3];
     }
@@ -254,6 +252,19 @@ void subScaleCoordinatesTest(bool usePreCorrectArray) {
     for (size_t i = 0; i < coords.size(); i++) {
         EXPECT_LE(std::abs(coords[i] - expectedZoomOutCoords[i]), kMaxAllowedPixelError);
     }
+
+    // Verify region zoom scaling doesn't generate invalid metering region
+    // (width < 0, or height < 0)
+    std::array<float, 3> scaleRatios = {10.0f, 1.0f, 0.1f};
+    for (float scaleRatio : scaleRatios) {
+        for (size_t i = 0; i < originalCoords.size(); i+= 2) {
+            int32_t coordinates[] = {originalCoords[i], originalCoords[i+1],
+                    originalCoords[i], originalCoords[i+1]};
+            mapper.scaleRegion(coordinates, scaleRatio, width, height);
+            EXPECT_LE(coordinates[0], coordinates[2]);
+            EXPECT_LE(coordinates[1], coordinates[3]);
+        }
+    }
 }
 
 TEST(ZoomRatioTest, scaleCoordinatesTest) {
@@ -285,7 +296,8 @@ void subCropOverMaxDigitalZoomTest(bool usePreCorrectArray) {
     }
 
     metadata.update(ANDROID_SCALER_CROP_REGION, test2xCropRegion[index], 4);
-    res = mapper.updateCaptureResult(&metadata, true/*requestedZoomRatioIs1*/);
+    res = mapper.updateCaptureResult(&metadata, false /*zoomMethodIsRatio*/,
+                                     true/*requestedZoomRatioIs1*/);
     ASSERT_EQ(res, OK);
     entry = metadata.find(ANDROID_SCALER_CROP_REGION);
     ASSERT_EQ(entry.count, 4U);
@@ -329,7 +341,8 @@ void subCropOverZoomRangeTest(bool usePreCorrectArray) {
     entry = metadata.find(ANDROID_CONTROL_ZOOM_RATIO);
     EXPECT_NEAR(entry.data.f[0], 2.0f, kMaxAllowedRatioError);
 
-    res = mapper.updateCaptureResult(&metadata, true/*requestedZoomRatioIs1*/);
+    res = mapper.updateCaptureResult(&metadata, false/*useZoomMethod*/,
+                                     true/*requestedZoomRatioIs1*/);
     ASSERT_EQ(res, OK);
     entry = metadata.find(ANDROID_CONTROL_ZOOM_RATIO);
     EXPECT_NEAR(entry.data.f[0], 1.0f, kMaxAllowedRatioError);
@@ -353,7 +366,8 @@ void subCropOverZoomRangeTest(bool usePreCorrectArray) {
     entry = metadata.find(ANDROID_CONTROL_ZOOM_RATIO);
     EXPECT_NEAR(entry.data.f[0], 1.0f, kMaxAllowedRatioError);
 
-    res = mapper.updateCaptureResult(&metadata, true/*requestedZoomRatioIs1*/);
+    res = mapper.updateCaptureResult(&metadata, false/*zoomMethodIsRatio*/,
+                                     true/*requestedZoomRatioIs1*/);
     ASSERT_EQ(res, OK);
     entry = metadata.find(ANDROID_SCALER_CROP_REGION);
     ASSERT_EQ(entry.count, 4U);
@@ -441,7 +455,8 @@ void subZoomOverZoomRangeTest(bool usePreCorrectArray) {
     entry = metadata.find(ANDROID_CONTROL_ZOOM_RATIO);
     ASSERT_EQ(entry.data.f[0], zoomRatio);
 
-    res = mapper.updateCaptureResult(&metadata, false/*requestedZoomRatioIs1*/);
+    res = mapper.updateCaptureResult(&metadata, false/*zoomMethodIsRatio*/,
+                                     false/*requestedZoomRatioIs1*/);
     ASSERT_EQ(res, OK);
     entry = metadata.find(ANDROID_SCALER_CROP_REGION);
     ASSERT_EQ(entry.count, 4U);

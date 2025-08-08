@@ -35,10 +35,7 @@ class HwModule;
 class IOProfile : public AudioPort, public PolicyAudioPort
 {
 public:
-    IOProfile(const std::string &name, audio_port_role_t role)
-        : AudioPort(name, AUDIO_PORT_TYPE_MIX, role),
-          curOpenCount(0),
-          curActiveCount(0) {}
+    IOProfile(const std::string &name, audio_port_role_t role);
 
     virtual ~IOProfile() = default;
 
@@ -66,12 +63,25 @@ public:
         if (getRole() == AUDIO_PORT_ROLE_SINK && (flags & AUDIO_INPUT_FLAG_MMAP_NOIRQ) != 0) {
             maxActiveCount = 0;
         }
+        refreshMixerBehaviors();
     }
 
+    const MixerBehaviorSet& getMixerBehaviors() const {
+        return mMixerBehaviors;
+    }
+
+    enum CompatibilityScore{
+        NO_MATCH = 0,
+        PARTIAL_MATCH = 1,
+        PARTIAL_MATCH_WITH_FLAG = 2,
+        EXACT_MATCH = 3
+    };
+
     /**
-     * @brief isCompatibleProfile: This method is used for input and direct output,
+     * @brief compatibilityScore: This method is used for input and direct output,
      * and is not used for other output.
-     * Checks if the IO profile is compatible with specified parameters.
+     * Return the compatibility score to measure how much the IO profile is compatible
+     * with specified parameters.
      * For input, flags is interpreted as audio_input_flags_t.
      * TODO: merge audio_output_flags_t and audio_input_flags_t.
      *
@@ -83,19 +93,34 @@ public:
      * @param channelMask to be checked for compatibility. Must be specified
      * @param updatedChannelMask if non-NULL, it is assigned the actual channel mask
      * @param flags to be checked for compatibility
-     * @param exactMatchRequiredForInputFlags true if exact match is required on flags
+     * @return how the IO profile is compatible with the given parameters.
+     */
+    CompatibilityScore getCompatibilityScore(const DeviceVector &devices,
+                                             uint32_t samplingRate,
+                                             uint32_t *updatedSamplingRate,
+                                             audio_format_t format,
+                                             audio_format_t *updatedFormat,
+                                             audio_channel_mask_t channelMask,
+                                             audio_channel_mask_t *updatedChannelMask,
+                                             // FIXME parameter type
+                                             uint32_t flags) const;
+
+    /**
+     * @brief areAllDevicesSupported: Checks if the given devices are supported by the IO profile.
+     *
+     * @param devices vector of devices to be checked for compatibility
+     * @return true if all devices are supported, false otherwise.
+     */
+    bool areAllDevicesSupported(const DeviceVector &devices) const;
+
+    /**
+     * @brief isCompatibleProfileForFlags: Checks if the IO profile is compatible with
+     * specified flags.
+     *
+     * @param flags to be checked for compatibility
      * @return true if the profile is compatible, false otherwise.
      */
-    bool isCompatibleProfile(const DeviceVector &devices,
-                             uint32_t samplingRate,
-                             uint32_t *updatedSamplingRate,
-                             audio_format_t format,
-                             audio_format_t *updatedFormat,
-                             audio_channel_mask_t channelMask,
-                             audio_channel_mask_t *updatedChannelMask,
-                             // FIXME parameter type
-                             uint32_t flags,
-                             bool exactMatchRequiredForInputFlags = false) const;
+    bool isCompatibleProfileForFlags(uint32_t flags) const;
 
     void dump(String8 *dst, int spaces) const;
     void log();
@@ -193,6 +218,12 @@ public:
         return false;
     }
 
+    void toSupportedMixerAttributes(std::vector<audio_mixer_attributes_t>* mixerAttributes) const;
+
+    status_t readFromParcelable(const media::AudioPortFw& parcelable);
+
+    void importAudioPort(const audio_port_v7& port) override;
+
     // Number of streams currently opened for this profile.
     uint32_t     curOpenCount;
     // Number of streams currently active for this profile. This is not the number of active clients
@@ -200,7 +231,12 @@ public:
     uint32_t     curActiveCount;
 
 private:
+    void refreshMixerBehaviors();
+    CompatibilityScore getFlagsCompatibleScore(uint32_t flags) const;
+
     DeviceVector mSupportedDevices; // supported devices: this input/output can be routed from/to
+
+    MixerBehaviorSet mMixerBehaviors;
 };
 
 class InputProfile : public IOProfile

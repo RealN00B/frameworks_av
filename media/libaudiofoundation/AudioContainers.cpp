@@ -77,6 +77,13 @@ const DeviceTypeSet& getAudioDeviceOutLeAudioUnicastSet() {
     return audioDeviceOutLeAudioUnicastSet;
 }
 
+const DeviceTypeSet& getAudioDeviceOutLeAudioBroadcastSet() {
+    static const DeviceTypeSet audioDeviceOutLeAudioUnicastSet = DeviceTypeSet(
+            std::begin(AUDIO_DEVICE_OUT_BLE_BROADCAST_ARRAY),
+            std::end(AUDIO_DEVICE_OUT_BLE_BROADCAST_ARRAY));
+    return audioDeviceOutLeAudioUnicastSet;
+}
+
 std::string deviceTypesToString(const DeviceTypeSet &deviceTypes) {
     if (deviceTypes.empty()) {
         return "Empty device types";
@@ -110,6 +117,144 @@ std::string dumpDeviceTypes(const DeviceTypeSet &deviceTypes) {
         ss << "0x" << std::hex << (*it);
     }
     return ss.str();
+}
+
+std::string dumpMixerBehaviors(const MixerBehaviorSet& mixerBehaviors) {
+    std::stringstream ss;
+    for (auto it = mixerBehaviors.begin(); it != mixerBehaviors.end(); ++it) {
+        if (it != mixerBehaviors.begin()) {
+            ss << ", ";
+        }
+        ss << (*it);
+    }
+    return ss.str();
+}
+
+std::string toString(const DeviceIdVector& deviceIds) {
+    if (deviceIds.empty()) {
+        return "AUDIO_PORT_HANDLE_NONE";
+    }
+    std::stringstream ss;
+    for (auto it = deviceIds.begin(); it != deviceIds.end(); ++it) {
+        if (it != deviceIds.begin()) {
+            ss << ", ";
+        }
+        ss << *it;
+    }
+    return ss.str();
+}
+
+audio_port_handle_t getFirstDeviceId(const DeviceIdVector& deviceIds) {
+    if (deviceIds.empty()) {
+        return AUDIO_PORT_HANDLE_NONE;
+    }
+    return deviceIds[0];
+}
+
+bool areDeviceIdsEqual(const DeviceIdVector& first, const DeviceIdVector& second) {
+    const std::set<audio_port_handle_t> firstSet(first.begin(), first.end());
+    const std::set<audio_port_handle_t> secondSet(second.begin(), second.end());
+    return firstSet == secondSet;
+}
+
+AudioProfileAttributesMultimap createAudioProfilesAttrMap(audio_profile profiles[],
+                                                          uint32_t first,
+                                                          uint32_t last) {
+    AudioProfileAttributesMultimap result;
+    for (uint32_t i = first; i < last; ++i) {
+        SampleRateSet sampleRates(profiles[i].sample_rates,
+                                  profiles[i].sample_rates + profiles[i].num_sample_rates);
+        ChannelMaskSet channelMasks(profiles[i].channel_masks,
+                                    profiles[i].channel_masks + profiles[i].num_channel_masks);
+        result.emplace(profiles[i].format, std::make_pair(sampleRates, channelMasks));
+    }
+    return result;
+}
+
+namespace {
+
+void populateAudioProfile(audio_format_t format,
+                          const ChannelMaskSet& channelMasks,
+                          const SampleRateSet& samplingRates,
+                          audio_profile* profile) {
+    profile->format = format;
+    profile->num_channel_masks = 0;
+    for (auto it = channelMasks.begin();
+         it != channelMasks.end() && profile->num_channel_masks < AUDIO_PORT_MAX_CHANNEL_MASKS;
+         ++it) {
+        profile->channel_masks[profile->num_channel_masks++] = *it;
+    }
+    profile->num_sample_rates = 0;
+    for (auto it = samplingRates.begin();
+         it != samplingRates.end() && profile->num_sample_rates < AUDIO_PORT_MAX_SAMPLING_RATES;
+         ++it) {
+        profile->sample_rates[profile->num_sample_rates++] = *it;
+    }
+}
+
+} // namespace
+
+void populateAudioProfiles(const AudioProfileAttributesMultimap& profileAttrs,
+                           audio_format_t format,
+                           ChannelMaskSet allChannelMasks,
+                           SampleRateSet allSampleRates,
+                           audio_profile audioProfiles[],
+                           uint32_t* numAudioProfiles,
+                           uint32_t maxAudioProfiles) {
+    if (*numAudioProfiles >= maxAudioProfiles) {
+        return;
+    }
+
+    const auto lower= profileAttrs.lower_bound(format);
+    const auto upper = profileAttrs.upper_bound(format);
+    SampleRateSet sampleRatesPresent;
+    ChannelMaskSet channelMasksPresent;
+    for (auto it = lower; it != upper && *numAudioProfiles < maxAudioProfiles; ++it) {
+        SampleRateSet srs;
+        std::set_intersection(it->second.first.begin(), it->second.first.end(),
+                              allSampleRates.begin(), allSampleRates.end(),
+                              std::inserter(srs, srs.begin()));
+        if (srs.empty()) {
+            continue;
+        }
+        ChannelMaskSet cms;
+        std::set_intersection(it->second.second.begin(), it->second.second.end(),
+                              allChannelMasks.begin(), allChannelMasks.end(),
+                              std::inserter(cms, cms.begin()));
+        if (cms.empty()) {
+            continue;
+        }
+        sampleRatesPresent.insert(srs.begin(), srs.end());
+        channelMasksPresent.insert(cms.begin(), cms.end());
+        populateAudioProfile(it->first, cms, srs,
+                             &audioProfiles[(*numAudioProfiles)++]);
+    }
+    if (*numAudioProfiles >= maxAudioProfiles) {
+        ALOGW("%s, too many audio profiles", __func__);
+        return;
+    }
+
+    SampleRateSet srs;
+    std::set_difference(allSampleRates.begin(), allSampleRates.end(),
+                        sampleRatesPresent.begin(), sampleRatesPresent.end(),
+                        std::inserter(srs, srs.begin()));
+    if (!srs.empty()) {
+        populateAudioProfile(format, allChannelMasks, srs,
+                             &audioProfiles[(*numAudioProfiles)++]);
+    }
+    if (*numAudioProfiles >= maxAudioProfiles) {
+        ALOGW("%s, too many audio profiles", __func__);
+        return;
+    }
+    ChannelMaskSet cms;
+    std::set_difference(allChannelMasks.begin(), allChannelMasks.end(),
+                        channelMasksPresent.begin(), channelMasksPresent.end(),
+                        std::inserter(cms, cms.begin()));
+    if (!cms.empty()) {
+        populateAudioProfile(format, cms, allSampleRates,
+                             &audioProfiles[(*numAudioProfiles)++]);
+    }
+
 }
 
 } // namespace android

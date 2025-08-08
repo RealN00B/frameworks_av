@@ -20,13 +20,16 @@
 
 #include <aidl/android/hardware/camera/device/CameraBlob.h>
 #include <aidl/android/hardware/camera/device/CameraBlobId.h>
+#include <camera/StringUtils.h>
+
+#include <com_android_graphics_libgui_flags.h>
+#include <gui/Surface.h>
+#include <utils/Log.h>
+#include <utils/Trace.h>
 
 #include "api1/client2/JpegProcessor.h"
 #include "common/CameraProviderManager.h"
 #include "utils/SessionConfigurationUtils.h"
-#include <gui/Surface.h>
-#include <utils/Log.h>
-#include <utils/Trace.h>
 
 #include "DepthCompositeStream.h"
 
@@ -47,7 +50,7 @@ DepthCompositeStream::DepthCompositeStream(sp<CameraDeviceBase> device,
         mBlobHeight(0),
         mDepthBufferAcquired(false),
         mBlobBufferAcquired(false),
-        mProducerListener(new ProducerListener()),
+        mStreamSurfaceListener(new StreamSurfaceListener()),
         mMaxJpegBufferSize(-1),
         mUHRMaxJpegBufferSize(-1),
         mIsLogicalCamera(false) {
@@ -98,7 +101,7 @@ DepthCompositeStream::DepthCompositeStream(sp<CameraDeviceBase> device,
         }
 
         getSupportedDepthSizes(staticInfo, /*maxResolution*/false, &mSupportedDepthSizes);
-        if (SessionConfigurationUtils::isUltraHighResolutionSensor(staticInfo)) {
+        if (SessionConfigurationUtils::supportsUltraHighResolutionCapture(staticInfo)) {
             getSupportedDepthSizes(staticInfo, true, &mSupportedDepthSizesMaximumResolution);
         }
     }
@@ -495,21 +498,30 @@ bool DepthCompositeStream::isDepthCompositeStream(const sp<Surface> &surface) {
     status_t err;
     int format;
     if ((err = anw->query(anw, NATIVE_WINDOW_FORMAT, &format)) != OK) {
-        String8 msg = String8::format("Failed to query Surface format: %s (%d)", strerror(-err),
+        std::string msg = fmt::sprintf("Failed to query Surface format: %s (%d)", strerror(-err),
                 err);
-        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        ALOGE("%s: %s", __FUNCTION__, msg.c_str());
         return false;
     }
 
     int dataspace;
     if ((err = anw->query(anw, NATIVE_WINDOW_DEFAULT_DATASPACE, &dataspace)) != OK) {
-        String8 msg = String8::format("Failed to query Surface dataspace: %s (%d)", strerror(-err),
+        std::string msg = fmt::sprintf("Failed to query Surface dataspace: %s (%d)", strerror(-err),
                 err);
-        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        ALOGE("%s: %s", __FUNCTION__, msg.c_str());
         return false;
     }
 
     if ((format == HAL_PIXEL_FORMAT_BLOB) && (dataspace == HAL_DATASPACE_DYNAMIC_DEPTH)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool DepthCompositeStream::isDepthCompositeStreamInfo(const OutputStreamInfo& streamInfo) {
+    if ((streamInfo.dataSpace == static_cast<android_dataspace_t>(HAL_DATASPACE_DYNAMIC_DEPTH)) &&
+            (streamInfo.format == HAL_PIXEL_FORMAT_BLOB)) {
         return true;
     }
 
@@ -576,12 +588,13 @@ status_t DepthCompositeStream::checkAndGetMatchingDepthSize(size_t width, size_t
 }
 
 
-status_t DepthCompositeStream::createInternalStreams(const std::vector<sp<Surface>>& consumers,
+status_t DepthCompositeStream::createInternalStreams(const std::vector<SurfaceHolder>& consumers,
         bool /*hasDeferredConsumer*/, uint32_t width, uint32_t height, int format,
-        camera_stream_rotation_t rotation, int *id, const String8& physicalCameraId,
+        camera_stream_rotation_t rotation, int *id, const std::string& physicalCameraId,
         const std::unordered_set<int32_t> &sensorPixelModesUsed,
         std::vector<int> *surfaceIds,
-        int /*streamSetId*/, bool /*isShared*/) {
+        int /*streamSetId*/, bool /*isShared*/, int32_t /*colorSpace*/,
+        int64_t /*dynamicProfile*/, int64_t /*streamUseCase*/, bool useReadoutTimestamp) {
     if (mSupportedDepthSizes.empty()) {
         ALOGE("%s: This camera device doesn't support any depth map streams!", __FUNCTION__);
         return INVALID_OPERATION;
@@ -603,6 +616,12 @@ status_t DepthCompositeStream::createInternalStreams(const std::vector<sp<Surfac
         return NO_INIT;
     }
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mBlobConsumer = new CpuConsumer(/*maxLockedBuffers*/ 1, /*controlledByApp*/ true);
+    mBlobConsumer->setFrameAvailableListener(this);
+    mBlobConsumer->setName(String8("Camera3-JpegCompositeStream"));
+    mBlobSurface = mBlobConsumer->getSurface();
+#else
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
     BufferQueue::createBufferQueue(&producer, &consumer);
@@ -610,26 +629,48 @@ status_t DepthCompositeStream::createInternalStreams(const std::vector<sp<Surfac
     mBlobConsumer->setFrameAvailableListener(this);
     mBlobConsumer->setName(String8("Camera3-JpegCompositeStream"));
     mBlobSurface = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     ret = device->createStream(mBlobSurface, width, height, format, kJpegDataSpace, rotation,
-            id, physicalCameraId, sensorPixelModesUsed, surfaceIds);
+            id, physicalCameraId, sensorPixelModesUsed, surfaceIds,
+            camera3::CAMERA3_STREAM_SET_ID_INVALID, /*isShared*/false, /*isMultiResolution*/false,
+            /*consumerUsage*/0, ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            OutputConfiguration::MIRROR_MODE_AUTO,
+            ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            useReadoutTimestamp);
     if (ret == OK) {
         mBlobStreamId = *id;
         mBlobSurfaceId = (*surfaceIds)[0];
-        mOutputSurface = consumers[0];
+        mOutputSurface = consumers[0].mSurface;
     } else {
         return ret;
     }
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    mDepthConsumer = new CpuConsumer(/*maxLockedBuffers*/ 1, /*controlledByApp*/ true);
+    mDepthConsumer->setFrameAvailableListener(this);
+    mDepthConsumer->setName(String8("Camera3-DepthCompositeStream"));
+    mDepthSurface = mDepthConsumer->getSurface();
+#else
     BufferQueue::createBufferQueue(&producer, &consumer);
     mDepthConsumer = new CpuConsumer(consumer, /*maxLockedBuffers*/ 1, /*controlledByApp*/ true);
     mDepthConsumer->setFrameAvailableListener(this);
     mDepthConsumer->setName(String8("Camera3-DepthCompositeStream"));
     mDepthSurface = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     std::vector<int> depthSurfaceId;
     ret = device->createStream(mDepthSurface, depthWidth, depthHeight, kDepthMapPixelFormat,
             kDepthMapDataSpace, rotation, &mDepthStreamId, physicalCameraId, sensorPixelModesUsed,
-            &depthSurfaceId);
+            &depthSurfaceId, camera3::CAMERA3_STREAM_SET_ID_INVALID, /*isShared*/false,
+            /*isMultiResolution*/false, /*consumerUsage*/0,
+            ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT,
+            OutputConfiguration::TIMESTAMP_BASE_DEFAULT,
+            OutputConfiguration::MIRROR_MODE_AUTO,
+            ANDROID_REQUEST_AVAILABLE_COLOR_SPACE_PROFILES_MAP_UNSPECIFIED,
+            useReadoutTimestamp);
     if (ret == OK) {
         mDepthSurfaceId = depthSurfaceId[0];
     } else {
@@ -665,7 +706,7 @@ status_t DepthCompositeStream::configureStream() {
         return NO_INIT;
     }
 
-    auto res = mOutputSurface->connect(NATIVE_WINDOW_API_CAMERA, mProducerListener);
+    auto res = mOutputSurface->connect(NATIVE_WINDOW_API_CAMERA, mStreamSurfaceListener);
     if (res != OK) {
         ALOGE("%s: Unable to connect to native window for stream %d",
                 __FUNCTION__, mBlobStreamId);
@@ -886,7 +927,7 @@ status_t DepthCompositeStream::getCompositeStreamInfo(const OutputStreamInfo &st
         return BAD_VALUE;
     }
 
-    if (SessionConfigurationUtils::isUltraHighResolutionSensor(ch)) {
+    if (SessionConfigurationUtils::supportsUltraHighResolutionCapture(ch)) {
         getSupportedDepthSizes(ch, /*maxResolution*/true, &depthSizesMaximumResolution);
         if (depthSizesMaximumResolution.empty()) {
             ALOGE("%s: No depth stream configurations for maximum resolution present",

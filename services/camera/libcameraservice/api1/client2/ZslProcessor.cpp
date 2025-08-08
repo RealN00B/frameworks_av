@@ -27,9 +27,11 @@
 
 #include <inttypes.h>
 
+#include <camera/StringUtils.h>
+#include <com_android_graphics_libgui_flags.h>
+#include <gui/Surface.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
-#include <gui/Surface.h>
 
 #include "common/CameraDeviceBase.h"
 #include "api1/Camera2Client.h"
@@ -140,8 +142,12 @@ ZslProcessor::ZslProcessor(
         mHasFocuser(false),
         mInputBuffer(nullptr),
         mProducer(nullptr),
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+        mInputSurface(nullptr),
+#else
         mInputProducer(nullptr),
         mInputProducerSlot(-1),
+#endif
         mBuffersToDetach(0) {
     // Initialize buffer queue and frame list based on pipeline max depth.
     size_t pipelineMaxDepth = kDefaultMaxPipelineDepth;
@@ -249,19 +255,24 @@ status_t ZslProcessor::updateStream(const Parameters &params) {
     if (mZslStreamId == NO_STREAM) {
         // Create stream for HAL production
         // TODO: Sort out better way to select resolution for ZSL
-
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+        mProducer = new RingBufferConsumer(GRALLOC_USAGE_HW_CAMERA_ZSL, mBufferQueueDepth);
+        mProducer->setName("Camera2-ZslRingBufferConsumer");
+        sp<Surface> outSurface = mProducer->getSurface();
+#else
         sp<IGraphicBufferProducer> producer;
         sp<IGraphicBufferConsumer> consumer;
         BufferQueue::createBufferQueue(&producer, &consumer);
         mProducer = new RingBufferConsumer(consumer, GRALLOC_USAGE_HW_CAMERA_ZSL,
             mBufferQueueDepth);
-        mProducer->setName(String8("Camera2-ZslRingBufferConsumer"));
+        mProducer->setName("Camera2-ZslRingBufferConsumer");
         sp<Surface> outSurface = new Surface(producer);
+#endif  // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
         res = device->createStream(outSurface, params.fastInfo.usedZslSize.width,
             params.fastInfo.usedZslSize.height, HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED,
             HAL_DATASPACE_UNKNOWN, CAMERA_STREAM_ROTATION_0, &mZslStreamId,
-            String8(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
+            std::string(), std::unordered_set<int32_t>{ANDROID_SENSOR_PIXEL_MODE_DEFAULT});
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create ZSL stream: "
                     "%s (%d)", __FUNCTION__, client->getCameraId(),
@@ -324,10 +335,17 @@ status_t ZslProcessor::deleteStream() {
         mInputStreamId = NO_STREAM;
     }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    if (nullptr != mInputSurface.get()) {
+        // The surface destructor calls disconnect
+        mInputSurface.clear();
+    }
+#else
     if (nullptr != mInputProducer.get()) {
         mInputProducer->disconnect(NATIVE_WINDOW_API_CPU);
         mInputProducer.clear();
     }
+#endif
 
     return OK;
 }
@@ -386,11 +404,19 @@ void ZslProcessor::notifyInputReleased() {
 
 void ZslProcessor::doNotifyInputReleasedLocked() {
     assert(nullptr != mInputBuffer.get());
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    assert(nullptr != mInputSurface.get());
+#else
     assert(nullptr != mInputProducer.get());
+#endif
 
     sp<GraphicBuffer> gb;
     sp<Fence> fence;
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    auto rc = mInputSurface->detachNextBuffer(&gb, &fence);
+#else
     auto rc = mInputProducer->detachNextBuffer(&gb, &fence);
+#endif
     if (NO_ERROR != rc) {
         ALOGE("%s: Failed to detach buffer from input producer: %d",
             __FUNCTION__, rc);
@@ -449,9 +475,15 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
             __FUNCTION__, (unsigned int) metadataIdx);
     }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    if (nullptr == mInputSurface.get()) {
+        res = client->getCameraDevice()->getInputSurface(
+            &mInputSurface);
+#else
     if (nullptr == mInputProducer.get()) {
         res = client->getCameraDevice()->getInputBufferProducer(
             &mInputProducer);
+#endif
         if (res != OK) {
             ALOGE("%s: Camera %d: Unable to retrieve input producer: "
                     "%s (%d)", __FUNCTION__, client->getCameraId(),
@@ -459,9 +491,14 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
             return res;
         }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+        res = mInputSurface->connect(NATIVE_WINDOW_API_CPU, new InputProducerListener(this),
+            false);
+#else
         IGraphicBufferProducer::QueueBufferOutput output;
         res = mInputProducer->connect(new InputProducerListener(this),
             NATIVE_WINDOW_API_CPU, false, &output);
+#endif
         if (res != OK) {
             ALOGE("%s: Camera %d: Unable to connect to input producer: "
                     "%s (%d)", __FUNCTION__, client->getCameraId(),
@@ -622,19 +659,32 @@ status_t ZslProcessor::enqueueInputBufferByTimestamp(
     }
 
     BufferItem &item = mInputBuffer->getBufferItem();
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    auto rc = mInputSurface->attachBuffer(item.mGraphicBuffer->getNativeBuffer());
+#else
     auto rc = mInputProducer->attachBuffer(&mInputProducerSlot,
         item.mGraphicBuffer);
+#endif
     if (OK != rc) {
         ALOGE("%s: Failed to attach input ZSL buffer to producer: %d",
             __FUNCTION__, rc);
         return rc;
     }
 
+#if WB_CAMERA3_AND_PROCESSORS_WITH_DEPENDENCIES
+    mInputSurface->setBuffersTimestamp(item.mTimestamp);
+    mInputSurface->setBuffersDataSpace(static_cast<ui::Dataspace>(item.mDataSpace));
+    mInputSurface->setCrop(&item.mCrop);
+    mInputSurface->setScalingMode(item.mScalingMode);
+    mInputSurface->setBuffersTransform(item.mTransform);
+    rc = mInputSurface->queueBuffer(item.mGraphicBuffer, item.mFence);
+#else
     IGraphicBufferProducer::QueueBufferOutput output;
     IGraphicBufferProducer::QueueBufferInput input(item.mTimestamp,
             item.mIsAutoTimestamp, item.mDataSpace, item.mCrop,
             item.mScalingMode, item.mTransform, item.mFence);
     rc = mInputProducer->queueBuffer(mInputProducerSlot, input, &output);
+#endif
     if (OK != rc) {
         ALOGE("%s: Failed to queue ZSL buffer to producer: %d",
             __FUNCTION__, rc);
@@ -680,12 +730,12 @@ void ZslProcessor::clearZslResultQueueLocked() {
 void ZslProcessor::dump(int fd, const Vector<String16>& /*args*/) const {
     Mutex::Autolock l(mInputMutex);
     if (!mLatestCapturedRequest.isEmpty()) {
-        String8 result("    Latest ZSL capture request:\n");
-        write(fd, result.string(), result.size());
+        std::string result = "    Latest ZSL capture request:\n";
+        write(fd, result.c_str(), result.size());
         mLatestCapturedRequest.dump(fd, 2, 6);
     } else {
-        String8 result("    Latest ZSL capture request: none yet\n");
-        write(fd, result.string(), result.size());
+        std::string result = "    Latest ZSL capture request: none yet\n";
+        write(fd, result.c_str(), result.size());
     }
     dumpZslQueue(fd);
 }
@@ -706,12 +756,12 @@ bool ZslProcessor::threadLoop() {
 }
 
 void ZslProcessor::dumpZslQueue(int fd) const {
-    String8 header("ZSL queue contents:");
-    String8 indent("    ");
-    ALOGV("%s", header.string());
+    std::string header = "ZSL queue contents:";
+    std::string indent = "    ";
+    ALOGV("%s", header.c_str());
     if (fd != -1) {
         header = indent + header + "\n";
-        write(fd, header.string(), header.size());
+        write(fd, header.c_str(), header.size());
     }
     for (size_t i = 0; i < mZslQueue.size(); i++) {
         const ZslPair &queueEntry = mZslQueue[i];
@@ -725,13 +775,13 @@ void ZslProcessor::dumpZslQueue(int fd) const {
             entry = queueEntry.frame.find(ANDROID_CONTROL_AE_STATE);
             if (entry.count > 0) frameAeState = entry.data.u8[0];
         }
-        String8 result =
-                String8::format("   %zu: b: %" PRId64 "\tf: %" PRId64 ", AE state: %d", i,
+        std::string result =
+                fmt::sprintf("   %zu: b: %" PRId64 "\tf: %" PRId64 ", AE state: %d", i,
                         bufferTimestamp, frameTimestamp, frameAeState);
-        ALOGV("%s", result.string());
+        ALOGV("%s", result.c_str());
         if (fd != -1) {
             result = indent + result + "\n";
-            write(fd, result.string(), result.size());
+            write(fd, result.c_str(), result.size());
         }
 
     }

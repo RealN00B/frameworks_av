@@ -20,7 +20,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <memory>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,6 +296,13 @@ int MtpFfsHandle::start(bool ptp) {
 }
 
 void MtpFfsHandle::close() {
+    // Join all child threads before destruction
+    int count = mChildThreads.size();
+    for (int i = 0; i < count; i++) {
+        mChildThreads[i].join();
+    }
+    mChildThreads.clear();
+
     io_destroy(mCtx);
     closeEndpoints();
     closeConfig();
@@ -587,6 +593,9 @@ int MtpFfsHandle::sendFile(mtp_file_range mfr) {
 
     // Send the header data
     mtp_data_header *header = reinterpret_cast<mtp_data_header*>(mIobuf[0].bufs.data());
+    if (header == NULL) {
+        return -1;
+    }
     header->length = htole32(given_length);
     header->type = htole16(2); // data packet
     header->command = htole16(mfr.command);
@@ -669,8 +678,11 @@ int MtpFfsHandle::sendEvent(mtp_event me) {
     char *temp = new char[me.length];
     memcpy(temp, me.data, me.length);
     me.data = temp;
+
     std::thread t([this, me]() { return this->doSendEvent(me); });
-    t.detach();
+
+    // Store the thread object for later joining
+    mChildThreads.emplace_back(std::move(t));
     return 0;
 }
 

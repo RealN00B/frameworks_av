@@ -21,12 +21,13 @@ import android.media.audio.common.AudioFormatDescription;
 parcelable StreamParameters {
     int                                       channelMask;  //          = AAUDIO_UNSPECIFIED;
     int                                       sampleRate;  //           = AAUDIO_UNSPECIFIED;
-    int                                       deviceId;  //             = AAUDIO_UNSPECIFIED;
+    int[]                                     deviceIds;  //            = null;
     int /* aaudio_sharing_mode_t */           sharingMode;  //          = AAUDIO_SHARING_MODE_SHARED;
     AudioFormatDescription                    audioFormat;  //          = AUDIO_FORMAT_DEFAULT;
     int /* aaudio_direction_t */              direction;  //            = AAUDIO_DIRECTION_OUTPUT;
     int /* aaudio_usage_t */                  usage;  //                = AAUDIO_UNSPECIFIED;
     int /* aaudio_content_type_t */           contentType;  //          = AAUDIO_UNSPECIFIED;
+    @utf8InCpp String[]                       tags;                     /* UTF8 */
     int /* aaudio_spatialization_behavior_t */spatializationBehavior; //= AAUDIO_UNSPECIFIED;
     boolean                                   isContentSpatialized;  // = false;
     int /* aaudio_input_preset_t */           inputPreset;  //          = AAUDIO_UNSPECIFIED;
@@ -34,4 +35,7 @@ parcelable StreamParameters {
     int /* aaudio_allowed_capture_policy_t */ allowedCapturePolicy;  // = AAUDIO_UNSPECIFIED;
     int /* aaudio_session_id_t */             sessionId;  //            = AAUDIO_SESSION_ID_NONE;
     boolean                                   isPrivacySensitive;  //   = false;
+    int                                       hardwareSamplesPerFrame;//= AAUDIO_UNSPECIFIED;
+    int                                       hardwareSampleRate;  //   = AAUDIO_UNSPECIFIED;
+    AudioFormatDescription                    hardwareAudioFormat;  //  = AUDIO_FORMAT_DEFAULT;
 }

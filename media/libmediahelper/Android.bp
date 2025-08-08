@@ -30,9 +30,6 @@ cc_library {
     name: "libmedia_helper",
     vendor_available: true,
     min_sdk_version: "29",
-    vndk: {
-        enabled: true,
-    },
     double_loadable: true,
     srcs: [
         "AudioParameter.cpp",
@@ -49,8 +46,9 @@ cc_library {
         "liblog",
     ],
     header_libs: [
-        "libmedia_helper_headers",
         "libaudio_system_headers",
+        "libhardware_headers",
+        "libmedia_helper_headers",
     ],
     export_header_lib_headers: [
         "libmedia_helper_headers",

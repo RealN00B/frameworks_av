@@ -18,6 +18,7 @@
 
 #define CCODEC_BUFFER_CHANNEL_H_
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <vector>
@@ -61,8 +62,8 @@ public:
     void setCrypto(const sp<ICrypto> &crypto) override;
     void setDescrambler(const sp<IDescrambler> &descrambler) override;
 
-    virtual status_t queueInputBuffer(const sp<MediaCodecBuffer> &buffer) override;
-    virtual status_t queueSecureInputBuffer(
+    status_t queueInputBuffer(const sp<MediaCodecBuffer> &buffer) override;
+    status_t queueSecureInputBuffer(
             const sp<MediaCodecBuffer> &buffer,
             bool secure,
             const uint8_t *key,
@@ -72,10 +73,14 @@ public:
             const CryptoPlugin::SubSample *subSamples,
             size_t numSubSamples,
             AString *errorDetailMsg) override;
-    virtual status_t attachBuffer(
+    status_t queueSecureInputBuffers(
+            const sp<MediaCodecBuffer> &buffer,
+            bool secure,
+            AString *errorDetailMsg) override;
+    status_t attachBuffer(
             const std::shared_ptr<C2Buffer> &c2Buffer,
             const sp<MediaCodecBuffer> &buffer) override;
-    virtual status_t attachEncryptedBuffer(
+    status_t attachEncryptedBuffer(
             const sp<hardware::HidlMemory> &memory,
             bool secure,
             const uint8_t *key,
@@ -85,12 +90,22 @@ public:
             size_t offset,
             const CryptoPlugin::SubSample *subSamples,
             size_t numSubSamples,
-            const sp<MediaCodecBuffer> &buffer) override;
-    virtual status_t renderOutputBuffer(
+            const sp<MediaCodecBuffer> &buffer,
+            AString* errorDetailMsg) override;
+    status_t attachEncryptedBuffers(
+            const sp<hardware::HidlMemory> &memory,
+            size_t offset,
+            const sp<MediaCodecBuffer> &buffer,
+            bool secure,
+            AString* errorDetailMsg) override;
+    status_t renderOutputBuffer(
             const sp<MediaCodecBuffer> &buffer, int64_t timestampNs) override;
-    virtual status_t discardBuffer(const sp<MediaCodecBuffer> &buffer) override;
-    virtual void getInputBufferArray(Vector<sp<MediaCodecBuffer>> *array) override;
-    virtual void getOutputBufferArray(Vector<sp<MediaCodecBuffer>> *array) override;
+    void pollForRenderedBuffers() override;
+    void onBufferReleasedFromOutputSurface(uint32_t generation) override;
+    void onBufferAttachedToOutputSurface(uint32_t generation) override;
+    status_t discardBuffer(const sp<MediaCodecBuffer> &buffer) override;
+    void getInputBufferArray(Vector<sp<MediaCodecBuffer>> *array) override;
+    void getOutputBufferArray(Vector<sp<MediaCodecBuffer>> *array) override;
 
     // Methods below are interface for CCodec to use.
 
@@ -102,7 +117,7 @@ public:
     /**
      * Set output graphic surface for rendering.
      */
-    status_t setSurface(const sp<Surface> &surface);
+    status_t setSurface(const sp<Surface> &surface, uint32_t generation, bool pushBlankBuffer);
 
     /**
      * Set GraphicBufferSource object from which the component extracts input
@@ -137,7 +152,8 @@ public:
      *                                  initial input buffers.
      */
     status_t prepareInitialInputBuffers(
-            std::map<size_t, sp<MediaCodecBuffer>> *clientInputBuffers);
+            std::map<size_t, sp<MediaCodecBuffer>> *clientInputBuffers,
+            bool retry = false);
 
     /**
      * Request initial input buffers as prepared in clientInputBuffers.
@@ -147,6 +163,14 @@ public:
      */
     status_t requestInitialInputBuffers(
             std::map<size_t, sp<MediaCodecBuffer>> &&clientInputBuffers);
+
+    /**
+     * Stop using buffers of the current output surface for other Codec
+     * instances to use the surface safely.
+     *
+     * \param pushBlankBuffer[in]       push a blank buffer at the end if true
+     */
+    void stopUseOutputSurface(bool pushBlankBuffer);
 
     /**
      * Stop queueing buffers to the component. This object should never queue
@@ -169,12 +193,15 @@ public:
     /**
      * Notify input client about work done.
      *
-     * @param workItems   finished work item.
+     * @param workItems    finished work item.
+     * @param inputFormat  input format
      * @param outputFormat new output format if it has changed, otherwise nullptr
-     * @param initData    new init data (CSD) if it has changed, otherwise nullptr
+     * @param initData     new init data (CSD) if it has changed, otherwise nullptr
      */
     void onWorkDone(
-            std::unique_ptr<C2Work> work, const sp<AMessage> &outputFormat,
+            std::unique_ptr<C2Work> work,
+            const sp<AMessage> &inputFormat,
+            const sp<AMessage> &outputFormat,
             const C2StreamInitDataInfo::output *initData);
 
     /**
@@ -196,11 +223,27 @@ public:
     void setMetaMode(MetaMode mode);
 
     /**
-     * Push a blank buffer to the configured native output surface.
+     * get pixel format from output buffers.
+     *
+     * @return 0 if no valid pixel format found.
      */
-    status_t pushBlankBufferToOutputSurface();
+    uint32_t getBuffersPixelFormat(bool isEncoder);
+
+    void resetBuffersPixelFormat(bool isEncoder);
+
+    /**
+     * Queue a C2 info buffer that will be sent to codec in the subsequent
+     * queueInputBuffer
+     *
+     * @param buffer C2 info buffer
+     */
+    void setInfoBuffer(const std::shared_ptr<C2InfoBuffer> &buffer);
 
 private:
+    uint32_t getInputBuffersPixelFormat();
+
+    uint32_t getOutputBuffersPixelFormat();
+
     class QueueGuard;
 
     /**
@@ -257,17 +300,33 @@ private:
         bool mRunning;
     };
 
+    struct TrackedFrame {
+        uint64_t number;
+        int64_t mediaTimeUs;
+        int64_t desiredRenderTimeNs;
+        nsecs_t latchTime;
+        sp<Fence> presentFence;
+    };
+
     void feedInputBufferIfAvailable();
     void feedInputBufferIfAvailableInternal();
     status_t queueInputBufferInternal(sp<MediaCodecBuffer> buffer,
                                       std::shared_ptr<C2LinearBlock> encryptedBlock = nullptr,
                                       size_t blockSize = 0);
     bool handleWork(
-            std::unique_ptr<C2Work> work, const sp<AMessage> &outputFormat,
+            std::unique_ptr<C2Work> work,
+            const sp<AMessage> &inputFormat,
+            const sp<AMessage> &outputFormat,
             const C2StreamInitDataInfo::output *initData);
     void sendOutputBuffers();
     void ensureDecryptDestination(size_t size);
     int32_t getHeapSeqNum(const sp<hardware::HidlMemory> &memory);
+
+    void initializeFrameTrackingFor(ANativeWindow * window);
+    void trackReleasedFrame(const IGraphicBufferProducer::QueueBufferOutput& qbo,
+                            int64_t mediaTimeUs, int64_t desiredRenderTimeNs);
+    void processRenderedFrames(const FrameEventHistoryDelta& delta);
+    int64_t getRenderTimeNs(const TrackedFrame& frame);
 
     QueueSync mSync;
     sp<MemoryDealer> mDealer;
@@ -282,6 +341,7 @@ private:
     std::shared_ptr<C2BlockPool> mInputAllocator;
     QueueSync mQueueSync;
     std::vector<std::unique_ptr<C2Param>> mParamsToBeSet;
+    sp<AMessage> mOutputFormat;
 
     struct Input {
         Input();
@@ -301,6 +361,9 @@ private:
         std::unique_ptr<OutputBuffers> buffers;
         size_t numSlots;
         uint32_t outputDelay;
+        // true iff the underlying block pool is bounded --- for example,
+        // a BufferQueue-based block pool would be bounded by the BufferQueue.
+        bool bounded;
     };
     Mutexed<Output> mOutput;
     Mutexed<std::list<std::unique_ptr<C2Work>>> mFlushedConfigs;
@@ -310,6 +373,11 @@ private:
 
     sp<MemoryDealer> makeMemoryDealer(size_t heapSize);
 
+    std::deque<TrackedFrame> mTrackedFrames;
+    bool mAreRenderMetricsEnabled;
+    bool mIsSurfaceToDisplay;
+    bool mHasPresentFenceTimes;
+
     struct OutputSurface {
         sp<Surface> surface;
         uint32_t generation;
@@ -317,6 +385,7 @@ private:
         std::map<uint64_t, int> rotation;
     };
     Mutexed<OutputSurface> mOutputSurface;
+    int mRenderingDepth;
 
     struct BlockPools {
         C2Allocator::id_t inputAllocatorId;
@@ -327,7 +396,21 @@ private:
     };
     Mutexed<BlockPools> mBlockPools;
 
-    std::shared_ptr<InputSurfaceWrapper> mInputSurface;
+    std::atomic_bool mHasInputSurface;
+    struct InputSurface {
+        std::shared_ptr<InputSurfaceWrapper> surface;
+        // This variable tracks the number of buffers processing
+        // in the input surface and codec by counting the # of buffers to
+        // be filled in and queued from the input surface and the # of
+        // buffers generated from the codec.
+        //
+        // Note that this variable can go below 0, because it does not take
+        // account the number of buffers initially in the buffer queue at
+        // start. This is okay, as we only track how many more we allow
+        // from the initial state.
+        int64_t numProcessingBuffersBalance;
+    };
+    Mutexed<InputSurface> mInputSurface;
 
     MetaMode mMetaMode;
 
@@ -345,6 +428,8 @@ private:
     std::atomic_bool mSendEncryptedInfoBuffer;
 
     std::atomic_bool mTunneled;
+
+    std::vector<std::shared_ptr<C2InfoBuffer>> mInfoBuffers;
 };
 
 // Conversion of a c2_status_t value to a status_t value may depend on the

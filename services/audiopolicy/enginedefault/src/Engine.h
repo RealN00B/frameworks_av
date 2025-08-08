@@ -28,25 +28,20 @@ class AudioPolicyManagerObserver;
 namespace audio_policy
 {
 
-enum legacy_strategy {
-    STRATEGY_NONE = -1,
-    STRATEGY_MEDIA,
-    STRATEGY_PHONE,
-    STRATEGY_SONIFICATION,
-    STRATEGY_SONIFICATION_RESPECTFUL,
-    STRATEGY_DTMF,
-    STRATEGY_ENFORCED_AUDIBLE,
-    STRATEGY_TRANSMITTED_THROUGH_SPEAKER,
-    STRATEGY_ACCESSIBILITY,
-    STRATEGY_REROUTING,
-    STRATEGY_CALL_ASSISTANT,
-};
-
 class Engine : public EngineBase
 {
 public:
-    Engine();
+    Engine() = default;
     virtual ~Engine() = default;
+    Engine(const Engine &object) = delete;
+    Engine &operator=(const Engine &object) = delete;
+
+    ///
+    /// from EngineInterface
+    ///
+    status_t loadFromHalConfigWithFallback(
+            const media::audio::common::AudioHalEngineConfig& config) override;
+    status_t loadFromXmlConfigWithFallback(const std::string& xmlFilePath = "") override;
 
 private:
     ///
@@ -64,15 +59,18 @@ private:
 
     sp<DeviceDescriptor> getInputDeviceForAttributes(const audio_attributes_t &attr,
                                                      uid_t uid = 0,
+                                                     audio_session_t session = AUDIO_SESSION_NONE,
                                                      sp<AudioPolicyMix> *mix = nullptr)
                                                      const override;
 
-    void updateDeviceSelectionCache() override;
+    void setStrategyDevices(const sp<ProductStrategy>& strategy,
+                            const DeviceVector& devices) override;
+
+    DeviceVector getDevicesForProductStrategy(product_strategy_t strategy) const override;
 
 private:
-    /* Copy facilities are put private to disable copy. */
-    Engine(const Engine &object);
-    Engine &operator=(const Engine &object);
+    template<typename T>
+    status_t loadWithFallback(const T& configSource);
 
     status_t setDefaultDevice(audio_devices_t device);
 
@@ -87,20 +85,19 @@ private:
                                           DeviceVector availableOutputDevices,
                                           const SwAudioOutputCollection &outputs) const;
 
-    DeviceVector getDevicesForProductStrategy(product_strategy_t strategy) const;
-
     sp<DeviceDescriptor> getDeviceForInputSource(audio_source_t inputSource) const;
 
     product_strategy_t getProductStrategyFromLegacy(legacy_strategy legacyStrategy) const;
     audio_devices_t getPreferredDeviceTypeForLegacyStrategy(
         const DeviceVector& availableOutputDevices, legacy_strategy legacyStrategy) const;
-    DeviceVector getPreferredAvailableDevicesForProductStrategy(
-        const DeviceVector& availableOutputDevices, product_strategy_t strategy) const;
+    DeviceVector getPreferredAvailableDevicesForInputSource(
+            const DeviceVector& availableInputDevices, audio_source_t inputSource) const;
+    DeviceVector getDisabledDevicesForInputSource(
+            const DeviceVector& availableInputDevices, audio_source_t inputSource) const;
 
-    DeviceStrategyMap mDevicesForStrategies;
+    bool isBtScoActive(DeviceVector& availableOutputDevices) const;
 
     std::map<product_strategy_t, legacy_strategy> mLegacyStrategyMap;
 };
 } // namespace audio_policy
 } // namespace android
-

@@ -20,7 +20,6 @@
 #include <memory>
 #include <mutex>
 
-#include <utils/String8.h>
 #include <utils/String16.h>
 
 #include "AidlCamera3OutputUtils.h"
@@ -97,24 +96,29 @@ class AidlCamera3OfflineSession :
         ::ndk::ScopedAStatus returnStreamBuffers(
                 const std::vector<
                         aidl::android::hardware::camera::device::StreamBuffer>& buffers) override;
+        protected:
+
+        ::ndk::SpAIBinder createBinder() override;
+
         private:
             wp<AidlCamera3OfflineSession> mParent = nullptr;
     };
 
     // initialize by Camera3Device.
-    explicit AidlCamera3OfflineSession(const String8& id,
-            const sp<camera3::Camera3Stream>& inputStream,
-            const camera3::StreamSet& offlineStreamSet,
-            camera3::BufferRecords&& bufferRecords,
+    explicit AidlCamera3OfflineSession(
+            const std::string& id, const sp<camera3::Camera3Stream>& inputStream,
+            const camera3::StreamSet& offlineStreamSet, camera3::BufferRecords&& bufferRecords,
             const camera3::InFlightRequestMap& offlineReqs,
             const Camera3OfflineStates& offlineStates,
             std::shared_ptr<aidl::android::hardware::camera::device::ICameraOfflineSession>
-                    offlineSession) :
-      Camera3OfflineSession(id, inputStream, offlineStreamSet, std::move(bufferRecords),
-              offlineReqs, offlineStates),
-      mSession(offlineSession) {
-        mCallbacks = ndk::SharedRefBase::make<AidlCameraDeviceCallbacks>(this);
-      };
+                    offlineSession,
+            bool sensorReadoutTimestampSupported)
+        : Camera3OfflineSession(id, inputStream, offlineStreamSet, std::move(bufferRecords),
+                                offlineReqs, offlineStates),
+          mSession(offlineSession),
+          mSensorReadoutTimestampSupported(sensorReadoutTimestampSupported) {
+            mCallbacks = ndk::SharedRefBase::make<AidlCameraDeviceCallbacks>(this);
+    };
 
     /**
      * End of CameraOfflineSessionBase interface
@@ -127,7 +131,11 @@ class AidlCamera3OfflineSession :
 
     std::shared_ptr<AidlCameraDeviceCallbacks> mCallbacks;
 
-    virtual void disconnectSession() override;
+    bool mSensorReadoutTimestampSupported;
+
+    virtual void closeSessionLocked() override;
+
+    virtual void releaseSessionLocked() override;
 
 }; // class AidlCamera3OfflineSession
 

@@ -34,12 +34,12 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
      * Set the transform on the output stream; one of the
      * HAL_TRANSFORM_* / NATIVE_WINDOW_TRANSFORM_* constants.
      */
-    virtual status_t setTransform(int transform, bool mayChangeMirror) = 0;
+    virtual status_t setTransform(int transform, bool mayChangeMirror, int surfaceId = 0) = 0;
 
     /**
      * Return if this output stream is for video encoding.
      */
-    virtual bool isVideoStream() const = 0;
+    virtual bool isVideoStream() = 0;
 
     /**
      * Return if the consumer configuration of this stream is deferred.
@@ -49,7 +49,7 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
     /**
      * Set the consumer surfaces to the output stream.
      */
-    virtual status_t setConsumers(const std::vector<sp<Surface>>& consumers) = 0;
+    virtual status_t setConsumers(const std::vector<SurfaceHolder>& consumers) = 0;
 
     /**
      * Detach an unused buffer from the stream.
@@ -81,7 +81,7 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
     /**
      * Update the stream output surfaces.
      */
-    virtual status_t updateStream(const std::vector<sp<Surface>> &outputSurfaces,
+    virtual status_t updateStream(const std::vector<SurfaceHolder> &outputSurfaces,
             const std::vector<OutputStreamInfo> &outputInfo,
             const std::vector<size_t> &removedSurfaceIds,
             KeyedVector<sp<Surface>, size_t> *outputMap/*out*/) = 0;
@@ -94,7 +94,7 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
     /**
      * Query the physical camera id for the output stream.
      */
-    virtual const String8& getPhysicalCameraId() const = 0;
+    virtual const std::string& getPhysicalCameraId() const = 0;
 
     /**
      * Set the batch size for buffer operations. The output stream will request
@@ -110,12 +110,18 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
     virtual status_t setBatchSize(size_t batchSize = 1) = 0;
 
     /**
-     * Notify the output stream that the minimum frame duration has changed.
+     * Notify the output stream that the minimum frame duration has changed, or
+     * frame rate has switched between variable and fixed.
      *
      * The minimum frame duration is calculated based on the upper bound of
      * AE_TARGET_FPS_RANGE in the capture request.
      */
-    virtual void onMinDurationChanged(nsecs_t duration) = 0;
+    virtual void onMinDurationChanged(nsecs_t duration, bool fixedFps) = 0;
+
+    /**
+     * Modify the stream use case for this output.
+     */
+    virtual void setStreamUseCase(int64_t streamUseCase) = 0;
 };
 
 // Helper class to organize a synchronized mapping of stream IDs to stream instances

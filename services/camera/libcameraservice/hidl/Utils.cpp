@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include <hidl/Utils.h>
-#include <hidl/VndkVersionMetadataTags.h>
-#include <gui/bufferqueue/1.0/H2BGraphicBufferProducer.h>
+#include <camera/StringUtils.h>
 #include <cutils/native_handle.h>
+#include <gui/Flags.h>  // remove with WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+#include <gui/bufferqueue/1.0/H2BGraphicBufferProducer.h>
+#include <hidl/Utils.h>
 #include <mediautils/AImageReaderUtils.h>
 
 namespace android {
@@ -28,6 +29,7 @@ namespace conversion {
 
 using hardware::graphics::bufferqueue::V1_0::utils::H2BGraphicBufferProducer;
 using aimg::AImageReader_getHGBPFromHandle;
+using CameraMetadataInfo = android::hardware::camera2::CameraMetadataInfo;
 
 // Note: existing data in dst will be gone. Caller still owns the memory of src
 void convertToHidl(const camera_metadata_t *src, HCameraMetadata* dst) {
@@ -84,15 +86,27 @@ int convertFromHidl(HOutputConfiguration::Rotation rotation) {
 
 hardware::camera2::params::OutputConfiguration convertFromHidl(
     const HOutputConfiguration &hOutputConfiguration) {
-    std::vector<sp<IGraphicBufferProducer>> iGBPs;
-    auto &windowHandles = hOutputConfiguration.windowHandles;
-    iGBPs.reserve(windowHandles.size());
+    std::vector<ParcelableSurfaceType> surfaces;
+    auto& windowHandles = hOutputConfiguration.windowHandles;
+    surfaces.reserve(windowHandles.size());
     for (auto &handle : windowHandles) {
-        iGBPs.push_back(new H2BGraphicBufferProducer(AImageReader_getHGBPFromHandle(handle)));
+        auto igbp = AImageReader_getHGBPFromHandle(handle);
+        if (igbp == nullptr) {
+            ALOGE("%s: Could not get HGBP from native_handle: %p. Skipping.",
+                    __FUNCTION__, handle.getNativeHandle());
+            continue;
+        }
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+        view::Surface surface;
+        surface.graphicBufferProducer = new H2BGraphicBufferProducer(igbp);
+        surfaces.push_back(surface);
+#else
+        surfaces.push_back(new H2BGraphicBufferProducer(igbp));
+#endif
     }
-    String16 physicalCameraId16(hOutputConfiguration.physicalCameraId.c_str());
     hardware::camera2::params::OutputConfiguration outputConfiguration(
-        iGBPs, convertFromHidl(hOutputConfiguration.rotation), physicalCameraId16,
+        surfaces, convertFromHidl(hOutputConfiguration.rotation),
+        hOutputConfiguration.physicalCameraId,
         hOutputConfiguration.windowGroupId, OutputConfiguration::SURFACE_TYPE_UNKNOWN, 0, 0,
         (windowHandles.size() > 1));
     return outputConfiguration;
@@ -158,8 +172,8 @@ HCaptureResultExtras convertToHidl(const CaptureResultExtras &captureResultExtra
     hCaptureResultExtras.frameNumber = captureResultExtras.frameNumber;
     hCaptureResultExtras.partialResultCount = captureResultExtras.partialResultCount;
     hCaptureResultExtras.errorStreamId = captureResultExtras.errorStreamId;
-    hCaptureResultExtras.errorPhysicalCameraId = hidl_string(String8(
-            captureResultExtras.errorPhysicalCameraId).string());
+    hCaptureResultExtras.errorPhysicalCameraId = hidl_string(
+            captureResultExtras.errorPhysicalCameraId.c_str());
     return hCaptureResultExtras;
 }
 
@@ -192,7 +206,7 @@ void convertToHidl(const std::vector<hardware::CameraStatus> &src,
     size_t i = 0;
     for (auto &statusAndId : src) {
         auto &a = (*dst)[i++];
-        a.cameraId = statusAndId.cameraId.c_str();
+        a.cameraId = statusAndId.cameraId;
         a.deviceStatus = convertToHidlCameraDeviceStatus(statusAndId.status);
     }
     return;
@@ -204,12 +218,12 @@ void convertToHidl(const std::vector<hardware::CameraStatus> &src,
     size_t i = 0;
     for (const auto &statusAndId : src) {
         auto &a = (*dst)[i++];
-        a.v2_0.cameraId = statusAndId.cameraId.c_str();
+        a.v2_0.cameraId = statusAndId.cameraId;
         a.v2_0.deviceStatus = convertToHidlCameraDeviceStatus(statusAndId.status);
         size_t numUnvailPhysicalCameras = statusAndId.unavailablePhysicalIds.size();
         a.unavailPhysicalCameraIds.resize(numUnvailPhysicalCameras);
         for (size_t j = 0; j < numUnvailPhysicalCameras; j++) {
-            a.unavailPhysicalCameraIds[j] = statusAndId.unavailablePhysicalIds[j].c_str();
+            a.unavailPhysicalCameraIds[j] = statusAndId.unavailablePhysicalIds[j];
         }
     }
     return;
@@ -266,9 +280,10 @@ HPhysicalCaptureResultInfo convertToHidl(
     std::shared_ptr<CaptureResultMetadataQueue> &captureResultMetadataQueue) {
     HPhysicalCaptureResultInfo hPhysicalCaptureResultInfo;
     hPhysicalCaptureResultInfo.physicalCameraId =
-        String8(physicalCaptureResultInfo.mPhysicalCameraId).string();
+        toString8(physicalCaptureResultInfo.mPhysicalCameraId);
     const camera_metadata_t *rawMetadata =
-        physicalCaptureResultInfo.mPhysicalCameraMetadata.getAndLock();
+        physicalCaptureResultInfo.mCameraMetadataInfo.get<CameraMetadataInfo::metadata>().
+                getAndLock();
     // Try using fmq at first.
     size_t metadata_size = get_camera_metadata_size(rawMetadata);
     if ((metadata_size > 0) && (captureResultMetadataQueue->availableToWrite() > 0)) {
@@ -281,7 +296,8 @@ HPhysicalCaptureResultInfo convertToHidl(
             hPhysicalCaptureResultInfo.physicalCameraMetadata.metadata(std::move(metadata));
         }
     }
-    physicalCaptureResultInfo.mPhysicalCameraMetadata.unlock(rawMetadata);
+    physicalCaptureResultInfo.mCameraMetadataInfo.get<CameraMetadataInfo::metadata>().
+            unlock(rawMetadata);
     return hPhysicalCaptureResultInfo;
 }
 
@@ -296,31 +312,6 @@ hidl_vec<HPhysicalCaptureResultInfo> convertToHidl(
                                                          captureResultMetadataQueue);
     }
     return hPhysicalCaptureResultInfos;
-}
-
-status_t filterVndkKeys(int vndkVersion, CameraMetadata &metadata, bool isStatic) {
-    if (vndkVersion == __ANDROID_API_FUTURE__) {
-        // VNDK version in ro.vndk.version is a version code-name that
-        // corresponds to the current version.
-        return OK;
-    }
-    const auto &apiLevelToKeys =
-            isStatic ? static_api_level_to_keys : dynamic_api_level_to_keys;
-    // Find the vndk versions above the given vndk version. All the vndk
-    // versions above the given one, need to have their keys filtered from the
-    // metadata in order to avoid metadata invalidation.
-    auto it = apiLevelToKeys.upper_bound(vndkVersion);
-    while (it != apiLevelToKeys.end()) {
-        for (const auto &key : it->second) {
-            status_t res = metadata.erase(key);
-            if (res != OK) {
-                ALOGE("%s metadata key %d could not be erased", __FUNCTION__, key);
-                return res;
-            }
-        }
-        it++;
-    }
-    return OK;
 }
 
 } //conversion

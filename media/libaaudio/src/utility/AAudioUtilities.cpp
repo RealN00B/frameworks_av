@@ -16,23 +16,27 @@
 
 #define LOG_TAG "AAudio"
 //#define LOG_NDEBUG 0
-#include <utils/Log.h>
 
-#include <cutils/properties.h>
+#include <assert.h>
+#include <math.h>
 #include <stdint.h>
+
+#include <aaudio/AAudioTesting.h>
+#include <android/media/audio/common/AudioMMapPolicy.h>
+#include <cutils/properties.h>
 #include <sys/types.h>
+#include <system/audio.h>
 #include <utils/Errors.h>
+#include <utils/Log.h>
 
 #include "aaudio/AAudio.h"
 #include "core/AudioGlobal.h"
-#include <aaudio/AAudioTesting.h>
-#include <math.h>
-#include <system/audio.h>
-#include <assert.h>
-
 #include "utility/AAudioUtilities.h"
 
 using namespace android;
+
+using android::media::audio::common::AudioMMapPolicy;
+using android::media::audio::common::AudioMMapPolicyInfo;
 
 status_t AAudioConvert_aaudioToAndroidStatus(aaudio_result_t result) {
     // This covers the case for AAUDIO_OK and for positive results.
@@ -140,6 +144,30 @@ audio_format_t AAudioConvert_aaudioToAndroidDataFormat(aaudio_format_t aaudioFor
     case AAUDIO_FORMAT_PCM_I32:
         androidFormat = AUDIO_FORMAT_PCM_32_BIT;
         break;
+    case AAUDIO_FORMAT_IEC61937:
+        androidFormat = AUDIO_FORMAT_IEC61937;
+        break;
+    case AAUDIO_FORMAT_MP3:
+        androidFormat = AUDIO_FORMAT_MP3;
+        break;
+    case AAUDIO_FORMAT_AAC_LC:
+        androidFormat = AUDIO_FORMAT_AAC_LC;
+        break;
+    case AAUDIO_FORMAT_AAC_HE_V1:
+        androidFormat = AUDIO_FORMAT_AAC_HE_V1;
+        break;
+    case AAUDIO_FORMAT_AAC_HE_V2:
+        androidFormat = AUDIO_FORMAT_AAC_HE_V2;
+        break;
+    case AAUDIO_FORMAT_AAC_ELD:
+        androidFormat = AUDIO_FORMAT_AAC_ELD;
+        break;
+    case AAUDIO_FORMAT_AAC_XHE:
+        androidFormat = AUDIO_FORMAT_AAC_XHE;
+        break;
+    case AAUDIO_FORMAT_OPUS:
+        androidFormat = AUDIO_FORMAT_OPUS;
+        break;
     default:
         androidFormat = AUDIO_FORMAT_INVALID;
         ALOGE("%s() 0x%08X unrecognized", __func__, aaudioFormat);
@@ -166,12 +194,47 @@ aaudio_format_t AAudioConvert_androidToAAudioDataFormat(audio_format_t androidFo
     case AUDIO_FORMAT_PCM_32_BIT:
         aaudioFormat = AAUDIO_FORMAT_PCM_I32;
         break;
+    case AUDIO_FORMAT_IEC61937:
+        aaudioFormat = AAUDIO_FORMAT_IEC61937;
+        break;
+    case AUDIO_FORMAT_MP3:
+        aaudioFormat = AAUDIO_FORMAT_MP3;
+        break;
+    case AUDIO_FORMAT_AAC_LC:
+        aaudioFormat = AAUDIO_FORMAT_AAC_LC;
+        break;
+    case AUDIO_FORMAT_AAC_HE_V1:
+        aaudioFormat = AAUDIO_FORMAT_AAC_HE_V1;
+        break;
+    case AUDIO_FORMAT_AAC_HE_V2:
+        aaudioFormat = AAUDIO_FORMAT_AAC_HE_V2;
+        break;
+    case AUDIO_FORMAT_AAC_ELD:
+        aaudioFormat = AAUDIO_FORMAT_AAC_ELD;
+        break;
+    case AUDIO_FORMAT_AAC_XHE:
+        aaudioFormat = AAUDIO_FORMAT_AAC_XHE;
+        break;
+    case AUDIO_FORMAT_OPUS:
+        aaudioFormat = AAUDIO_FORMAT_OPUS;
+        break;
     default:
         aaudioFormat = AAUDIO_FORMAT_INVALID;
         ALOGE("%s() 0x%08X unrecognized", __func__, androidFormat);
         break;
     }
     return aaudioFormat;
+}
+
+aaudio_format_t AAudioConvert_androidToNearestAAudioDataFormat(audio_format_t androidFormat) {
+    // Special case AUDIO_FORMAT_PCM_8_24_BIT because this function should be used to find the
+    // resolution of the data format. Setting AUDIO_FORMAT_PCM_8_24_BIT directly is not available
+    // from AAudio but hardware may use AUDIO_FORMAT_PCM_8_24_BIT under the hood.
+    if (androidFormat == AUDIO_FORMAT_PCM_8_24_BIT) {
+        ALOGD("%s() converting 8.24 to 24 bit packed", __func__);
+        return AAUDIO_FORMAT_PCM_I24_PACKED;
+    }
+    return AAudioConvert_androidToAAudioDataFormat(androidFormat);
 }
 
 // Make a message string from the condition.
@@ -234,10 +297,11 @@ audio_source_t AAudioConvert_inputPresetToAudioSource(aaudio_input_preset_t pres
     return (audio_source_t) preset; // same value
 }
 
-audio_flags_mask_t AAudioConvert_allowCapturePolicyToAudioFlagsMask(
+audio_flags_mask_t AAudio_computeAudioFlagsMask(
         aaudio_allowed_capture_policy_t policy,
         aaudio_spatialization_behavior_t spatializationBehavior,
-        bool isContentSpatialized) {
+        bool isContentSpatialized,
+        audio_output_flags_t outputFlags) {
     audio_flags_mask_t flagsMask = AUDIO_FLAG_NONE;
     switch (policy) {
         case AAUDIO_UNSPECIFIED:
@@ -272,6 +336,15 @@ audio_flags_mask_t AAudioConvert_allowCapturePolicyToAudioFlagsMask(
 
     if (isContentSpatialized) {
         flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_CONTENT_SPATIALIZED);
+    }
+
+    if ((outputFlags & AUDIO_OUTPUT_FLAG_HW_AV_SYNC) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_HW_AV_SYNC);
+    }
+    if ((outputFlags & AUDIO_OUTPUT_FLAG_FAST) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_LOW_LATENCY);
+    } else if ((outputFlags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) != 0) {
+        flagsMask = static_cast<audio_flags_mask_t>(flagsMask | AUDIO_FLAG_DEEP_BUFFER);
     }
 
     return flagsMask;
@@ -352,11 +425,10 @@ audio_channel_mask_t AAudioConvert_aaudioToAndroidChannelLayoutMask(
                 return AUDIO_CHANNEL_OUT_7POINT1POINT2;
             case AAUDIO_CHANNEL_7POINT1POINT4:
                 return AUDIO_CHANNEL_OUT_7POINT1POINT4;
-            // TODO: add 9point1point4 and 9point1point6 when they are added in audio-hal-enums.h
-            // case AAUDIO_CHANNEL_9POINT1POINT4:
-            //     return AUDIO_CHANNEL_OUT_9POINT1POINT4;
-            // case AAUDIO_CHANNEL_9POINT1POINT6:
-            //     return AUDIO_CHANNEL_OUT_9POINT1POINT6;
+            case AAUDIO_CHANNEL_9POINT1POINT4:
+                return AUDIO_CHANNEL_OUT_9POINT1POINT4;
+            case AAUDIO_CHANNEL_9POINT1POINT6:
+                return AUDIO_CHANNEL_OUT_9POINT1POINT6;
             default:
                 ALOGE("%s() %#x unrecognized", __func__, channelMask);
                 return AUDIO_CHANNEL_INVALID;
@@ -434,11 +506,10 @@ aaudio_channel_mask_t AAudioConvert_androidToAAudioChannelLayoutMask(
                 return AAUDIO_CHANNEL_7POINT1POINT2;
             case AUDIO_CHANNEL_OUT_7POINT1POINT4:
                 return AAUDIO_CHANNEL_7POINT1POINT4;
-            // TODO: add 9point1point4 and 9point1point6 when they are added in audio-hal-enums.h
-            // case AUDIO_CHANNEL_OUT_9POINT1POINT4:
-            //     return AAUDIO_CHANNEL_9POINT1POINT4;
-            // case AUDIO_CHANNEL_OUT_9POINT1POINT6:
-            //     return AAUDIO_CHANNEL_9POINT1POINT6;
+            case AUDIO_CHANNEL_OUT_9POINT1POINT4:
+                return AAUDIO_CHANNEL_9POINT1POINT4;
+            case AUDIO_CHANNEL_OUT_9POINT1POINT6:
+                return AAUDIO_CHANNEL_9POINT1POINT6;
             default:
                 ALOGE("%s() %#x unrecognized", __func__, channelMask);
                 return AAUDIO_CHANNEL_INVALID;
@@ -631,4 +702,161 @@ aaudio_result_t AAudio_isFlushAllowed(aaudio_stream_state_t state) {
             break;
     }
     return result;
+}
+
+namespace {
+
+aaudio_policy_t aidl2legacy_aaudio_policy(AudioMMapPolicy aidl) {
+    switch (aidl) {
+        case AudioMMapPolicy::NEVER:
+            return AAUDIO_POLICY_NEVER;
+        case AudioMMapPolicy::AUTO:
+            return AAUDIO_POLICY_AUTO;
+        case AudioMMapPolicy::ALWAYS:
+            return AAUDIO_POLICY_ALWAYS;
+        case AudioMMapPolicy::UNSPECIFIED:
+        default:
+            return AAUDIO_UNSPECIFIED;
+    }
+}
+
+} // namespace
+
+aaudio_policy_t AAudio_getAAudioPolicy(const std::vector<AudioMMapPolicyInfo>& policyInfos,
+                                       AudioMMapPolicy defaultPolicy) {
+    AudioMMapPolicy policy = defaultPolicy;
+    for (const auto& policyInfo : policyInfos) {
+        if (policyInfo.mmapPolicy == AudioMMapPolicy::NEVER) {
+            policy = policyInfo.mmapPolicy;
+        } else if (policyInfo.mmapPolicy == AudioMMapPolicy::AUTO ||
+                   policyInfo.mmapPolicy == AudioMMapPolicy::ALWAYS) {
+            return AAUDIO_POLICY_AUTO;
+        }
+    }
+    return aidl2legacy_aaudio_policy(policy);
+}
+
+audio_devices_t AAudioConvert_aaudioToAndroidDeviceType(AAudio_DeviceType device,
+                                                        aaudio_direction_t direction) {
+    if (direction == AAUDIO_DIRECTION_INPUT) {
+        switch (device) {
+            case AAUDIO_DEVICE_BUILTIN_MIC:
+                return AUDIO_DEVICE_IN_BUILTIN_MIC;
+            case AAUDIO_DEVICE_BLUETOOTH_SCO:
+                return AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET;
+            case AAUDIO_DEVICE_WIRED_HEADSET:
+                return AUDIO_DEVICE_IN_WIRED_HEADSET;
+            case AAUDIO_DEVICE_HDMI:
+                return AUDIO_DEVICE_IN_HDMI;
+            case AAUDIO_DEVICE_TELEPHONY:
+                return AUDIO_DEVICE_IN_TELEPHONY_RX;
+            case AAUDIO_DEVICE_DOCK:
+                return AUDIO_DEVICE_IN_DGTL_DOCK_HEADSET;
+            case AAUDIO_DEVICE_DOCK_ANALOG:
+                return AUDIO_DEVICE_IN_ANLG_DOCK_HEADSET;
+            case AAUDIO_DEVICE_USB_ACCESSORY:
+                return AUDIO_DEVICE_IN_USB_ACCESSORY;
+            case AAUDIO_DEVICE_USB_DEVICE:
+                return AUDIO_DEVICE_IN_USB_DEVICE;
+            case AAUDIO_DEVICE_USB_HEADSET:
+                return AUDIO_DEVICE_IN_USB_HEADSET;
+            case AAUDIO_DEVICE_FM_TUNER:
+                return AUDIO_DEVICE_IN_FM_TUNER;
+            case AAUDIO_DEVICE_TV_TUNER:
+                return AUDIO_DEVICE_IN_TV_TUNER;
+            case AAUDIO_DEVICE_LINE_ANALOG:
+                return AUDIO_DEVICE_IN_LINE;
+            case AAUDIO_DEVICE_LINE_DIGITAL:
+                return AUDIO_DEVICE_IN_SPDIF;
+            case AAUDIO_DEVICE_BLUETOOTH_A2DP:
+                return AUDIO_DEVICE_IN_BLUETOOTH_A2DP;
+            case AAUDIO_DEVICE_IP:
+                return AUDIO_DEVICE_IN_IP;
+            case AAUDIO_DEVICE_BUS:
+                return AUDIO_DEVICE_IN_BUS;
+            case AAUDIO_DEVICE_REMOTE_SUBMIX:
+                return AUDIO_DEVICE_IN_REMOTE_SUBMIX;
+            case AAUDIO_DEVICE_BLE_HEADSET:
+                return AUDIO_DEVICE_IN_BLE_HEADSET;
+            case AAUDIO_DEVICE_HDMI_ARC:
+                return AUDIO_DEVICE_IN_HDMI_ARC;
+            case AAUDIO_DEVICE_HDMI_EARC:
+                return AUDIO_DEVICE_IN_HDMI_EARC;
+            default:
+                break;
+        }
+    } else {
+        switch (device) {
+            case AAUDIO_DEVICE_BUILTIN_EARPIECE:
+                return AUDIO_DEVICE_OUT_EARPIECE;
+            case AAUDIO_DEVICE_BUILTIN_SPEAKER:
+                return AUDIO_DEVICE_OUT_SPEAKER;
+            case AAUDIO_DEVICE_WIRED_HEADSET:
+                return AUDIO_DEVICE_OUT_WIRED_HEADSET;
+            case AAUDIO_DEVICE_WIRED_HEADPHONES:
+                return AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
+            case AAUDIO_DEVICE_LINE_ANALOG:
+                return AUDIO_DEVICE_OUT_LINE;
+            case AAUDIO_DEVICE_LINE_DIGITAL:
+                return AUDIO_DEVICE_OUT_SPDIF;
+            case AAUDIO_DEVICE_BLUETOOTH_SCO:
+                return AUDIO_DEVICE_OUT_BLUETOOTH_SCO;
+            case AAUDIO_DEVICE_BLUETOOTH_A2DP:
+                return AUDIO_DEVICE_OUT_BLUETOOTH_A2DP;
+            case AAUDIO_DEVICE_HDMI:
+                return AUDIO_DEVICE_OUT_HDMI;
+            case AAUDIO_DEVICE_HDMI_ARC:
+                return AUDIO_DEVICE_OUT_HDMI_ARC;
+            case AAUDIO_DEVICE_HDMI_EARC:
+                return AUDIO_DEVICE_OUT_HDMI_EARC;
+            case AAUDIO_DEVICE_USB_DEVICE:
+                return AUDIO_DEVICE_OUT_USB_DEVICE;
+            case AAUDIO_DEVICE_USB_HEADSET:
+                return AUDIO_DEVICE_OUT_USB_HEADSET;
+            case AAUDIO_DEVICE_USB_ACCESSORY:
+                return AUDIO_DEVICE_OUT_USB_ACCESSORY;
+            case AAUDIO_DEVICE_DOCK:
+                return AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET;
+            case AAUDIO_DEVICE_DOCK_ANALOG:
+                return AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET;
+            case AAUDIO_DEVICE_FM:
+                return AUDIO_DEVICE_OUT_FM;
+            case AAUDIO_DEVICE_TELEPHONY:
+                return AUDIO_DEVICE_OUT_TELEPHONY_TX;
+            case AAUDIO_DEVICE_AUX_LINE:
+                return AUDIO_DEVICE_OUT_AUX_LINE;
+            case AAUDIO_DEVICE_IP:
+                return AUDIO_DEVICE_OUT_IP;
+            case AAUDIO_DEVICE_BUS:
+                return AUDIO_DEVICE_OUT_BUS;
+            case AAUDIO_DEVICE_HEARING_AID:
+                return AUDIO_DEVICE_OUT_HEARING_AID;
+            case AAUDIO_DEVICE_BUILTIN_SPEAKER_SAFE:
+                return AUDIO_DEVICE_OUT_SPEAKER_SAFE;
+            case AAUDIO_DEVICE_REMOTE_SUBMIX:
+                return AUDIO_DEVICE_OUT_REMOTE_SUBMIX;
+            case AAUDIO_DEVICE_BLE_HEADSET:
+                return AUDIO_DEVICE_OUT_BLE_HEADSET;
+            case AAUDIO_DEVICE_BLE_SPEAKER:
+                return AUDIO_DEVICE_OUT_BLE_SPEAKER;
+            case AAUDIO_DEVICE_BLE_BROADCAST:
+                return AUDIO_DEVICE_OUT_BLE_BROADCAST;
+            default:
+                break;
+        }
+    }
+    return AUDIO_DEVICE_NONE;
+}
+
+aaudio_policy_t AAudioConvert_androidToAAudioMMapPolicy(AudioMMapPolicy policy) {
+    switch (policy) {
+        case AudioMMapPolicy::AUTO:
+            return AAUDIO_POLICY_AUTO;
+        case AudioMMapPolicy::ALWAYS:
+            return AAUDIO_POLICY_ALWAYS;
+        case AudioMMapPolicy::NEVER:
+        case AudioMMapPolicy::UNSPECIFIED:
+        default:
+            return AAUDIO_POLICY_NEVER;
+    }
 }

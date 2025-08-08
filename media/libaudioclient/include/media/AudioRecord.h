@@ -26,7 +26,6 @@
 #include <media/AudioTimestamp.h>
 #include <media/MediaMetricsItem.h>
 #include <media/Modulo.h>
-#include <media/MicrophoneInfo.h>
 #include <media/RecordingActivityTracker.h>
 #include <utils/RefBase.h>
 #include <utils/threads.h>
@@ -138,6 +137,12 @@ public:
                                       uint32_t sampleRate,
                                       audio_format_t format,
                                       audio_channel_mask_t channelMask);
+
+    /* Checks for erroneous status, marks error in MediaMetrics, logs the error message.
+     * Updates and returns mStatus.
+     */
+    status_t logIfErrorAndReturnStatus(status_t status, const std::string& errorMessage,
+                                       const std::string& func);
 
     /* How data is transferred from AudioRecord
      */
@@ -326,6 +331,15 @@ public:
      */
             uint32_t    getSampleRate() const   { return mSampleRate; }
 
+    /* Return the sample rate from the AudioFlinger input thread. */
+            uint32_t    getHalSampleRate() const;
+
+    /* Return the channel count from the AudioFlinger input thread. */
+            uint32_t    getHalChannelCount() const;
+
+    /* Return the HAL format from the AudioFlinger input thread. */
+            audio_format_t    getHalFormat() const;
+
     /* Sets marker position. When record reaches the number of frames specified,
      * a callback with event type EVENT_MARKER is called. Calling setMarkerPosition
      * with marker == 0 cancels marker notification callback.
@@ -481,19 +495,19 @@ public:
      */
             audio_port_handle_t getInputDevice();
 
-     /* Returns the ID of the audio device actually used by the input to which this AudioRecord
+     /* Returns the IDs of the audio devices actually used by the input to which this AudioRecord
       * is attached.
-      * The device ID is relevant only if the AudioRecord is active.
-      * When the AudioRecord is inactive, the device ID returned can be either:
-      * - AUDIO_PORT_HANDLE_NONE if the AudioRecord is not attached to any output.
-      * - The device ID used before paused or stopped.
+      * The device IDs is relevant only if the AudioRecord is active.
+      * When the AudioRecord is inactive, the device IDs returned can be either:
+      * - An empty vector if the AudioRecord is not attached to any output.
+      * - The device IDs used before paused or stopped.
       * - The device ID selected by audio policy manager of setOutputDevice() if the AudioRecord
       * has not been started yet.
       *
       * Parameters:
       *  none.
       */
-     audio_port_handle_t getRoutedDeviceId();
+     DeviceIdVector getRoutedDeviceIds();
 
     /* Add an AudioDeviceCallback. The caller will be notified when the audio device
      * to which this AudioRecord is routed is updated.
@@ -520,7 +534,7 @@ public:
 
             // AudioSystem::AudioDeviceCallback> virtuals
             virtual void onAudioDeviceUpdate(audio_io_handle_t audioIo,
-                                             audio_port_handle_t deviceId);
+                                             const DeviceIdVector& deviceIds);
 
 private:
     /* If nonContig is non-NULL, it is an output parameter that will be set to the number of
@@ -575,10 +589,11 @@ public:
     /* Get the flags */
             audio_input_flags_t getFlags() const { AutoMutex _l(mLock); return mFlags; }
 
-    /* Get active microphones. A empty vector of MicrophoneInfo will be passed as a parameter,
+    /* Get active microphones. A empty vector of MicrophoneInfoFw will be passed as a parameter,
      * the data will be filled when querying the hal.
      */
-            status_t    getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+            status_t    getActiveMicrophones(
+                    std::vector<media::MicrophoneInfoFw>* activeMicrophones);
 
     /* Set the Microphone direction (for processing purposes).
      */
@@ -663,7 +678,7 @@ private:
             // FIXME enum is faster than strcmp() for parameter 'from'
             status_t restoreRecord_l(const char *from);
 
-            void     updateRoutedDeviceId_l();
+            void     updateRoutedDeviceIds_l();
 
     sp<AudioRecordThread>   mAudioRecordThread;
     mutable Mutex           mLock;
@@ -672,7 +687,7 @@ private:
 
     // Current client state:  false = stopped, true = active.  Protected by mLock.  If more states
     // are added, consider changing this to enum State { ... } mState as in AudioTrack.
-    bool                    mActive;
+    bool mActive = false;
 
     // for client callback handler
 
@@ -699,7 +714,7 @@ private:
     Modulo<uint32_t>        mNewPosition;           // in frames
     uint32_t                mUpdatePeriod;          // in frames, zero means no EVENT_NEW_POS
 
-    status_t                mStatus;
+    status_t mStatus = NO_INIT;
 
     android::content::AttributionSourceState mClientAttributionSource; // Owner's attribution source
 
@@ -727,8 +742,8 @@ private:
                                                     // held to read or write those bits reliably.
     audio_input_flags_t     mOrigFlags;             // as specified in constructor or set(), const
 
-    audio_session_t         mSessionId;
-    audio_port_handle_t     mPortId;                    // Id from Audio Policy Manager
+    audio_session_t mSessionId = AUDIO_SESSION_ALLOCATE;
+    audio_port_handle_t mPortId = AUDIO_PORT_HANDLE_NONE;
 
     /**
      * mLogSessionId is a string identifying this AudioRecord for the metrics service.
@@ -747,9 +762,9 @@ private:
     sp<IMemory>             mBufferMemory;
     audio_io_handle_t       mInput = AUDIO_IO_HANDLE_NONE; // from AudioSystem::getInputforAttr()
 
-    int                     mPreviousPriority;  // before start()
-    SchedPolicy             mPreviousSchedulingGroup;
-    bool                    mAwaitBoost;    // thread should wait for priority boost before running
+    int mPreviousPriority = ANDROID_PRIORITY_NORMAL;  // before start()
+    SchedPolicy mPreviousSchedulingGroup = SP_DEFAULT;
+    bool mAwaitBoost = false;  // thread should wait for priority boost before running
 
     // The proxy should only be referenced while a lock is held because the proxy isn't
     // multi-thread safe.
@@ -770,6 +785,9 @@ private:
     size_t                  mServerSampleSize;
     std::unique_ptr<uint8_t[]> mFormatConversionBufRaw;
     Buffer                  mFormatConversionBuffer;
+    uint32_t                mHalSampleRate;          // AudioFlinger thread sample rate
+    uint32_t                mHalChannelCount;        // AudioFlinger thread channel count
+    audio_format_t          mHalFormat;              // AudioFlinger thread format
 
 private:
     class DeathNotifier : public IBinder::DeathRecipient {
@@ -787,14 +805,17 @@ private:
 
     // For Device Selection API
     //  a value of AUDIO_PORT_HANDLE_NONE indicated default (AudioPolicyManager) routing.
-    audio_port_handle_t     mSelectedDeviceId; // Device requested by the application.
-    audio_port_handle_t     mRoutedDeviceId;   // Device actually selected by audio policy manager:
-                                              // May not match the app selection depending on other
-                                              // activity and connected devices
+
+    // Device requested by the application.
+    audio_port_handle_t     mSelectedDeviceId = AUDIO_PORT_HANDLE_NONE;
+    // Device actually selected by AudioPolicyManager: This may not match the app
+    // selection depending on other activity and connected devices
+    DeviceIdVector          mRoutedDeviceIds;
+
     wp<AudioSystem::AudioDeviceCallback> mDeviceCallback;
 
-    audio_microphone_direction_t mSelectedMicDirection;
-    float mSelectedMicFieldDimension;
+    audio_microphone_direction_t mSelectedMicDirection = MIC_DIRECTION_UNSPECIFIED;
+    float mSelectedMicFieldDimension = MIC_FIELD_DIMENSION_DEFAULT;
 
     int32_t                    mMaxSharedAudioHistoryMs = 0;
     std::string                mSharedAudioPackageName = {};

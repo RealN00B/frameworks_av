@@ -22,9 +22,10 @@
 #include <utils/threads.h>
 #include <utils/List.h>
 #include <utils/Errors.h>
+#include <media/AudioContainers.h>
 #include <media/IMediaRecorderClient.h>
 #include <media/IMediaDeathNotifier.h>
-#include <media/MicrophoneInfo.h>
+#include <android/media/MicrophoneInfoFw.h>
 #include <android/content/AttributionSourceState.h>
 
 namespace android {
@@ -266,9 +267,9 @@ public:
     sp<IGraphicBufferProducer>     querySurfaceMediaSourceFromMediaServer();
     status_t    getMetrics(Parcel *reply);
     status_t    setInputDevice(audio_port_handle_t deviceId);
-    status_t    getRoutedDeviceId(audio_port_handle_t *deviceId);
+    status_t    getRoutedDeviceIds(DeviceIdVector& deviceIds);
     status_t    enableAudioDeviceCallback(bool enabled);
-    status_t    getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+    status_t    getActiveMicrophones(std::vector<media::MicrophoneInfoFw>* activeMicrophones);
     status_t    setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
     status_t    setPreferredMicrophoneFieldDimension(float zoom);
 

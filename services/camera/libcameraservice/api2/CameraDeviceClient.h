@@ -23,18 +23,28 @@
 #include <camera/camera2/SessionConfiguration.h>
 #include <camera/camera2/SubmitInfo.h>
 #include <unordered_map>
+#include <gui/Flags.h>  // remove with WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+
+#include <fmq/AidlMessageQueueCpp.h>
 
 #include "CameraOfflineSessionClient.h"
 #include "CameraService.h"
 #include "common/FrameProcessorBase.h"
 #include "common/Camera2ClientBase.h"
 #include "CompositeStream.h"
+#include "utils/CameraServiceProxyWrapper.h"
 #include "utils/SessionConfigurationUtils.h"
 
 using android::camera3::OutputStreamInfo;
 using android::camera3::CompositeStream;
 
 namespace android {
+
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+typedef uint64_t SurfaceKey;
+#else
+typedef sp<IBinder> SurfaceKey;
+#endif
 
 struct CameraDeviceClientBase :
          public CameraService::BasicClient,
@@ -47,18 +57,14 @@ struct CameraDeviceClientBase :
     }
 
 protected:
-    CameraDeviceClientBase(const sp<CameraService>& cameraService,
+    CameraDeviceClientBase(
+            const sp<CameraService>& cameraService,
             const sp<hardware::camera2::ICameraDeviceCallbacks>& remoteCallback,
-            const String16& clientPackageName,
-            bool systemNativeClient,
-            const std::optional<String16>& clientFeatureId,
-            const String8& cameraId,
-            int api1CameraId,
-            int cameraFacing,
-            int sensorOrientation,
-            int clientPid,
-            uid_t clientUid,
-            int servicePid);
+            std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+            const AttributionSourceState& clientAttribution, int callingPid,
+            bool systemNativeClient, const std::string& cameraId, int api1CameraId,
+            int cameraFacing, int sensorOrientation, int servicePid, int rotationOverride,
+            bool sharedMode);
 
     sp<hardware::camera2::ICameraDeviceCallbacks> mRemoteCallback;
 };
@@ -164,6 +170,11 @@ public:
 
     virtual binder::Status setCameraAudioRestriction(int32_t mode) override;
 
+    virtual binder::Status getCaptureResultMetadataQueue(
+          android::hardware::common::fmq::MQDescriptor<
+          int8_t, android::hardware::common::fmq::SynchronizedReadWrite>*
+          aidl_return) override;
+
     virtual binder::Status getGlobalAudioRestriction(/*out*/int32_t* outMode) override;
 
     virtual binder::Status switchToOffline(
@@ -172,45 +183,56 @@ public:
             /*out*/
             sp<hardware::camera2::ICameraOfflineSession>* session) override;
 
+    virtual binder::Status isPrimaryClient(/*out*/bool* isPrimary) override;
+
     /**
      * Interface used by CameraService
      */
 
     CameraDeviceClient(const sp<CameraService>& cameraService,
-            const sp<hardware::camera2::ICameraDeviceCallbacks>& remoteCallback,
-            const String16& clientPackageName,
-            bool clientPackageOverride,
-            const std::optional<String16>& clientFeatureId,
-            const String8& cameraId,
-            int cameraFacing,
-            int sensorOrientation,
-            int clientPid,
-            uid_t clientUid,
-            int servicePid,
-            bool overrideForPerfClass);
+                       const sp<hardware::camera2::ICameraDeviceCallbacks>& remoteCallback,
+                       std::shared_ptr<CameraServiceProxyWrapper> cameraServiceProxyWrapper,
+                       std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+                       const AttributionSourceState& clientAttribution, int callingPid,
+                       bool clientPackageOverride, const std::string& cameraId, int cameraFacing,
+                       int sensorOrientation, int servicePid, bool overrideForPerfClass,
+                       int rotationOverride, const std::string& originalCameraId, bool sharedMode,
+                       bool isVendorClient);
     virtual ~CameraDeviceClient();
 
     virtual status_t      initialize(sp<CameraProviderManager> manager,
-            const String8& monitorTags) override;
+            const std::string& monitorTags) override;
 
-    virtual status_t      setRotateAndCropOverride(uint8_t rotateAndCrop) override;
+    virtual status_t      setRotateAndCropOverride(uint8_t rotateAndCrop,
+            bool fromHal = false) override;
+
+    virtual status_t      setAutoframingOverride(uint8_t autoframingValue) override;
 
     virtual bool          supportsCameraMute();
     virtual status_t      setCameraMute(bool enabled);
+
+    virtual bool          supportsZoomOverride() override;
+    virtual status_t      setZoomOverride(int32_t zoomOverride) override;
 
     virtual status_t      dump(int fd, const Vector<String16>& args);
 
     virtual status_t      dumpClient(int fd, const Vector<String16>& args);
 
-    virtual status_t      startWatchingTags(const String8 &tags, int out);
+    virtual status_t      startWatchingTags(const std::string &tags, int out);
     virtual status_t      stopWatchingTags(int out);
     virtual status_t      dumpWatchedEventsToVector(std::vector<std::string> &out);
+
+    virtual status_t      setCameraServiceWatchdog(bool enabled);
+
+    virtual void          setStreamUseCaseOverrides(const std::vector<int64_t>& useCaseOverrides);
+    virtual void          clearStreamUseCaseOverrides() override;
 
     /**
      * Device listener interface
      */
 
     virtual void notifyIdle(int64_t requestCount, int64_t resultErrorCount, bool deviceError,
+                            std::pair<int32_t, int32_t> mostRequestedFpsRange,
                             const std::vector<hardware::CameraStreamStats>& streamStats);
     virtual void notifyError(int32_t errorCode,
                              const CaptureResultExtras& resultExtras);
@@ -218,6 +240,7 @@ public:
     virtual void notifyPrepared(int streamId);
     virtual void notifyRequestQueueEmpty();
     virtual void notifyRepeatingRequestError(long lastFrameNumber);
+    virtual void notifyClientSharedAccessPriorityChanged(bool primaryClient);
 
     void setImageDumpMask(int mask) { if (mDevice != nullptr) mDevice->setImageDumpMask(mask); }
     /**
@@ -225,20 +248,26 @@ public:
      */
 protected:
     /** FilteredListener implementation **/
+
+    size_t writeResultMetadataIntoResultQueue(const CameraMetadata &result);
+    std::vector<PhysicalCaptureResultInfo> convertToFMQ(
+            const std::vector<PhysicalCaptureResultInfo> &physicalResults);
     virtual void          onResultAvailable(const CaptureResult& result);
     virtual void          detachDevice();
 
-    // Calculate the ANativeWindow transform from android.sensor.orientation
-    status_t              getRotationTransformLocked(int mirrorMode, /*out*/int32_t* transform);
-
-    bool isUltraHighResolutionSensor(const String8 &cameraId);
+    bool supportsUltraHighResolutionCapture(const std::string &cameraId);
 
     bool isSensorPixelModeConsistent(const std::list<int> &streamIdList,
             const CameraMetadata &settings);
 
-    const CameraMetadata &getStaticInfo(const String8 &cameraId);
+    const CameraMetadata &getStaticInfo(const std::string &cameraId);
 
 private:
+    using MetadataQueue = AidlMessageQueueCpp<
+            int8_t, android::hardware::common::fmq::SynchronizedReadWrite>;
+    using CameraMetadataInfo = android::hardware::camera2::CameraMetadataInfo;
+    status_t CreateMetadataQueue(
+            std::unique_ptr<MetadataQueue>* metadata_queue, uint32_t default_size);
     // StreamSurfaceId encapsulates streamId + surfaceId for a particular surface.
     // streamId specifies the index of the stream the surface belongs to, and the
     // surfaceId specifies the index of the surface within the stream. (one stream
@@ -275,7 +304,7 @@ private:
     std::vector<int32_t> mSupportedPhysicalRequestKeys;
 
     template<typename TProviderPtr>
-    status_t      initializeImpl(TProviderPtr providerPtr, const String8& monitorTags);
+    status_t      initializeImpl(TProviderPtr providerPtr, const std::string& monitorTags);
 
     /** Utility members */
     binder::Status checkPidStatus(const char* checkLocation);
@@ -287,21 +316,21 @@ private:
             bool isShared,
             int* newStreamId = NULL);
 
-    // Set the stream transform flags to automatically rotate the camera stream for preview use
-    // cases.
-    binder::Status setStreamTransformLocked(int streamId, int mirrorMode);
-
     // Utility method to insert the surface into SurfaceMap
-    binder::Status insertGbpLocked(const sp<IGraphicBufferProducer>& gbp,
+    binder::Status insertSurfaceLocked(const ParcelableSurfaceType& surface,
             /*out*/SurfaceMap* surfaceMap, /*out*/Vector<int32_t>* streamIds,
             /*out*/int32_t*  currentStreamId);
 
-    // Utility method that maps AIDL request templates.
-    binder::Status mapRequestTemplate(int templateId,
-            camera_request_template_t* tempId /*out*/);
+    // A ParcelableSurfaceType can be either a view::Surface or IGBP.
+    // We use this type of surface when we need to be able to have a parcelable data type.
+    // view::Surface has helper functions to make converting between a regular Surface and a
+    // view::Surface easy.
+    status_t getSurfaceKey(ParcelableSurfaceType surface, SurfaceKey* out) const;
+    // Surface only
+    status_t getSurfaceKey(sp<Surface> surface, SurfaceKey* out) const;
 
     // IGraphicsBufferProducer binder -> Stream ID + Surface ID for output streams
-    KeyedVector<sp<IBinder>, StreamSurfaceId> mStreamMap;
+    KeyedVector<SurfaceKey, StreamSurfaceId> mStreamMap;
 
     // Stream ID -> OutputConfiguration. Used for looking up Surface by stream/surface index
     KeyedVector<int32_t, hardware::camera2::params::OutputConfiguration> mConfiguredOutputs;
@@ -325,6 +354,9 @@ private:
 
     int32_t mRequestIdCounter;
 
+    // Metadata queue to write the result metadata to.
+    std::unique_ptr<MetadataQueue> mResultMetadataQueue;
+
     std::vector<std::string> mPhysicalCameraIds;
 
     // The list of output streams whose surfaces are deferred. We have to track them separately
@@ -343,17 +375,29 @@ private:
 
     // Synchronize access to 'mCompositeStreamMap'
     Mutex mCompositeLock;
-    KeyedVector<sp<IBinder>, sp<CompositeStream>> mCompositeStreamMap;
+    KeyedVector<SurfaceKey, sp<CompositeStream>> mCompositeStreamMap;
 
     sp<CameraProviderManager> mProviderManager;
 
     // Override the camera characteristics for performance class primary cameras.
     bool mOverrideForPerfClass;
 
-    // The string representation of object passed into CaptureRequest.setTag.
-    std::string mUserTag;
-    // The last set video stabilization mode
-    int mVideoStabilizationMode = -1;
+    // Various fields used to collect session statistics
+    struct RunningSessionStats {
+        // The string representation of object passed into CaptureRequest.setTag.
+        std::string mUserTag;
+        // The last set video stabilization mode
+        int mVideoStabilizationMode = -1;
+        // Whether a zoom_ratio < 1.0 has been used during this session
+        bool mUsedUltraWide = false;
+        // Whether a zoom settings override has been used during this session
+        bool mUsedSettingsOverrideZoom = false;
+    } mRunningSessionStats;
+
+    // This only exists in case of camera ID Remapping.
+    const std::string mOriginalCameraId;
+
+    bool mIsVendorClient = false;
 };
 
 }; // namespace android

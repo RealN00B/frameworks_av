@@ -17,6 +17,7 @@
 #include "common/HalConversionsTemplated.h"
 #include "common/CameraProviderInfoTemplated.h"
 
+#include <com_android_internal_camera_flags.h>
 #include <cutils/properties.h>
 
 #include <android/hardware/ICameraService.h>
@@ -25,6 +26,7 @@
 #include "device3/ZoomRatioMapper.h"
 #include <utils/SessionConfigurationUtilsHidl.h>
 #include <utils/Trace.h>
+#include <utils/Utils.h>
 
 #include <android/hardware/camera/device/3.7/ICameraDevice.h>
 
@@ -44,6 +46,7 @@ using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 
 using StatusListener = CameraProviderManager::StatusListener;
 using HalDeviceStatusType = android::hardware::camera::common::V1_0::CameraDeviceStatus;
+namespace flags = com::android::internal::camera::flags;
 
 using hardware::camera::provider::V2_5::DeviceState;
 using hardware::ICameraService;
@@ -67,7 +70,7 @@ status_t HidlProviderInfo::mapToStatusT(const Status& s)  {
         case Status::INTERNAL_ERROR:
             return INVALID_OPERATION;
     }
-    ALOGW("Unexpected HAL status code %d", s);
+    ALOGW("Unexpected HAL status code %d", eToI(s));
     return INVALID_OPERATION;
 }
 
@@ -109,7 +112,7 @@ const char* statusToString(const Status& s) {
         case Status::INTERNAL_ERROR:
             return "INTERNAL_ERROR";
     }
-    ALOGW("Unexpected HAL status code %d", s);
+    ALOGW("Unexpected HAL status code %d", eToI(s));
     return "UNKNOWN_ERROR";
 }
 
@@ -388,7 +391,7 @@ HidlProviderInfo::startProviderInterface() {
                   __FUNCTION__,
                   mProviderName.c_str(),
                   linked.description().c_str());
-              mManager->removeProvider(mProviderName);
+              mManager->removeProvider(std::string(mProviderInstance));
               return nullptr;
             } else if (!linked) {
               ALOGW("%s: Unable to link to provider '%s' death notifications",
@@ -442,14 +445,13 @@ hardware::Return<void> HidlProviderInfo::torchModeStatusChange(
 }
 
 void HidlProviderInfo::serviceDied(uint64_t cookie,
-        const wp<hidl::base::V1_0::IBase>& who) {
-    (void) who;
+        [[maybe_unused]] const wp<hidl::base::V1_0::IBase>& who) {
     ALOGI("Camera provider '%s' has died; removing it", mProviderInstance.c_str());
     if (cookie != mId) {
         ALOGW("%s: Unexpected serviceDied cookie %" PRIu64 ", expected %" PRIu32,
                 __FUNCTION__, cookie, mId);
     }
-    mManager->removeProvider(mProviderInstance);
+    mManager->removeProvider(std::string(mProviderInstance));
 }
 
 std::unique_ptr<CameraProviderManager::ProviderInfo::DeviceInfo>
@@ -534,7 +536,7 @@ status_t HidlProviderInfo::getConcurrentCameraIdsInternalLocked(
                 for (auto& combination : cameraDeviceIdCombinations) {
                     std::unordered_set<std::string> deviceIds;
                     for (auto &cameraDeviceId : combination) {
-                        deviceIds.insert(cameraDeviceId.c_str());
+                        deviceIds.insert(cameraDeviceId);
                     }
                     mConcurrentCameraIdCombinations.push_back(std::move(deviceIds));
                 }
@@ -590,7 +592,7 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
     }
     if (status != Status::OK) {
         ALOGE("%s: Unable to get camera characteristics for device %s: %s (%d)",
-                __FUNCTION__, id.c_str(), statusToString(status), status);
+                __FUNCTION__, id.c_str(), statusToString(status), eToI(status));
         return;
     }
 
@@ -614,6 +616,14 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
                 __FUNCTION__, strerror(-res), res);
         return;
     }
+
+    res = fixupManualFlashStrengthControlTags(mCameraCharacteristics);
+    if (OK != res) {
+        ALOGE("%s: Unable to fix up manual flash strength control tags: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        return;
+    }
+
     auto stat = addDynamicDepthTags();
     if (OK != stat) {
         ALOGE("%s: Failed appending dynamic depth tags: %s (%d)", __FUNCTION__, strerror(-stat),
@@ -625,7 +635,7 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
                 __FUNCTION__, strerror(-res), res);
     }
 
-    if (SessionConfigurationUtils::isUltraHighResolutionSensor(mCameraCharacteristics)) {
+    if (SessionConfigurationUtils::supportsUltraHighResolutionCapture(mCameraCharacteristics)) {
         status_t status = addDynamicDepthTags(/*maxResolution*/true);
         if (OK != status) {
             ALOGE("%s: Failed appending dynamic depth tags for maximum resolution mode: %s (%d)",
@@ -644,6 +654,11 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
         ALOGE("%s: Unable to add default SCALER_ROTATE_AND_CROP tags: %s (%d)", __FUNCTION__,
                 strerror(-res), res);
     }
+    res = addAutoframingTags();
+    if (OK != res) {
+        ALOGE("%s: Unable to add default AUTOFRAMING tags: %s (%d)", __FUNCTION__,
+                strerror(-res), res);
+    }
     res = addPreCorrectionActiveArraySize();
     if (OK != res) {
         ALOGE("%s: Unable to add PRE_CORRECTION_ACTIVE_ARRAY_SIZE: %s (%d)", __FUNCTION__,
@@ -654,6 +669,26 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
     if (OK != res) {
         ALOGE("%s: Unable to override zoomRatio related tags: %s (%d)",
                 __FUNCTION__, strerror(-res), res);
+    }
+    res = addReadoutTimestampTag(/*readoutTimestampSupported*/false);
+    if (OK != res) {
+        ALOGE("%s: Unable to add sensorReadoutTimestamp tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+    }
+    if (flags::color_temperature()) {
+        res = addColorCorrectionAvailableModesTag(mCameraCharacteristics);
+        if (OK != res) {
+            ALOGE("%s: Unable to add COLOR_CORRECTION_AVAILABLE_MODES tag: %s (%d)",
+                    __FUNCTION__, strerror(-res), res);
+        }
+    }
+
+    if (flags::ae_priority()) {
+        res = addAePriorityModeTags();
+        if (OK != res) {
+            ALOGE("%s: Unable to add CONTROL_AE_AVAILABLE_PRIORITY_MODES tag: %s (%d)",
+                    __FUNCTION__, strerror(-res), res);
+        }
     }
 
     camera_metadata_entry flashAvailable =
@@ -672,6 +707,12 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
         mHasFlashUnit = false;
     }
 
+    res = addSessionConfigQueryVersionTag();
+    if (OK != res) {
+        ALOGE("%s: Unable to add sessionConfigurationQueryVersion tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+    }
+
     camera_metadata_entry entry =
             mCameraCharacteristics.find(ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL);
     if (entry.count == 1) {
@@ -687,6 +728,11 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
     }
 
     mTorchStrengthLevel = 0;
+
+    if (!kEnableLazyHal) {
+        // Save HAL reference indefinitely
+        mSavedInterface = interface;
+    }
 
     queryPhysicalCameraIds();
 
@@ -729,14 +775,15 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
             });
 
             if (!ret.isOk()) {
-                ALOGE("%s: Transaction error getting physical camera %s characteristics for %s: %s",
-                        __FUNCTION__, id.c_str(), id.c_str(), ret.description().c_str());
+                ALOGE("%s: Transaction error getting physical camera %s characteristics for"
+                        " logical id %s: %s", __FUNCTION__, id.c_str(), mId.c_str(),
+                        ret.description().c_str());
                 return;
             }
             if (status != Status::OK) {
                 ALOGE("%s: Unable to get physical camera %s characteristics for device %s: %s (%d)",
                         __FUNCTION__, id.c_str(), mId.c_str(),
-                        statusToString(status), status);
+                        statusToString(status), eToI(status));
                 return;
             }
 
@@ -746,15 +793,23 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
                 ALOGE("%s: Unable to override zoomRatio related tags: %s (%d)",
                         __FUNCTION__, strerror(-res), res);
             }
+
+            res = fixupManualFlashStrengthControlTags(mPhysicalCameraCharacteristics[id]);
+            if (OK != res) {
+                ALOGE("%s: Unable to fix up manual flash strength control tags: %s (%d)",
+                        __FUNCTION__, strerror(-res), res);
+                return;
+            }
+
+            if (flags::color_temperature()) {
+                res = addColorCorrectionAvailableModesTag(mPhysicalCameraCharacteristics[id]);
+                if (OK != res) {
+                    ALOGE("%s: Unable to add COLOR_CORRECTION_AVAILABLE_MODES tag: %s (%d)",
+                            __FUNCTION__, strerror(-res), res);
+                }
+            }
         }
     }
-
-    if (!kEnableLazyHal) {
-        // Save HAL reference indefinitely
-        mSavedInterface = interface;
-    }
-
-
 }
 
 status_t HidlProviderInfo::HidlDeviceInfo3::setTorchMode(bool enabled) {
@@ -825,13 +880,19 @@ status_t HidlProviderInfo::HidlDeviceInfo3::dumpState(int fd) {
 
 status_t HidlProviderInfo::HidlDeviceInfo3::isSessionConfigurationSupported(
         const SessionConfiguration &configuration, bool overrideForPerfClass,
-        metadataGetter getMetadata, bool *status) {
+        camera3::metadataGetter getMetadata, bool checkSessionParams, bool *status) {
+
+    if (checkSessionParams) {
+        // HIDL device doesn't support checking session parameters
+        return INVALID_OPERATION;
+    }
 
     hardware::camera::device::V3_7::StreamConfiguration configuration_3_7;
     bool earlyExit = false;
     auto bRes = SessionConfigurationUtils::convertToHALStreamCombination(configuration,
-            String8(mId.c_str()), mCameraCharacteristics, getMetadata, mPhysicalIds,
-            configuration_3_7, overrideForPerfClass, &earlyExit);
+            mId, mCameraCharacteristics, getMetadata, mPhysicalIds,
+            configuration_3_7, overrideForPerfClass, mProviderTagid,
+            &earlyExit);
 
     if (!bRes.isOk()) {
         return UNKNOWN_ERROR;
@@ -886,7 +947,7 @@ status_t HidlProviderInfo::HidlDeviceInfo3::isSessionConfigurationSupported(
                 res = INVALID_OPERATION;
                 break;
             default:
-                ALOGE("%s: Session configuration query failed: %d", __FUNCTION__, callStatus);
+                ALOGE("%s: Session configuration query failed: %d", __FUNCTION__, eToI(callStatus));
                 res = UNKNOWN_ERROR;
         }
     } else {
@@ -914,15 +975,16 @@ status_t HidlProviderInfo::convertToHALStreamCombinationAndCameraIdsLocked(
         bool overrideForPerfClass =
                 SessionConfigurationUtils::targetPerfClassPrimaryCamera(
                         perfClassPrimaryCameraIds, cameraId, targetSdkVersion);
-        res = mManager->getCameraCharacteristicsLocked(cameraId, overrideForPerfClass, &deviceInfo);
+        res = mManager->getCameraCharacteristicsLocked(cameraId, overrideForPerfClass, &deviceInfo,
+                 hardware::ICameraService::ROTATION_OVERRIDE_NONE);
         if (res != OK) {
             return res;
         }
         camera3::metadataGetter getMetadata =
-                [this](const String8 &id, bool overrideForPerfClass) {
+                [this](const std::string &id, bool overrideForPerfClass) {
                     CameraMetadata physicalDeviceInfo;
-                    mManager->getCameraCharacteristicsLocked(id.string(), overrideForPerfClass,
-                                                   &physicalDeviceInfo);
+                    mManager->getCameraCharacteristicsLocked(id, overrideForPerfClass,
+                            &physicalDeviceInfo, hardware::ICameraService::ROTATION_OVERRIDE_NONE);
                     return physicalDeviceInfo;
                 };
         std::vector<std::string> physicalCameraIds;
@@ -930,9 +992,9 @@ status_t HidlProviderInfo::convertToHALStreamCombinationAndCameraIdsLocked(
         bStatus =
             SessionConfigurationUtils::convertToHALStreamCombination(
                     cameraIdAndSessionConfig.mSessionConfiguration,
-                    String8(cameraId.c_str()), deviceInfo, getMetadata,
+                    cameraId, deviceInfo, getMetadata,
                     physicalCameraIds, streamConfiguration,
-                    overrideForPerfClass, &shouldExit);
+                    overrideForPerfClass, mProviderTagid, &shouldExit);
         if (!bStatus.isOk()) {
             ALOGE("%s: convertToHALStreamCombination failed", __FUNCTION__);
             return INVALID_OPERATION;
@@ -1033,7 +1095,7 @@ status_t HidlProviderInfo::isConcurrentSessionConfigurationSupported(
                         break;
                     default:
                         ALOGE("%s: Session configuration query failed: %d", __FUNCTION__,
-                                  callStatus);
+                                eToI(callStatus));
                         res = UNKNOWN_ERROR;
                 }
             } else {

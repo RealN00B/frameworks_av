@@ -17,8 +17,13 @@
 #define LOG_TAG "CameraServiceWatchdog"
 
 #include "CameraServiceWatchdog.h"
+#include "com_android_internal_camera_flags.h"
+#include "android/set_abort_message.h"
+#include "utils/CameraServiceProxyWrapper.h"
 
 namespace android {
+
+namespace flags = com::android::internal::camera::flags;
 
 bool CameraServiceWatchdog::threadLoop()
 {
@@ -35,15 +40,26 @@ bool CameraServiceWatchdog::threadLoop()
     {
         AutoMutex _l(mWatchdogLock);
 
-        for (auto it = tidToCycleCounterMap.begin(); it != tidToCycleCounterMap.end(); it++) {
+        for (auto it = mTidMap.begin(); it != mTidMap.end(); it++) {
             uint32_t currentThreadId = it->first;
 
-            tidToCycleCounterMap[currentThreadId]++;
+            mTidMap[currentThreadId].cycles++;
 
-            if (tidToCycleCounterMap[currentThreadId] >= mMaxCycles) {
-                ALOGW("CameraServiceWatchdog triggering abort for pid: %d", getpid());
+            if (mTidMap[currentThreadId].cycles >= mMaxCycles) {
+                std::string abortMessage = getAbortMessage(mTidMap[currentThreadId].functionName);
+                android_set_abort_message(abortMessage.c_str());
+                ALOGW("CameraServiceWatchdog triggering abort for pid: %d tid: %d", getpid(),
+                        currentThreadId);
+                mCameraServiceProxyWrapper->logClose(mCameraId, 0 /*latencyMs*/,
+                        true /*deviceError*/);
                 // We use abort here so we can get a tombstone for better
                 // debugging.
+                if (flags::enable_hal_abort_from_cameraservicewatchdog()) {
+                    for (pid_t pid : mProviderPids) {
+                        kill(pid, SIGABRT);
+                    }
+                }
+
                 abort();
             }
         }
@@ -52,13 +68,19 @@ bool CameraServiceWatchdog::threadLoop()
     return true;
 }
 
+std::string CameraServiceWatchdog::getAbortMessage(const std::string& functionName) {
+    std::string res = "CameraServiceWatchdog triggering abort during "
+            + functionName;
+    return res;
+}
+
 void CameraServiceWatchdog::requestExit()
 {
     Thread::requestExit();
 
     AutoMutex _l(mWatchdogLock);
 
-    tidToCycleCounterMap.clear();
+    mTidMap.clear();
 
     if (mPause) {
         mPause = false;
@@ -66,22 +88,36 @@ void CameraServiceWatchdog::requestExit()
     }
 }
 
+void CameraServiceWatchdog::setEnabled(bool enable)
+{
+    AutoMutex _l(mEnabledLock);
+
+    if (enable) {
+        mEnabled = true;
+    } else {
+        mEnabled = false;
+    }
+}
+
 void CameraServiceWatchdog::stop(uint32_t tid)
 {
     AutoMutex _l(mWatchdogLock);
 
-    tidToCycleCounterMap.erase(tid);
+    mTidMap.erase(tid);
 
-    if (tidToCycleCounterMap.empty()) {
+    if (mTidMap.empty()) {
         mPause = true;
     }
 }
 
-void CameraServiceWatchdog::start(uint32_t tid)
+void CameraServiceWatchdog::start(uint32_t tid, const char* functionName)
 {
     AutoMutex _l(mWatchdogLock);
 
-    tidToCycleCounterMap[tid] = 0;
+    MonitoredFunction monitoredFunction = {};
+    monitoredFunction.cycles = 0;
+    monitoredFunction.functionName = functionName;
+    mTidMap[tid] = monitoredFunction;
 
     if (mPause) {
         mPause = false;

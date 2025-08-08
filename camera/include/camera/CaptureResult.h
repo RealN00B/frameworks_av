@@ -20,7 +20,7 @@
 #include <utils/RefBase.h>
 #include <binder/Parcelable.h>
 #include <camera/CameraMetadata.h>
-
+#include <android/hardware/camera2/CameraMetadataInfo.h>
 
 namespace android {
 
@@ -74,7 +74,7 @@ struct CaptureResultExtras : public android::Parcelable {
      * a reference to physical camera device.
      * Empty otherwise.
      */
-    String16  errorPhysicalCameraId;
+    std::string errorPhysicalCameraId;
 
     // The last completed frame numbers shouldn't be checked in onResultReceived() and notifyError()
     // because the output buffers could be arriving after onResultReceived() and
@@ -103,6 +103,17 @@ struct CaptureResultExtras : public android::Parcelable {
      */
     int64_t lastCompletedZslFrameNumber;
 
+    /**
+     * Whether the readoutTimestamp variable is valid and should be used.
+     */
+    bool hasReadoutTimestamp;
+
+    /**
+     * The readout timestamp of the capture. Its value is equal to the
+     * start-of-exposure timestamp plus the exposure time (and a possible fixed
+     * offset due to sensor crop).
+     */
+    int64_t readoutTimestamp;
 
     /**
      * Constructor initializes object as invalid by setting requestId to be -1.
@@ -118,7 +129,9 @@ struct CaptureResultExtras : public android::Parcelable {
           errorPhysicalCameraId(),
           lastCompletedRegularFrameNumber(-1),
           lastCompletedReprocessFrameNumber(-1),
-          lastCompletedZslFrameNumber(-1) {
+          lastCompletedZslFrameNumber(-1),
+          hasReadoutTimestamp(false),
+          readoutTimestamp(0) {
     }
 
     /**
@@ -132,19 +145,26 @@ struct CaptureResultExtras : public android::Parcelable {
 };
 
 struct PhysicalCaptureResultInfo : public android::Parcelable {
-
+    using CameraMetadataInfo = android::hardware::camera2::CameraMetadataInfo;
     PhysicalCaptureResultInfo()
         : mPhysicalCameraId(),
-          mPhysicalCameraMetadata() {
+          mCameraMetadataInfo() {
     }
-    PhysicalCaptureResultInfo(const String16& cameraId,
+    PhysicalCaptureResultInfo(const std::string& cameraId,
             const CameraMetadata& cameraMetadata)
-            : mPhysicalCameraId(cameraId),
-              mPhysicalCameraMetadata(cameraMetadata) {
+            : mPhysicalCameraId(cameraId) {
+              mCameraMetadataInfo.set<CameraMetadataInfo::metadata>(cameraMetadata);
     }
 
-    String16  mPhysicalCameraId;
-    CameraMetadata mPhysicalCameraMetadata;
+   PhysicalCaptureResultInfo(const std::string& cameraId,
+            uint64_t fmqSize)
+            : mPhysicalCameraId(cameraId) {
+              mCameraMetadataInfo.set<CameraMetadataInfo::fmqSize>(fmqSize);
+    }
+
+    std::string mPhysicalCameraId;
+
+    CameraMetadataInfo mCameraMetadataInfo;
 
     virtual status_t                readFromParcel(const android::Parcel* parcel) override;
     virtual status_t                writeToParcel(android::Parcel* parcel) const override;

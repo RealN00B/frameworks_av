@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <fstream>
+#include <memory>
 
 #include <media/esds/ESDS.h>
 #include <binder/ProcessState.h>
@@ -51,7 +52,7 @@ class ESDSUnitTest : public ::testing::TestWithParam<tuple<
                              /* BitrateMax */ int32_t,
                              /* BitrateAvg */ int32_t>> {
   public:
-    ESDSUnitTest() : mESDSData(nullptr) {
+    ESDSUnitTest() {
         mESDSParams.inputFile = get<0>(GetParam());
         mESDSParams.objectTypeIndication = get<1>(GetParam());
         mESDSParams.codecSpecificInfoData = get<2>(GetParam());
@@ -59,6 +60,13 @@ class ESDSUnitTest : public ::testing::TestWithParam<tuple<
         mESDSParams.bitrateMax = get<4>(GetParam());
         mESDSParams.bitrateAvg = get<5>(GetParam());
     };
+
+    ~ESDSUnitTest() {
+        if (mESDSData != nullptr) {
+            free(mESDSData);
+            mESDSData = nullptr;
+        }
+    }
 
     virtual void TearDown() override {
         if (mDataSource) mDataSource.clear();
@@ -69,8 +77,8 @@ class ESDSUnitTest : public ::testing::TestWithParam<tuple<
     }
 
     virtual void SetUp() override { ASSERT_NO_FATAL_FAILURE(readESDSData()); }
-    const void *mESDSData;
-    size_t mESDSSize;
+    void *mESDSData = nullptr;
+    size_t mESDSSize = 0;
     ESDSParams mESDSParams;
 
   private:
@@ -104,10 +112,19 @@ class ESDSUnitTest : public ::testing::TestWithParam<tuple<
     bool esdsDataPresent(size_t numTracks, sp<IMediaExtractor> extractor) {
         bool foundESDS = false;
         uint32_t type;
+        if (mESDSData != nullptr) {
+            free(mESDSData);
+            mESDSData = nullptr;
+        }
         for (size_t i = 0; i < numTracks; ++i) {
             sp<MetaData> trackMeta = extractor->getTrackMetaData(i);
+            const void *esdsData = nullptr;
+            size_t esdsSize = 0;
             if (trackMeta != nullptr &&
-                trackMeta->findData(kKeyESDS, &type, &mESDSData, &mESDSSize)) {
+                trackMeta->findData(kKeyESDS, &type, &esdsData, &esdsSize)) {
+                mESDSData = malloc(esdsSize);
+                mESDSSize = esdsSize;
+                memcpy(mESDSData, esdsData, esdsSize);
                 trackMeta->clear();
                 foundESDS = true;
                 break;
@@ -121,18 +138,16 @@ class ESDSUnitTest : public ::testing::TestWithParam<tuple<
 };
 
 TEST_P(ESDSUnitTest, InvalidDataTest) {
-    void *invalidData = calloc(mESDSSize, 1);
+    std::unique_ptr<char[]> invalidData(new char[mESDSSize]());
     ASSERT_NE(invalidData, nullptr) << "Unable to allocate memory";
-    ESDS esds(invalidData, mESDSSize);
-    free(invalidData);
+    ESDS esds((void*)invalidData.get(), mESDSSize);
     ASSERT_NE(esds.InitCheck(), OK) << "invalid ESDS data accepted";
 }
 
 TEST(ESDSSanityUnitTest, ConstructorSanityTest) {
-    void *invalidData = malloc(1);
+    std::unique_ptr<char[]> invalidData(new char[1]());
     ASSERT_NE(invalidData, nullptr) << "Unable to allocate memory";
-    ESDS esds_zero(invalidData, 0);
-    free(invalidData);
+    ESDS esds_zero((void*)invalidData.get(), 0);
     ASSERT_NE(esds_zero.InitCheck(), OK) << "invalid ESDS data accepted";
 
     ESDS esds_null(NULL, 0);

@@ -26,6 +26,9 @@
 
 namespace android {
 
+// Device id of a context associated with the default device.
+constexpr int32_t kDefaultDeviceId = 0;
+
 /**
  * CameraUtils contains utility methods that are shared between the native
  * camera client, and the camera service.
@@ -43,7 +46,7 @@ class CameraUtils {
          * Returns OK on success, or a negative error code.
          */
         static status_t getRotationTransform(const CameraMetadata& staticInfo,
-                int mirrorMode, /*out*/int32_t* transform);
+                int mirrorMode, bool enableTransformInverseDisplay, /*out*/int32_t* transform);
 
         /**
          * Check if the image data is VideoNativeHandleMetadata, that contains a native handle.

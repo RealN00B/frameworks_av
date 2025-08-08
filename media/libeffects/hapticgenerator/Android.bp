@@ -22,6 +22,32 @@ package {
     default_applicable_licenses: ["frameworks_av_license"],
 }
 
+cc_defaults {
+    name: "hapticgeneratordefaults",
+    srcs: [
+        "Processors.cpp",
+    ],
+    shared_libs: [
+        "libaudioutils",
+        "libbase",
+        "liblog",
+        "libutils",
+        "libvibratorutils",
+    ],
+    header_libs: [
+        "libaudioeffects",
+    ],
+    cflags: [
+        // This is needed for the non-zero coefficients optimization for
+        // BiquadFilter. Try the biquad_filter_benchmark test in audio_utils
+        // with/without `-ffast-math` for more context.
+        "-ffast-math",
+        "-fhonor-infinities",
+        "-fhonor-nans",
+    ],
+    relative_install_path: "soundfx",
+}
+
 cc_library_shared {
     name: "libhapticgenerator",
 
@@ -29,32 +55,41 @@ cc_library_shared {
 
     srcs: [
         "EffectHapticGenerator.cpp",
-        "Processors.cpp",
+    ],
+
+    defaults: [
+        "hapticgeneratordefaults",
     ],
 
     cflags: [
-        "-O2", // Turning on the optimization in order to reduce effect processing time.
-               // The latency is around 1/5 less than without the optimization.
+        // Turning on the optimization in order to reduce effect processing time.
+        // The latency is around 1/5 less than without the optimization.
+        "-O2",
         "-Wall",
         "-Werror",
-        "-ffast-math", // This is needed for the non-zero coefficients optimization for
-                       // BiquadFilter. Try the biquad_filter_benchmark test in audio_utils
-                       // with/without `-ffast-math` for more context.
         "-fvisibility=hidden",
     ],
+}
 
-    shared_libs: [
-        "libaudioutils",
-        "libbase",
-        "libbinder",
-        "liblog",
-        "libutils",
-        "libvibrator",
+cc_library_shared {
+    name: "libhapticgeneratoraidl",
+
+    srcs: [
+        ":effectCommonFile",
+        "aidl/EffectHapticGenerator.cpp",
+        "aidl/HapticGeneratorContext.cpp",
     ],
 
-    relative_install_path: "soundfx",
+    defaults: [
+        "aidlaudioeffectservice_defaults",
+        "hapticgeneratordefaults",
+    ],
 
-    header_libs: [
-        "libaudioeffects",
+    cflags: [
+        "-Wthread-safety",
+    ],
+
+    visibility: [
+        "//hardware/interfaces/audio/aidl/default:__subpackages__",
     ],
 }

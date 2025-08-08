@@ -25,8 +25,9 @@
 #include <sstream>
 #include <string>
 #include <audio_utils/clock.h>
+#include <audio_utils/StringUtils.h>
 #include <cutils/properties.h>
-#include <statslog.h>
+#include <stats_media_metrics.h>
 #include <sys/timerfd.h>
 #include <system/audio.h>
 
@@ -93,18 +94,27 @@ bool AudioPowerUsage::typeFromString(const std::string& type_string, int32_t& ty
 /* static */
 bool AudioPowerUsage::deviceFromString(const std::string& device_string, int32_t& device) {
     static std::map<std::string, int32_t> deviceTable = {
-        { "AUDIO_DEVICE_OUT_EARPIECE",             OUTPUT_EARPIECE },
-        { "AUDIO_DEVICE_OUT_SPEAKER_SAFE",         OUTPUT_SPEAKER_SAFE },
-        { "AUDIO_DEVICE_OUT_SPEAKER",              OUTPUT_SPEAKER },
-        { "AUDIO_DEVICE_OUT_WIRED_HEADSET",        OUTPUT_WIRED_HEADSET },
-        { "AUDIO_DEVICE_OUT_WIRED_HEADPHONE",      OUTPUT_WIRED_HEADSET },
-        { "AUDIO_DEVICE_OUT_BLUETOOTH_SCO",        OUTPUT_BLUETOOTH_SCO },
-        { "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP",       OUTPUT_BLUETOOTH_A2DP },
-        { "AUDIO_DEVICE_OUT_USB_HEADSET",          OUTPUT_USB_HEADSET },
-        { "AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET", OUTPUT_BLUETOOTH_SCO },
+        { "AUDIO_DEVICE_OUT_EARPIECE",                  OUTPUT_EARPIECE },
+        { "AUDIO_DEVICE_OUT_SPEAKER_SAFE",              OUTPUT_SPEAKER_SAFE },
+        { "AUDIO_DEVICE_OUT_SPEAKER",                   OUTPUT_SPEAKER },
+        { "AUDIO_DEVICE_OUT_WIRED_HEADSET",             OUTPUT_WIRED_HEADSET },
+        { "AUDIO_DEVICE_OUT_WIRED_HEADPHONE",           OUTPUT_WIRED_HEADSET },
+        { "AUDIO_DEVICE_OUT_BLUETOOTH_SCO",             OUTPUT_BLUETOOTH_SCO },
+        { "AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET",     OUTPUT_BLUETOOTH_SCO },
+        { "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP",            OUTPUT_BLUETOOTH_A2DP },
+        { "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES", OUTPUT_BLUETOOTH_A2DP },
+        { "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER",    OUTPUT_BLUETOOTH_A2DP },
+        { "AUDIO_DEVICE_OUT_BLE_HEADSET",               OUTPUT_BLUETOOTH_BLE },
+        { "AUDIO_DEVICE_OUT_BLE_SPEAKER",               OUTPUT_BLUETOOTH_BLE },
+        { "AUDIO_DEVICE_OUT_BLE_BROADCAST",             OUTPUT_BLUETOOTH_BLE },
+        { "AUDIO_DEVICE_OUT_USB_HEADSET",               OUTPUT_USB_HEADSET },
+        { "AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET",         OUTPUT_DOCK },
+        { "AUDIO_DEVICE_OUT_HDMI",                      OUTPUT_HDMI },
 
         { "AUDIO_DEVICE_IN_BUILTIN_MIC",           INPUT_BUILTIN_MIC },
         { "AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET", INPUT_BLUETOOTH_SCO },
+        { "AUDIO_DEVICE_IN_BLUETOOTH_BLE",         INPUT_BLUETOOTH_BLE },
+        { "AUDIO_DEVICE_IN_BLE_HEADSET",           INPUT_BLUETOOTH_BLE },
         { "AUDIO_DEVICE_IN_WIRED_HEADSET",         INPUT_WIRED_HEADSET_MIC },
         { "AUDIO_DEVICE_IN_USB_DEVICE",            INPUT_USB_HEADSET_MIC },
         { "AUDIO_DEVICE_IN_BACK_MIC",              INPUT_BUILTIN_BACK_MIC },
@@ -122,7 +132,7 @@ bool AudioPowerUsage::deviceFromString(const std::string& device_string, int32_t
 
 int32_t AudioPowerUsage::deviceFromStringPairs(const std::string& device_strings) {
     int32_t deviceMask = 0;
-    const auto devaddrvec = stringutils::getDeviceAddressPairs(device_strings);
+    const auto devaddrvec = audio_utils::stringutils::getDeviceAddressPairs(device_strings);
     for (const auto &[device, addr] : devaddrvec) {
         int32_t combo_device = 0;
         deviceFromString(device, combo_device);
@@ -164,7 +174,7 @@ void AudioPowerUsage::sendItem(const std::shared_ptr<const mediametrics::Item>& 
     const int32_t duration_secs = (int32_t)(duration_ns / NANOS_PER_SECOND);
     const int32_t min_volume_duration_secs = (int32_t)(min_volume_duration_ns / NANOS_PER_SECOND);
     const int32_t max_volume_duration_secs = (int32_t)(max_volume_duration_ns / NANOS_PER_SECOND);
-    const int result = android::util::stats_write(android::util::AUDIO_POWER_USAGE_DATA_REPORTED,
+    const int result = stats::media_metrics::stats_write(stats::media_metrics::AUDIO_POWER_USAGE_DATA_REPORTED,
                                          audio_device,
                                          duration_secs,
                                          (float)volume,
@@ -177,7 +187,7 @@ void AudioPowerUsage::sendItem(const std::shared_ptr<const mediametrics::Item>& 
     std::stringstream log;
     log << "result:" << result << " {"
             << " mediametrics_audio_power_usage_data_reported:"
-            << android::util::AUDIO_POWER_USAGE_DATA_REPORTED
+            << stats::media_metrics::AUDIO_POWER_USAGE_DATA_REPORTED
             << " audio_device:" << audio_device
             << " duration_secs:" << duration_secs
             << " average_volume:" << (float)volume
@@ -187,7 +197,7 @@ void AudioPowerUsage::sendItem(const std::shared_ptr<const mediametrics::Item>& 
             << " max_volume_duration_secs:" << max_volume_duration_secs
             << " max_volume:" << (float)max_volume
             << " }";
-    mStatsdLog->log(android::util::AUDIO_POWER_USAGE_DATA_REPORTED, log.str());
+    mStatsdLog->log(stats::media_metrics::AUDIO_POWER_USAGE_DATA_REPORTED, log.str());
 }
 
 void AudioPowerUsage::updateMinMaxVolumeAndDuration(
@@ -549,7 +559,7 @@ std::pair<std::string, int32_t> AudioPowerUsage::dump(int limit) const {
 
     int slot = 1;
     std::stringstream ss;
-    ss << "AudioPowerUsage:\n";
+    ss << "AudioPowerUsage interval " << mIntervalHours << " hours:\n";
     for (const auto &item : mItems) {
         if (slot >= limit - 1) {
             ss << "-- AudioPowerUsage may be truncated!\n";

@@ -19,8 +19,8 @@
 #include <string>
 #include <type_traits>
 
-#include <android/media/AudioPort.h>
-#include <android/media/AudioPortConfig.h>
+#include <android/media/AudioPortFw.h>
+#include <android/media/AudioPortConfigFw.h>
 #include <android/media/audio/common/ExtraAudioDescriptor.h>
 #include <binder/Parcel.h>
 #include <binder/Parcelable.h>
@@ -48,7 +48,10 @@ public:
     audio_port_role_t getRole() const { return mRole; }
 
     virtual void setFlags(uint32_t flags);
-    uint32_t getFlags() const { return useInputChannelMask() ? mFlags.input : mFlags.output; }
+    uint32_t getFlags() const {
+        return useInputChannelMask() ? static_cast<uint32_t>(mFlags.input)
+                                     : static_cast<uint32_t>(mFlags.output);
+    }
 
     void setGains(const AudioGains &gains) { mGains = gains; }
     const AudioGains &getGains() const { return mGains; }
@@ -118,8 +121,8 @@ public:
 
     bool equals(const sp<AudioPort>& other) const;
 
-    status_t writeToParcelable(media::AudioPort* parcelable) const;
-    status_t readFromParcelable(const media::AudioPort& parcelable);
+    status_t writeToParcelable(media::AudioPortFw* parcelable) const;
+    status_t readFromParcelable(const media::AudioPortFw& parcelable);
 
     AudioGains mGains; // gain controllers
     // Maximum number of input or output streams that can be simultaneously

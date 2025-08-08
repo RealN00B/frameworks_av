@@ -73,7 +73,7 @@ bool TunerHelper::checkTunerFeature() {
 
 // TODO: update Demux, Descrambler.
 void TunerHelper::updateTunerResources(const vector<TunerFrontendInfo>& feInfos,
-                                       const vector<int32_t>& lnbHandles) {
+                                       const vector<int64_t>& lnbHandles) {
     ::ndk::SpAIBinder binder(AServiceManager_waitForService("tv_tuner_resource_mgr"));
     shared_ptr<ITunerResourceManager> tunerRM = ITunerResourceManager::fromBinder(binder);
     if (tunerRM == nullptr) {
@@ -83,15 +83,40 @@ void TunerHelper::updateTunerResources(const vector<TunerFrontendInfo>& feInfos,
     tunerRM->setFrontendInfoList(feInfos);
     tunerRM->setLnbInfoList(lnbHandles);
 }
+void TunerHelper::updateTunerResources(const vector<TunerFrontendInfo>& feInfos,
+                                       const vector<TunerDemuxInfo>& demuxInfos,
+                                       const vector<int64_t>& lnbHandles) {
+    ::ndk::SpAIBinder binder(AServiceManager_waitForService("tv_tuner_resource_mgr"));
+    shared_ptr<ITunerResourceManager> tunerRM = ITunerResourceManager::fromBinder(binder);
+    if (tunerRM == nullptr) {
+        return;
+    }
 
-// TODO: create a map between resource id and handles.
-int TunerHelper::getResourceIdFromHandle(int resourceHandle, int /*type*/) {
-    return (resourceHandle & 0x00ff0000) >> 16;
+    updateTunerResources(feInfos, lnbHandles);
+
+    // for Tuner 2.0 and below, Demux resource is not really managed under TRM
+    if (demuxInfos.size() > 0) {
+        tunerRM->setDemuxInfoList(demuxInfos);
+    }
 }
 
-int TunerHelper::getResourceHandleFromId(int id, int resourceType) {
+// TODO: create a map between resource id and handles.
+int TunerHelper::getResourceIdFromHandle(long resourceHandle, int /*type*/) {
+    return (int)((resourceHandle >> RESOURCE_ID_SHIFT) & RESOURCE_ID_MASK);
+}
+
+/**
+ *   Generate resource handle for resourceType and id
+ *   Resource Handle Allotment : 64 bits (long)
+ *   8 bits - resourceType
+ *   32 bits - id
+ *   24 bits - resourceRequestCount
+ */
+long TunerHelper::getResourceHandleFromId(int id, int resourceType) {
     // TODO: build up randomly generated id to handle mapping
-    return (resourceType & 0x000000ff) << 24 | (id << 16) | (sResourceRequestCount++ & 0xffff);
+    return static_cast<int64_t>(resourceType & RESOURCE_TYPE_MASK) << RESOURCE_TYPE_SHIFT |
+           static_cast<int64_t>(id & RESOURCE_ID_MASK) << RESOURCE_ID_SHIFT |
+           (sResourceRequestCount++ & RESOURCE_COUNT_MASK);
 }
 
 }  // namespace tuner

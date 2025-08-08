@@ -253,7 +253,7 @@ static status_t GetAppPackageName(String8 *packageName) {
 }
 
 static sp<IDrm> CreateDrm() {
-    return DrmUtils::MakeDrm();
+    return DrmUtils::MakeDrm(IDRM_NDK);
 }
 
 
@@ -478,7 +478,7 @@ media_status_t AMediaDrm_getKeyRequestWithDefaultUrlAndType(AMediaDrm *mObj,
         *keyRequest = mObj->mKeyRequest.array();
         *keyRequestSize = mObj->mKeyRequest.size();
         if (defaultUrl != NULL)
-            *defaultUrl = mObj->mDefaultUrl.string();
+            *defaultUrl = mObj->mDefaultUrl.c_str();
         switch(requestType) {
             case DrmPlugin::kKeyRequestType_Initial:
                 mObj->mkeyRequestType = KEY_REQUEST_TYPE_INITIAL;
@@ -606,8 +606,8 @@ media_status_t AMediaDrm_queryKeyStatus(AMediaDrm *mObj, const AMediaDrmSessionI
     }
 
     for (size_t i = 0; i < mObj->mQueryResults.size(); i++) {
-        keyValuePairs[i].mKey = mObj->mQueryResults.keyAt(i).string();
-        keyValuePairs[i].mValue = mObj->mQueryResults.valueAt(i).string();
+        keyValuePairs[i].mKey = mObj->mQueryResults.keyAt(i).c_str();
+        keyValuePairs[i].mValue = mObj->mQueryResults.valueAt(i).c_str();
     }
     *numPairs = mObj->mQueryResults.size();
     return AMEDIA_OK;
@@ -630,7 +630,7 @@ media_status_t AMediaDrm_getProvisionRequest(AMediaDrm *mObj, const uint8_t **pr
     } else {
         *provisionRequest = mObj->mProvisionRequest.array();
         *provisionRequestSize = mObj->mProvisionRequest.size();
-        *serverUrl = mObj->mProvisionUrl.string();
+        *serverUrl = mObj->mProvisionUrl.c_str();
     }
     return AMEDIA_OK;
 }
@@ -714,7 +714,7 @@ media_status_t AMediaDrm_getPropertyString(AMediaDrm *mObj, const char *property
             mObj->mPropertyString);
 
     if (status == OK) {
-        *propertyValue = mObj->mPropertyString.string();
+        *propertyValue = mObj->mPropertyString.c_str();
     } else {
         *propertyValue = NULL;
     }
@@ -758,6 +758,9 @@ media_status_t AMediaDrm_setPropertyString(AMediaDrm *mObj,
 EXPORT
 media_status_t AMediaDrm_setPropertyByteArray(AMediaDrm *mObj,
         const char *propertyName, const uint8_t *value, size_t valueSize) {
+    if (!mObj || mObj->mDrm == NULL) {
+        return AMEDIA_ERROR_INVALID_OBJECT;
+    }
 
     Vector<uint8_t> byteArray;
     byteArray.appendArray(value, valueSize);

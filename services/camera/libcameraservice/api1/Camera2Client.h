@@ -17,16 +17,16 @@
 #ifndef ANDROID_SERVERS_CAMERA_CAMERA2CLIENT_H
 #define ANDROID_SERVERS_CAMERA_CAMERA2CLIENT_H
 
+#include <atomic>
+
+#include <gui/Flags.h>
+#include <gui/view/Surface.h>
+#include <media/RingBuffer.h>
 #include "CameraService.h"
-#include "common/CameraDeviceBase.h"
-#include "common/Camera2ClientBase.h"
-#include "api1/client2/Parameters.h"
 #include "api1/client2/FrameProcessor.h"
-//#include "api1/client2/StreamingProcessor.h"
-//#include "api1/client2/JpegProcessor.h"
-//#include "api1/client2/ZslProcessor.h"
-//#include "api1/client2/CaptureSequencer.h"
-//#include "api1/client2/CallbackProcessor.h"
+#include "api1/client2/Parameters.h"
+#include "common/Camera2ClientBase.h"
+#include "common/CameraDeviceBase.h"
 
 namespace android {
 
@@ -57,11 +57,9 @@ public:
     virtual status_t        connect(const sp<hardware::ICameraClient>& client);
     virtual status_t        lock();
     virtual status_t        unlock();
-    virtual status_t        setPreviewTarget(
-        const sp<IGraphicBufferProducer>& bufferProducer);
+    virtual status_t        setPreviewTarget(const sp<SurfaceType>& target);
     virtual void            setPreviewCallbackFlag(int flag);
-    virtual status_t        setPreviewCallbackTarget(
-        const sp<IGraphicBufferProducer>& callbackProducer);
+    virtual status_t        setPreviewCallbackTarget(const sp<SurfaceType>& target);
 
     virtual status_t        startPreview();
     virtual void            stopPreview();
@@ -82,35 +80,41 @@ public:
     virtual status_t        sendCommand(int32_t cmd, int32_t arg1, int32_t arg2);
     virtual void            notifyError(int32_t errorCode,
                                         const CaptureResultExtras& resultExtras);
-    virtual status_t        setVideoTarget(const sp<IGraphicBufferProducer>& bufferProducer);
+    virtual status_t        setVideoTarget(const sp<SurfaceType>& target);
     virtual status_t        setAudioRestriction(int mode);
     virtual int32_t         getGlobalAudioRestriction();
-    virtual status_t        setRotateAndCropOverride(uint8_t rotateAndCrop);
+    virtual status_t        setRotateAndCropOverride(uint8_t rotateAndCrop, bool fromHal = false);
+    virtual status_t        setAutoframingOverride(uint8_t autoframingMode);
 
     virtual bool            supportsCameraMute();
     virtual status_t        setCameraMute(bool enabled);
+
+    virtual status_t        setCameraServiceWatchdog(bool enabled);
+
+    virtual void            setStreamUseCaseOverrides(
+                                    const std::vector<int64_t>& useCaseOverrides);
+    virtual void            clearStreamUseCaseOverrides();
+
+    virtual bool            supportsZoomOverride();
+    virtual status_t        setZoomOverride(int32_t zoomOverride);
 
     /**
      * Interface used by CameraService
      */
 
     Camera2Client(const sp<CameraService>& cameraService,
-            const sp<hardware::ICameraClient>& cameraClient,
-            const String16& clientPackageName,
-            const std::optional<String16>& clientFeatureId,
-            const String8& cameraDeviceId,
-            int api1CameraId,
-            int cameraFacing,
-            int sensorOrientation,
-            int clientPid,
-            uid_t clientUid,
-            int servicePid,
-            bool overrideForPerfClass);
+                  const sp<hardware::ICameraClient>& cameraClient,
+                  std::shared_ptr<CameraServiceProxyWrapper> cameraServiceProxyWrapper,
+                  std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+                  const AttributionSourceState& clientAttribution, int callingPid,
+                  const std::string& cameraDeviceId, int api1CameraId, int cameraFacing,
+                  int sensorOrientation, int servicePid, bool overrideForPerfClass,
+                  int rotationOverride, bool forceSlowJpegMode, bool sharedMode);
 
     virtual ~Camera2Client();
 
     virtual status_t initialize(sp<CameraProviderManager> manager,
-            const String8& monitorTags) override;
+            const std::string& monitorTags) override;
 
     virtual status_t dump(int fd, const Vector<String16>& args);
 
@@ -173,8 +177,12 @@ private:
     /** ICamera interface-related private members */
     typedef camera2::Parameters Parameters;
 
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+    status_t setPreviewWindowL(const view::Surface& viewSurface, const sp<Surface>& window);
+#else
     status_t setPreviewWindowL(const sp<IBinder>& binder,
             const sp<Surface>& window);
+#endif
     status_t startPreviewL(Parameters &params, bool restart);
     void     stopPreviewL();
     status_t startRecordingL(Parameters &params, bool restart);
@@ -211,8 +219,13 @@ private:
 
     /* Preview/Recording related members */
 
+#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
+    uint64_t mPreviewViewSurfaceID;
+    uint64_t mVideoSurfaceID;
+#else
     sp<IBinder> mPreviewSurface;
     sp<IBinder> mVideoSurface;
+#endif
     sp<camera2::StreamingProcessor> mStreamingProcessor;
 
     /** Preview callback related members */
@@ -225,6 +238,8 @@ private:
     sp<camera2::JpegProcessor> mJpegProcessor;
     sp<camera2::ZslProcessor> mZslProcessor;
 
+    std::atomic<bool> mInitialized;
+
     /** Utility members */
     bool mLegacyMode;
 
@@ -235,7 +250,7 @@ private:
     status_t overrideVideoSnapshotSize(Parameters &params);
 
     template<typename TProviderPtr>
-    status_t initializeImpl(TProviderPtr providerPtr, const String8& monitorTags);
+    status_t initializeImpl(TProviderPtr providerPtr, const std::string& monitorTags);
 
     bool isZslEnabledInStillTemplate();
     // The current rotate & crop mode passed by camera service
@@ -250,8 +265,8 @@ private:
 
     mutable Mutex mLatestRequestMutex;
     Condition mLatestRequestSignal;
-    int32_t mLatestRequestId = -1;
-    int32_t mLatestFailedRequestId = -1;
+    static constexpr size_t kMaxRequestIds = BufferQueueDefs::NUM_BUFFER_SLOTS;
+    RingBuffer<int32_t> mLatestRequestIds, mLatestFailedRequestIds;
     status_t waitUntilRequestIdApplied(int32_t requestId, nsecs_t timeout);
     status_t waitUntilCurrentRequestIdLocked();
 };

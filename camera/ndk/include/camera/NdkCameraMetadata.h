@@ -96,9 +96,12 @@ typedef struct ACameraMetadata_entry {
     /**
      * The tag identifying the entry.
      *
-     * <p> It is one of the values defined in {@link NdkCameraMetadataTags.h}, and defines how the
+     * <p> It is one of the values defined in
+     * <a href="https://cs.android.com/android/platform/superproject/+/master:frameworks/av/camera/ndk/include/camera/NdkCameraMetadataTags.h">NdkCameraMetadataTags.h</a>
+     * , and defines how the
      * entry should be interpreted and which parts of the API provide it.
-     * See {@link NdkCameraMetadataTags.h} for more details. </p>
+     * See <a href="https://cs.android.com/android/platform/superproject/+/master:frameworks/av/camera/ndk/include/camera/NdkCameraMetadataTags.h">NdkCameraMetadataTags.h</a>
+     * for more details. </p>
      */
     uint32_t tag;
 
@@ -141,9 +144,11 @@ typedef struct ACameraMetadata_const_entry {
     /**
      * The tag identifying the entry.
      *
-     * <p> It is one of the values defined in {@link NdkCameraMetadataTags.h}, and defines how the
+     * <p> It is one of the values defined in <a href="https://cs.android.com/android/platform/superproject/+/master:frameworks/av/camera/ndk/include/camera/NdkCameraMetadataTags.h">NdkCameraMetadataTags.h</a>
+     * , and defines how the
      * entry should be interpreted and which parts of the API provide it.
-     * See {@link NdkCameraMetadataTags.h} for more details. </p>
+     * See <a href="https://cs.android.com/android/platform/superproject/+/master:frameworks/av/camera/ndk/include/camera/NdkCameraMetadataTags.h">NdkCameraMetadataTags.h</a>
+     * for more details. </p>
      */
     uint32_t tag;
 
@@ -185,7 +190,7 @@ typedef struct ACameraMetadata_const_entry {
  * @param metadata the {@link ACameraMetadata} of interest.
  * @param tag the tag value of the camera metadata entry to be get.
  * @param entry the output {@link ACameraMetadata_const_entry} will be filled here if the method
- *        call succeeeds.
+ *        call succeeds.
  *
  * @return <ul>
  *         <li>{@link ACAMERA_OK} if the method call succeeds.</li>
@@ -214,6 +219,24 @@ camera_status_t ACameraMetadata_getConstEntry(
 camera_status_t ACameraMetadata_getAllTags(
         const ACameraMetadata* metadata,
         /*out*/int32_t* numEntries, /*out*/const uint32_t** tags) __INTRODUCED_IN(24);
+
+/**
+ * Look up tag ID value for device-specific custom tags that are usable only
+ * for the particular device, by name. The name and type of the tag need to be
+ * discovered from some other source, such as the manufacturer. The ID value is
+ * stable during the lifetime of an application, but should be queried again after
+ * process restarts. This method can also be used to query tag values using the names
+ * for public tags which exist in the Java API, however it is just simpler and faster to
+ * use the values of the tags which exist in the ndk.
+ * @param metadata The {@link ACameraMetadata} of to query the tag value from.
+ * @param name The name of the tag being queried.
+ * @param tag The output tag assigned by this method.
+ *
+ * @return ACAMERA_OK only if the function call was successful.
+ */
+
+camera_status_t
+ACameraMetadata_getTagFromName(const ACameraMetadata* metadata, const char *name, uint32_t *tag)  __INTRODUCED_IN(35);
 
 /**
  * Create a copy of input {@link ACameraMetadata}.

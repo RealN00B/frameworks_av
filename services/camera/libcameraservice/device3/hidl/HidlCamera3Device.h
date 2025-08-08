@@ -31,8 +31,13 @@ class HidlCamera3Device :
             public Camera3Device {
   public:
 
-   explicit HidlCamera3Device(const String8& id, bool overrideForPerfClass,
-          bool legacyClient = false) : Camera3Device(id, overrideForPerfClass, legacyClient) { }
+    explicit HidlCamera3Device(
+        std::shared_ptr<CameraServiceProxyWrapper>& cameraServiceProxyWrapper,
+        std::shared_ptr<AttributionAndPermissionUtils> attributionAndPermissionUtils,
+        const std::string& id, bool overrideForPerfClass, int rotationOverride,
+        bool legacyClient = false) :
+        Camera3Device(cameraServiceProxyWrapper, attributionAndPermissionUtils, id,
+                overrideForPerfClass, rotationOverride, legacyClient) { }
 
     virtual ~HidlCamera3Device() {}
 
@@ -56,7 +61,7 @@ class HidlCamera3Device :
     static uint64_t mapProducerToFrameworkUsage(
             hardware::camera::device::V3_2::BufferUsageFlags usage);
 
-    status_t initialize(sp<CameraProviderManager> manager, const String8& monitorTags) override;
+    status_t initialize(sp<CameraProviderManager> manager, const std::string& monitorTags) override;
 
     /**
      * Implementation of android::hardware::camera::device::V3_5::ICameraDeviceCallback
@@ -80,9 +85,6 @@ class HidlCamera3Device :
     hardware::Return<void> returnStreamBuffers(
             const hardware::hidl_vec<
                     hardware::camera::device::V3_2::StreamBuffer>& buffers) override;
-
-    // Handle one notify message
-    void notify(const hardware::camera::device::V3_2::NotifyMsg& msg);
 
     status_t switchToOffline(const std::vector<int32_t>& streamsToKeep,
             /*out*/ sp<CameraOfflineSessionBase>* session) override;
@@ -110,7 +112,8 @@ class HidlCamera3Device :
 
         virtual status_t configureStreams(const camera_metadata_t *sessionParams,
                 /*inout*/ camera_stream_configuration_t *config,
-                const std::vector<uint32_t>& bufferSizes) override;
+                const std::vector<uint32_t>& bufferSizes,
+                int64_t logId) override;
 
         // The injection camera configures the streams to hal.
         virtual status_t configureInjectedStreams(
@@ -175,7 +178,9 @@ class HidlCamera3Device :
                 sp<HalInterface> interface,
                 const Vector<int32_t>& sessionParamKeys,
                 bool useHalBufManager,
-                bool supportCameraMute);
+                bool supportCameraMute,
+                int rotationOverride,
+                bool supportSettingsOverride);
 
         status_t switchToOffline(
                 const std::vector<int32_t>& streamsToKeep,
@@ -188,7 +193,7 @@ class HidlCamera3Device :
      public:
         // Initialize the injection camera and generate an hal interface.
         status_t injectionInitialize(
-                const String8& injectedCamId, sp<CameraProviderManager> manager,
+                const std::string& injectedCamId, sp<CameraProviderManager> manager,
                 const sp<
                     android::hardware::camera::device::V3_2 ::ICameraDeviceCallback>&
                     callback);
@@ -214,7 +219,11 @@ class HidlCamera3Device :
     hardware::Return<void> notifyHelper(
             const hardware::hidl_vec<NotifyMsgType>& msgs);
 
-    virtual status_t injectionCameraInitialize(const String8 &injectCamId,
+    virtual void applyMaxBatchSizeLocked(
+            RequestList* requestList,
+            const sp<camera3::Camera3OutputStreamInterface>& stream) override;
+
+    virtual status_t injectionCameraInitialize(const std::string &injectCamId,
             sp<CameraProviderManager> manager) override;
 
     virtual sp<RequestThread> createNewRequestThread(wp<Camera3Device> parent,
@@ -222,7 +231,9 @@ class HidlCamera3Device :
                 sp<HalInterface> interface,
                 const Vector<int32_t>& sessionParamKeys,
                 bool useHalBufManager,
-                bool supportCameraMute) override;
+                bool supportCameraMute,
+                int rotationOverride,
+                bool supportSettingsOverride) override;
 
     virtual sp<Camera3DeviceInjectionMethods>
             createCamera3DeviceInjectionMethods(wp<Camera3Device>) override;

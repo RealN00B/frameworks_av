@@ -16,24 +16,20 @@
 
 
 #define LOG_TAG "AAudioStreamParameters"
+
+#include <android-base/strings.h>
 #include <utils/Log.h>
 #include <system/audio.h>
+#include <system/aaudio/AAudio.h>
 
 #include "AAudioStreamParameters.h"
 
 using namespace aaudio;
 
-// TODO These defines should be moved to a central place in audio.
-#define SAMPLES_PER_FRAME_MIN        1
-#define SAMPLES_PER_FRAME_MAX        FCC_LIMIT
-#define SAMPLE_RATE_HZ_MIN           8000
-// HDMI supports up to 32 channels at 1536000 Hz.
-#define SAMPLE_RATE_HZ_MAX           1600000
-
 void AAudioStreamParameters::copyFrom(const AAudioStreamParameters &other) {
     mSamplesPerFrame      = other.mSamplesPerFrame;
     mSampleRate           = other.mSampleRate;
-    mDeviceId             = other.mDeviceId;
+    mDeviceIds            = other.mDeviceIds;
     mSessionId            = other.mSessionId;
     mSharingMode          = other.mSharingMode;
     mAudioFormat          = other.mAudioFormat;
@@ -41,6 +37,7 @@ void AAudioStreamParameters::copyFrom(const AAudioStreamParameters &other) {
     mBufferCapacity       = other.mBufferCapacity;
     mUsage                = other.mUsage;
     mContentType          = other.mContentType;
+    mTags                 = other.mTags;
     mSpatializationBehavior = other.mSpatializationBehavior;
     mIsContentSpatialized = other.mIsContentSpatialized;
     mInputPreset          = other.mInputPreset;
@@ -49,6 +46,9 @@ void AAudioStreamParameters::copyFrom(const AAudioStreamParameters &other) {
     mOpPackageName        = other.mOpPackageName;
     mAttributionTag       = other.mAttributionTag;
     mChannelMask          = other.mChannelMask;
+    mHardwareSamplesPerFrame = other.mHardwareSamplesPerFrame;
+    mHardwareSampleRate   = other.mHardwareSampleRate;
+    mHardwareAudioFormat  = other.mHardwareAudioFormat;
 }
 
 static aaudio_result_t isFormatValid(audio_format_t format) {
@@ -58,6 +58,15 @@ static aaudio_result_t isFormatValid(audio_format_t format) {
         case AUDIO_FORMAT_PCM_32_BIT:
         case AUDIO_FORMAT_PCM_FLOAT:
         case AUDIO_FORMAT_PCM_24_BIT_PACKED:
+        case AUDIO_FORMAT_PCM_8_24_BIT:
+        case AUDIO_FORMAT_IEC61937:
+        case AUDIO_FORMAT_MP3:
+        case AUDIO_FORMAT_AAC_LC:
+        case AUDIO_FORMAT_AAC_HE_V1:
+        case AUDIO_FORMAT_AAC_HE_V2:
+        case AUDIO_FORMAT_AAC_ELD:
+        case AUDIO_FORMAT_AAC_XHE:
+        case AUDIO_FORMAT_OPUS:
             break; // valid
         default:
             ALOGD("audioFormat not valid, audio_format_t = 0x%08x", format);
@@ -68,15 +77,19 @@ static aaudio_result_t isFormatValid(audio_format_t format) {
 }
 
 aaudio_result_t AAudioStreamParameters::validate() const {
-    if (mSamplesPerFrame != AAUDIO_UNSPECIFIED
-        && (mSamplesPerFrame < SAMPLES_PER_FRAME_MIN || mSamplesPerFrame > SAMPLES_PER_FRAME_MAX)) {
+    if (mSamplesPerFrame != AAUDIO_UNSPECIFIED && (mSamplesPerFrame < CHANNEL_COUNT_MIN_AAUDIO ||
+                                                   mSamplesPerFrame > CHANNEL_COUNT_MAX_AAUDIO)) {
         ALOGD("channelCount out of range = %d", mSamplesPerFrame);
         return AAUDIO_ERROR_OUT_OF_RANGE;
     }
 
-    if (mDeviceId < 0) {
-        ALOGD("deviceId out of range = %d", mDeviceId);
-        return AAUDIO_ERROR_OUT_OF_RANGE;
+    // TODO(b/379139078): Query AudioSystem::listAudioPorts
+    for (auto deviceId : mDeviceIds) {
+        if (deviceId < 0) {
+            ALOGE("deviceId out of range = %d, deviceIds = %s", deviceId,
+                      android::toString(mDeviceIds).c_str());
+            return AAUDIO_ERROR_OUT_OF_RANGE;
+        }
     }
 
     // All Session ID values are legal.
@@ -100,8 +113,8 @@ aaudio_result_t AAudioStreamParameters::validate() const {
     aaudio_result_t result = isFormatValid (mAudioFormat);
     if (result != AAUDIO_OK) return result;
 
-    if (mSampleRate != AAUDIO_UNSPECIFIED
-        && (mSampleRate < SAMPLE_RATE_HZ_MIN || mSampleRate > SAMPLE_RATE_HZ_MAX)) {
+    if (mSampleRate != AAUDIO_UNSPECIFIED &&
+        (mSampleRate < SAMPLE_RATE_HZ_MIN_AAUDIO || mSampleRate > SAMPLE_RATE_HZ_MAX_IEC610937)) {
         ALOGD("sampleRate out of range = %d", mSampleRate);
         return AAUDIO_ERROR_INVALID_RATE;
     }
@@ -180,6 +193,8 @@ aaudio_result_t AAudioStreamParameters::validate() const {
         case AAUDIO_INPUT_PRESET_VOICE_RECOGNITION:
         case AAUDIO_INPUT_PRESET_UNPROCESSED:
         case AAUDIO_INPUT_PRESET_VOICE_PERFORMANCE:
+        case AAUDIO_INPUT_PRESET_SYSTEM_ECHO_REFERENCE:
+        case AAUDIO_INPUT_PRESET_SYSTEM_HOTWORD:
             break; // valid
         default:
             ALOGD("input preset not valid = %d", mInputPreset);
@@ -199,10 +214,14 @@ aaudio_result_t AAudioStreamParameters::validate() const {
             // break;
     }
 
+    if (getTagsAsString().size() >= AUDIO_ATTRIBUTES_TAGS_MAX_SIZE) {
+        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
+    }
+
     return validateChannelMask();
 }
 
-bool AAudioStreamParameters::validateChannelMask() const {
+aaudio_result_t AAudioStreamParameters::validateChannelMask() const {
     if (mChannelMask == AAUDIO_UNSPECIFIED) {
         return AAUDIO_OK;
     }
@@ -289,8 +308,12 @@ bool AAudioStreamParameters::validateChannelMask() const {
     }
 }
 
+std::string AAudioStreamParameters::getTagsAsString() const {
+    return android::base::Join(mTags, AUDIO_ATTRIBUTES_TAGS_SEPARATOR);
+}
+
 void AAudioStreamParameters::dump() const {
-    ALOGD("mDeviceId             = %6d", mDeviceId);
+    ALOGD("mDeviceIds            = %s",  android::toString(mDeviceIds).c_str());
     ALOGD("mSessionId            = %6d", mSessionId);
     ALOGD("mSampleRate           = %6d", mSampleRate);
     ALOGD("mSamplesPerFrame      = %6d", mSamplesPerFrame);
@@ -301,6 +324,7 @@ void AAudioStreamParameters::dump() const {
     ALOGD("mBufferCapacity       = %6d", mBufferCapacity);
     ALOGD("mUsage                = %6d", mUsage);
     ALOGD("mContentType          = %6d", mContentType);
+    ALOGD("mTags                 = %s",  getTagsAsString().c_str());
     ALOGD("mSpatializationBehavior = %6d", mSpatializationBehavior);
     ALOGD("mIsContentSpatialized = %s", mIsContentSpatialized ? "true" : "false");
     ALOGD("mInputPreset          = %6d", mInputPreset);
@@ -310,4 +334,7 @@ void AAudioStreamParameters::dump() const {
         "(null)" : mOpPackageName.value().c_str());
     ALOGD("mAttributionTag       = %s", !mAttributionTag.has_value() ?
         "(null)" : mAttributionTag.value().c_str());
+    ALOGD("mHardwareSamplesPerFrame = %6d", mHardwareSamplesPerFrame);
+    ALOGD("mHardwareSampleRate   = %6d", mHardwareSampleRate);
+    ALOGD("mHardwareAudioFormat  = %6d", (int)mHardwareAudioFormat);
 }

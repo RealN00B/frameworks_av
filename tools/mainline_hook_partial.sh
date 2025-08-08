@@ -35,8 +35,9 @@
 
 ## tunables:
 ##
-DEV_BRANCH=master
-MAINLINE_BRANCH=tm-mainline-prod
+## as of 2024/5, things are all on the same branch.
+DEV_BRANCH=main
+MAINLINE_BRANCH=main
 filelist_file=MainlineFiles.cfg
 
 ###

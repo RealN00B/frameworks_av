@@ -17,13 +17,20 @@
 #ifndef ANDROID_AUDIOPOLICY_INTERFACE_H
 #define ANDROID_AUDIOPOLICY_INTERFACE_H
 
+#include <android/media/DeviceConnectedState.h>
+#include <android/media/TrackInternalMuteInfo.h>
+#include <android/media/audio/common/AudioConfigBase.h>
+#include <android/media/audio/common/AudioMMapPolicyInfo.h>
+#include <android/media/audio/common/AudioMMapPolicyType.h>
+#include <android/media/GetInputForAttrResponse.h>
+#include <android/content/AttributionSourceState.h>
+#include <error/BinderResult.h>
 #include <media/AudioCommonTypes.h>
 #include <media/AudioContainers.h>
 #include <media/AudioDeviceTypeAddr.h>
-#include <media/AudioSystem.h>
 #include <media/AudioPolicy.h>
+#include <media/AudioSystem.h>
 #include <media/DeviceDescriptorBase.h>
-#include <android/content/AttributionSourceState.h>
 #include <utils/String8.h>
 
 namespace android {
@@ -134,17 +141,20 @@ public:
     // request an output appropriate for playback of the supplied stream type and parameters
     virtual audio_io_handle_t getOutput(audio_stream_type_t stream) = 0;
     virtual status_t getOutputForAttr(const audio_attributes_t *attr,
-                                        audio_io_handle_t *output,
-                                        audio_session_t session,
-                                        audio_stream_type_t *stream,
-                                        const AttributionSourceState& attributionSouce,
-                                        const audio_config_t *config,
-                                        audio_output_flags_t *flags,
-                                        audio_port_handle_t *selectedDeviceId,
-                                        audio_port_handle_t *portId,
-                                        std::vector<audio_io_handle_t> *secondaryOutputs,
-                                        output_type_t *outputType,
-                                        bool *isSpatialized) = 0;
+                                      audio_io_handle_t *output,
+                                      audio_session_t session,
+                                      audio_stream_type_t *stream,
+                                      const AttributionSourceState& attributionSource,
+                                      audio_config_t *config,
+                                      audio_output_flags_t *flags,
+                                      DeviceIdVector *selectedDeviceIds,
+                                      audio_port_handle_t *portId,
+                                      std::vector<audio_io_handle_t> *secondaryOutputs,
+                                      output_type_t *outputType,
+                                      bool *isSpatialized,
+                                      bool *isBitPerfect,
+                                      float *volume,
+                                      bool *muted) = 0;
     // indicates to the audio policy manager that the output starts being used by corresponding
     // stream.
     virtual status_t startOutput(audio_port_handle_t portId) = 0;
@@ -154,17 +164,26 @@ public:
     // releases the output, return true if the output descriptor is reopened.
     virtual bool releaseOutput(audio_port_handle_t portId) = 0;
 
-    // request an input appropriate for record from the supplied device with supplied parameters.
-    virtual status_t getInputForAttr(const audio_attributes_t *attr,
-                                     audio_io_handle_t *input,
+    // Request an input appropriate for record from the supplied device with supplied parameters.
+    // attr -- attributes for the requested record
+    // requestedInput -- input only for MMAP mode where an input is re-used, otherwise output param
+    // requestedDeviceId, config, flags -- additional params for matching
+    // riid, session, attributionSource -- params which encapsulate client info to associate with
+    // this input
+    //
+    // On most errors, return a Status describing the error in the error object.
+    // However, in cases where an appropriate device cannot be found for a config, the error side of
+    // the unexpected will contain a suggested config.
+    virtual base::expected<media::GetInputForAttrResponse,
+            std::variant<binder::Status, media::audio::common::AudioConfigBase>>
+                     getInputForAttr(audio_attributes_t attributes,
+                                     audio_io_handle_t requestedInput,
+                                     audio_port_handle_t requestedDeviceId,
+                                     audio_config_base_t config,
+                                     audio_input_flags_t flags,
                                      audio_unique_id_t riid,
                                      audio_session_t session,
-                                     const AttributionSourceState& attributionSouce,
-                                     const audio_config_base_t *config,
-                                     audio_input_flags_t flags,
-                                     audio_port_handle_t *selectedDeviceId,
-                                     input_type_t *inputType,
-                                     audio_port_handle_t *portId) = 0;
+                                     const AttributionSourceState& attributionSource) = 0;
     // indicates to the audio policy manager that the input starts being used.
     virtual status_t startInput(audio_port_handle_t portId) = 0;
     // indicates to the audio policy manager that the input stops being used.
@@ -176,16 +195,23 @@ public:
     // volume control functions
     //
 
+    // notifies the audio policy manager that the absolute volume mode is enabled/disabled on
+    // the passed device. Also specifies the stream that is controlling the absolute volume.
+    virtual status_t setDeviceAbsoluteVolumeEnabled(audio_devices_t device,
+                                                    const char *address,
+                                                    bool enabled,
+                                                    audio_stream_type_t streamToDriveAbs) = 0;
     // initialises stream volume conversion parameters by specifying volume index range.
     virtual void initStreamVolume(audio_stream_type_t stream,
-                                      int indexMin,
-                                      int indexMax) = 0;
+                                  int indexMin,
+                                  int indexMax) = 0;
 
     // sets the new stream volume at a level corresponding to the supplied index for the
     // supplied device. By convention, specifying AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME means
     // setting volume for all devices
     virtual status_t setStreamVolumeIndex(audio_stream_type_t stream,
                                           int index,
+                                          bool muted,
                                           audio_devices_t device) = 0;
 
     // retrieve current volume index for the specified stream and the
@@ -197,6 +223,7 @@ public:
 
     virtual status_t setVolumeIndexForAttributes(const audio_attributes_t &attr,
                                                  int index,
+                                                 bool muted,
                                                  audio_devices_t device) = 0;
     virtual status_t getVolumeIndexForAttributes(const audio_attributes_t &attr,
                                                  int &index,
@@ -245,6 +272,8 @@ public:
                                     unsigned int *num_ports,
                                     struct audio_port_v7 *ports,
                                     unsigned int *generation) = 0;
+    virtual status_t listDeclaredDevicePorts(media::AudioPortRole role,
+                                             std::vector<media::AudioPortFw>* result) = 0;
     virtual status_t getAudioPort(struct audio_port_v7 *port) = 0;
     virtual status_t createAudioPatch(const struct audio_patch *patch,
                                        audio_patch_handle_t *handle,
@@ -265,6 +294,11 @@ public:
 
     virtual status_t registerPolicyMixes(const Vector<AudioMix>& mixes) = 0;
     virtual status_t unregisterPolicyMixes(Vector<AudioMix> mixes) = 0;
+    virtual status_t getRegisteredPolicyMixes(std::vector<AudioMix>& mixes) = 0;
+
+    virtual status_t updatePolicyMix(
+        const AudioMix& mix,
+        const std::vector<AudioMixMatchCriterion>& updatedCriteria) = 0;
 
     virtual status_t setUidDeviceAffinities(uid_t uid, const AudioDeviceTypeAddrVector& devices)
             = 0;
@@ -299,6 +333,8 @@ public:
 
     virtual bool     isUltrasoundSupported() = 0;
 
+    virtual bool     isHotwordStreamSupported(bool lookbackAudio) = 0;
+
     virtual status_t getHwOffloadFormatsSupportedForBluetoothMedia(
                 audio_devices_t device, std::vector<audio_format_t> *formats) = 0;
 
@@ -307,13 +343,13 @@ public:
     virtual status_t listAudioProductStrategies(AudioProductStrategyVector &strategies) = 0;
 
     virtual status_t getProductStrategyFromAudioAttributes(
-            const AudioAttributes &aa, product_strategy_t &productStrategy,
+            const audio_attributes_t &aa, product_strategy_t &productStrategy,
             bool fallbackOnDefault) = 0;
 
     virtual status_t listAudioVolumeGroups(AudioVolumeGroupVector &groups) = 0;
 
     virtual status_t getVolumeGroupFromAudioAttributes(
-            const AudioAttributes &aa, volume_group_t &volumeGroup, bool fallbackOnDefault) = 0;
+            const audio_attributes_t &aa, volume_group_t &volumeGroup, bool fallbackOnDefault) = 0;
 
     virtual bool     isCallScreenModeSupported() = 0;
 
@@ -322,8 +358,11 @@ public:
                                                const AudioDeviceTypeAddrVector &devices) = 0;
 
     virtual status_t removeDevicesRoleForStrategy(product_strategy_t strategy,
-                                                  device_role_t role) = 0;
+                                                  device_role_t role,
+                                                  const AudioDeviceTypeAddrVector &devices) = 0;
 
+    virtual status_t clearDevicesRoleForStrategy(product_strategy_t strategy,
+                                                     device_role_t role) = 0;
 
     virtual status_t getDevicesForRoleAndStrategy(product_strategy_t strategy,
                                                   device_role_t role,
@@ -407,6 +446,27 @@ public:
     // retrieves the list of available direct audio profiles for the given audio attributes
     virtual status_t getDirectProfilesForAttributes(const audio_attributes_t* attr,
                                                     AudioProfileVector& audioProfiles) = 0;
+
+    virtual status_t getSupportedMixerAttributes(
+            audio_port_handle_t portId, std::vector<audio_mixer_attributes_t>& mixerAttrs) = 0;
+    virtual status_t setPreferredMixerAttributes(
+            const audio_attributes_t* attr,
+            audio_port_handle_t portId,
+            uid_t uid,
+            const audio_mixer_attributes_t* mixerAttributes) = 0;
+    virtual status_t getPreferredMixerAttributes(const audio_attributes_t* attr,
+                                                 audio_port_handle_t portId,
+                                                 audio_mixer_attributes_t* mixerAttributes) = 0;
+    virtual status_t clearPreferredMixerAttributes(const audio_attributes_t* attr,
+                                                   audio_port_handle_t portId,
+                                                   uid_t uid) = 0;
+
+    virtual status_t getMmapPolicyInfos(
+            media::audio::common::AudioMMapPolicyType policyType,
+            std::vector<media::audio::common::AudioMMapPolicyInfo> *policyInfos) = 0;
+    virtual status_t getMmapPolicyForDevice(
+            media::audio::common::AudioMMapPolicyType policyType,
+            media::audio::common::AudioMMapPolicyInfo *policyInfo) = 0;
 };
 
 // Audio Policy client Interface
@@ -414,6 +474,8 @@ class AudioPolicyClientInterface
 {
 public:
     virtual ~AudioPolicyClientInterface() {}
+
+    virtual status_t getAudioPolicyConfig(media::AudioPolicyConfig *config) = 0;
 
     //
     // Audio HW module functions
@@ -439,7 +501,8 @@ public:
                                 audio_config_base_t *mixerConfig,
                                 const sp<DeviceDescriptorBase>& device,
                                 uint32_t *latencyMs,
-                                audio_output_flags_t flags) = 0;
+                                audio_output_flags_t *flags,
+                                audio_attributes_t audioAttributes) = 0;
     // creates a special output that is duplicated to the two outputs passed as arguments.
     // The duplication is performed by a special mixer thread in the AudioFlinger.
     virtual audio_io_handle_t openDuplicateOutput(audio_io_handle_t output1,
@@ -474,11 +537,21 @@ public:
     // set a stream volume for a particular output. For the same user setting, a given stream type
     // can have different volumes
     // for each output (destination device) it is attached to.
-    virtual status_t setStreamVolume(audio_stream_type_t stream, float volume,
+    virtual status_t setStreamVolume(audio_stream_type_t stream, float volume, bool muted,
                                      audio_io_handle_t output, int delayMs = 0) = 0;
-
-    // invalidate a stream type, causing a reroute to an unspecified new output
-    virtual status_t invalidateStream(audio_stream_type_t stream) = 0;
+    /**
+     * Set volume for given AudioTrack port ids for a particular output.
+     * For the same user setting, a given volume group and associated output port id
+     * can have different volumes for each output (destination device) it is attached to.
+     * @param ports to consider
+     * @param volume to apply
+     * @param muted to apply
+     * @param output to consider
+     * @param delayMs to use
+     * @return NO_ERROR if successful
+     */
+    virtual status_t setPortsVolume(const std::vector<audio_port_handle_t>& ports, float volume,
+            bool muted, audio_io_handle_t output, int delayMs = 0) = 0;
 
     // function enabling to send proprietary informations directly from audio policy manager to
     // audio hardware interface.
@@ -548,7 +621,47 @@ public:
     virtual status_t updateSecondaryOutputs(
             const TrackSecondaryOutputsMap& trackSecondaryOutputs) = 0;
 
-    virtual status_t setDeviceConnectedState(const struct audio_port_v7 *port, bool connected) = 0;
+    virtual status_t setDeviceConnectedState(const struct audio_port_v7 *port,
+                                             media::DeviceConnectedState state) = 0;
+
+    virtual status_t invalidateTracks(const std::vector<audio_port_handle_t>& portIds) = 0;
+
+    // Get the attributes of the mix port when connecting to the given device port.
+    virtual status_t getAudioMixPort(const struct audio_port_v7 *devicePort,
+                                     struct audio_port_v7 *mixPort) = 0;
+
+    virtual status_t setTracksInternalMute(
+            const std::vector<media::TrackInternalMuteInfo>& tracksInternalMute) = 0;
+
+    virtual status_t getMmapPolicyInfos(
+            media::audio::common::AudioMMapPolicyType policyType,
+            std::vector<media::audio::common::AudioMMapPolicyInfo> *policyInfos) = 0;
+
+    enum class MixType {
+        // e.g. audio recording from a microphone
+        NONE = 0,
+        // used for "remote submix" legacy mode (no DAP), capture of the media to play it remotely
+        CAPTURE,
+        // used for platform audio rerouting, where mixes are handled by external and dynamically
+        // installed policies which reroute audio mixes
+        EXT_POLICY_REROUTE,
+        // used for playback capture with a MediaProjection
+        PUBLIC_CAPTURE_PLAYBACK,
+        // used for capture from telephony RX path
+        TELEPHONY_RX_CAPTURE,
+    };
+
+    struct PermissionReqs {
+        media::audio::common::AudioSource source;
+        MixType mixType;
+        uint32_t virtualDeviceId;
+        // Flag based validation
+        bool isHotword;
+        bool isCallRedir;
+    };
+
+    virtual error::BinderResult<bool> checkPermissionForInput(const AttributionSourceState& attr,
+                                                              const PermissionReqs& req) = 0;
 };
 
     // These are the signatures of createAudioPolicyManager/destroyAudioPolicyManager

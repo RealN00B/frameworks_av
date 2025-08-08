@@ -41,38 +41,23 @@ TunerDescrambler::TunerDescrambler(shared_ptr<IDescrambler> descrambler) {
 }
 
 TunerDescrambler::~TunerDescrambler() {
+    if (!isClosed) {
+        close();
+    }
     mDescrambler = nullptr;
 }
 
 ::ndk::ScopedAStatus TunerDescrambler::setDemuxSource(
         const shared_ptr<ITunerDemux>& in_tunerDemux) {
-    if (mDescrambler == nullptr) {
-        ALOGE("IDescrambler is not initialized");
-        return ::ndk::ScopedAStatus::fromServiceSpecificError(
-                static_cast<int32_t>(Result::UNAVAILABLE));
-    }
-
     return mDescrambler->setDemuxSource((static_cast<TunerDemux*>(in_tunerDemux.get()))->getId());
 }
 
 ::ndk::ScopedAStatus TunerDescrambler::setKeyToken(const vector<uint8_t>& in_keyToken) {
-    if (mDescrambler == nullptr) {
-        ALOGE("IDescrambler is not initialized");
-        return ::ndk::ScopedAStatus::fromServiceSpecificError(
-                static_cast<int32_t>(Result::UNAVAILABLE));
-    }
-
     return mDescrambler->setKeyToken(in_keyToken);
 }
 
 ::ndk::ScopedAStatus TunerDescrambler::addPid(
         const DemuxPid& in_pid, const shared_ptr<ITunerFilter>& in_optionalSourceFilter) {
-    if (mDescrambler == nullptr) {
-        ALOGE("IDescrambler is not initialized");
-        return ::ndk::ScopedAStatus::fromServiceSpecificError(
-                static_cast<int32_t>(Result::UNAVAILABLE));
-    }
-
     shared_ptr<IFilter> halFilter =
             (in_optionalSourceFilter == nullptr)
                     ? nullptr
@@ -83,12 +68,6 @@ TunerDescrambler::~TunerDescrambler() {
 
 ::ndk::ScopedAStatus TunerDescrambler::removePid(
         const DemuxPid& in_pid, const shared_ptr<ITunerFilter>& in_optionalSourceFilter) {
-    if (mDescrambler == nullptr) {
-        ALOGE("IDescrambler is not initialized");
-        return ::ndk::ScopedAStatus::fromServiceSpecificError(
-                static_cast<int32_t>(Result::UNAVAILABLE));
-    }
-
     shared_ptr<IFilter> halFilter =
             (in_optionalSourceFilter == nullptr)
                     ? nullptr
@@ -98,16 +77,8 @@ TunerDescrambler::~TunerDescrambler() {
 }
 
 ::ndk::ScopedAStatus TunerDescrambler::close() {
-    if (mDescrambler == nullptr) {
-        ALOGE("IDescrambler is not initialized.");
-        return ::ndk::ScopedAStatus::fromServiceSpecificError(
-                static_cast<int32_t>(Result::UNAVAILABLE));
-    }
-
-    auto res = mDescrambler->close();
-    mDescrambler = nullptr;
-
-    return res;
+    isClosed = true;
+    return mDescrambler->close();
 }
 
 }  // namespace tuner
